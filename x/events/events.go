@@ -15,55 +15,75 @@ import (
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/x"
+	"github.com/ory/x/jsonx"
 	"github.com/ory/x/otelx/semconv"
 )
 
 const (
-	SessionIssued            semconv.Event = "SessionIssued"
+	IdentityCreated          semconv.Event = "IdentityCreated"
+	IdentityDeleted          semconv.Event = "IdentityDeleted"
+	IdentityUpdated          semconv.Event = "IdentityUpdated"
+	JsonnetMappingFailed     semconv.Event = "JsonnetMappingFailed"
+	LoginFailed              semconv.Event = "LoginFailed"
+	LoginInitiated           semconv.Event = "LoginInitiated"
+	LoginSucceeded           semconv.Event = "LoginSucceeded"
+	RecoveryFailed           semconv.Event = "RecoveryFailed"
+	RecoveryInitiatedByAdmin semconv.Event = "RecoveryInitiatedByAdmin"
+	RecoverySucceeded        semconv.Event = "RecoverySucceeded"
+	RegistrationFailed       semconv.Event = "RegistrationFailed"
+	RegistrationInitiated    semconv.Event = "RegistrationInitiated"
+	RegistrationSucceeded    semconv.Event = "RegistrationSucceeded"
 	SessionChanged           semconv.Event = "SessionChanged"
+	SessionChecked           semconv.Event = "SessionChecked"
+	SessionIssued            semconv.Event = "SessionIssued"
 	SessionLifespanExtended  semconv.Event = "SessionLifespanExtended"
 	SessionRevoked           semconv.Event = "SessionRevoked"
-	SessionChecked           semconv.Event = "SessionChecked"
 	SessionTokenizedAsJWT    semconv.Event = "SessionTokenizedAsJWT"
-	RegistrationFailed       semconv.Event = "RegistrationFailed"
-	RegistrationSucceeded    semconv.Event = "RegistrationSucceeded"
-	LoginFailed              semconv.Event = "LoginFailed"
-	LoginSucceeded           semconv.Event = "LoginSucceeded"
 	SettingsFailed           semconv.Event = "SettingsFailed"
 	SettingsSucceeded        semconv.Event = "SettingsSucceeded"
-	RecoveryFailed           semconv.Event = "RecoveryFailed"
-	RecoverySucceeded        semconv.Event = "RecoverySucceeded"
-	RecoveryInitiatedByAdmin semconv.Event = "RecoveryInitiatedByAdmin"
 	VerificationFailed       semconv.Event = "VerificationFailed"
 	VerificationSucceeded    semconv.Event = "VerificationSucceeded"
-	IdentityCreated          semconv.Event = "IdentityCreated"
-	IdentityUpdated          semconv.Event = "IdentityUpdated"
-	IdentityDeleted          semconv.Event = "IdentityDeleted"
 	WebhookDelivered         semconv.Event = "WebhookDelivered"
-	WebhookSucceeded         semconv.Event = "WebhookSucceeded"
 	WebhookFailed            semconv.Event = "WebhookFailed"
+	WebhookSucceeded         semconv.Event = "WebhookSucceeded"
+	CourierMessageAbandoned  semconv.Event = "CourierMessageAbandoned"
+	CourierMessageDispatched semconv.Event = "CourierMessageDispatched"
 )
 
 const (
-	AttributeKeySessionID                       semconv.AttributeKey = "SessionID"
-	AttributeKeySessionAAL                      semconv.AttributeKey = "SessionAAL"
-	AttributeKeySessionExpiresAt                semconv.AttributeKey = "SessionExpiresAt"
-	AttributeKeySelfServiceFlowType             semconv.AttributeKey = "SelfServiceFlowType"
-	AttributeKeySelfServiceMethodUsed           semconv.AttributeKey = "SelfServiceMethodUsed"
-	AttributeKeySelfServiceSSOProviderUsed      semconv.AttributeKey = "SelfServiceSSOProviderUsed"
+	AttributeKeyErrorReason                     semconv.AttributeKey = "ErrorReason"
+	AttributeKeyFlowID                          semconv.AttributeKey = "FlowID"
+	AttributeKeyFlowRefresh                     semconv.AttributeKey = "FlowRefresh"
+	AttributeKeyFlowRequestedAAL                semconv.AttributeKey = "FlowRequestedAAL"
+	AttributeKeyJsonnetInput                    semconv.AttributeKey = "JsonnetInput"
+	AttributeKeyJsonnetOutput                   semconv.AttributeKey = "JsonnetOutput"
 	AttributeKeyLoginRequestedAAL               semconv.AttributeKey = "LoginRequestedAAL"
 	AttributeKeyLoginRequestedPrivilegedSession semconv.AttributeKey = "LoginRequestedPrivilegedSession"
-	AttributeKeyTokenizedSessionTTL             semconv.AttributeKey = "TokenizedSessionTTL"
-	AttributeKeyWebhookID                       semconv.AttributeKey = "WebhookID"
-	AttributeKeyWebhookURL                      semconv.AttributeKey = "WebhookURL"
-	AttributeKeyWebhookRequestBody              semconv.AttributeKey = "WebhookRequestBody"
-	AttributeKeyWebhookResponseBody             semconv.AttributeKey = "WebhookResponseBody"
-	AttributeKeyWebhookResponseStatusCode       semconv.AttributeKey = "WebhookResponseStatusCode"
-	AttributeKeyWebhookAttemptNumber            semconv.AttributeKey = "WebhookAttemptNumber"
-	AttributeKeyWebhookRequestID                semconv.AttributeKey = "WebhookRequestID"
-	AttributeKeyWebhookTriggerID                semconv.AttributeKey = "WebhookTriggerID"
-	AttributeKeyReason                          semconv.AttributeKey = "Reason"
-	AttributeKeyFlowID                          semconv.AttributeKey = "FlowID"
+	AttributeKeyOrganizationID                  semconv.AttributeKey = "OrganizationID"
+	AttributeKeyReason                          semconv.AttributeKey = "Reason" // Deprecated, use AttributeKeyErrorReason
+	// AttributeKeySelfServiceFlowType is the type of self-service flow, e.g. "api" or "browser".
+	AttributeKeySelfServiceFlowType semconv.AttributeKey = "SelfServiceFlowType"
+	// AttributeKeySelfServiceMethodUsed is the method used in the self-service flow, e.g. "oidc" or "password".
+	AttributeKeySelfServiceMethodUsed      semconv.AttributeKey = "SelfServiceMethodUsed"
+	AttributeKeySelfServiceSSOProviderUsed semconv.AttributeKey = "SelfServiceSSOProviderUsed"
+	// AttributeKeySelfServiceStrategyUsed is the strategy used in the self-service flow, e.g. "login" or "registration".
+	AttributeKeySelfServiceStrategyUsed    semconv.AttributeKey = "SelfServiceStrategyUsed"
+	AttributeKeySessionAAL                 semconv.AttributeKey = "SessionAAL"
+	AttributeKeySessionExpiresAt           semconv.AttributeKey = "SessionExpiresAt"
+	AttributeKeySessionID                  semconv.AttributeKey = "SessionID"
+	AttributeKeyTokenizedSessionTTL        semconv.AttributeKey = "TokenizedSessionTTL"
+	AttributeKeyWebhookAttemptNumber       semconv.AttributeKey = "WebhookAttemptNumber"
+	AttributeKeyWebhookID                  semconv.AttributeKey = "WebhookID"
+	AttributeKeyWebhookRequestBody         semconv.AttributeKey = "WebhookRequestBody"
+	AttributeKeyWebhookRequestID           semconv.AttributeKey = "WebhookRequestID"
+	AttributeKeyWebhookResponseBody        semconv.AttributeKey = "WebhookResponseBody"
+	AttributeKeyWebhookResponseStatusCode  semconv.AttributeKey = "WebhookResponseStatusCode"
+	AttributeKeyWebhookTriggerID           semconv.AttributeKey = "WebhookTriggerID"
+	AttributeKeyWebhookURL                 semconv.AttributeKey = "WebhookURL"
+	AttributeKeyCourierMessageID           semconv.AttributeKey = "CourierMessageID"
+	AttributeKeyCourierMessageChannel      semconv.AttributeKey = "CourierMessageChannel"
+	AttributeKeyCourierMessageTemplateType semconv.AttributeKey = "CourierMessageTemplateType"
 )
 
 func attrSessionID(val uuid.UUID) otelattr.KeyValue {
@@ -80,6 +100,18 @@ func attrSessionAAL(val string) otelattr.KeyValue {
 
 func attLoginRequestedAAL(val string) otelattr.KeyValue {
 	return otelattr.String(AttributeKeyLoginRequestedAAL.String(), val)
+}
+
+func attrFlowRefresh(val bool) otelattr.KeyValue {
+	return otelattr.Bool(AttributeKeyFlowRefresh.String(), val)
+}
+
+func attrOrganizationID(val string) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyOrganizationID.String(), val)
+}
+
+func attrFlowRequestedAAL(val string) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyFlowRequestedAAL.String(), val)
 }
 
 func attSessionExpiresAt(expiresAt time.Time) otelattr.KeyValue {
@@ -134,12 +166,37 @@ func attrWebhookTriggerID(id uuid.UUID) otelattr.KeyValue {
 	return otelattr.String(AttributeKeyWebhookTriggerID.String(), id.String())
 }
 
+// deprecated: use attrErrorReason instead
 func attrReason(err error) otelattr.KeyValue {
 	return otelattr.String(AttributeKeyReason.String(), reasonForError(err))
 }
 
+func attrErrorReason(err error) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyErrorReason.String(), reasonForError(err))
+}
+
+func attrJsonnetInput(in []byte) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyJsonnetInput.String(), string(jsonx.Anonymize(in)))
+}
+
+func attrJsonnetOutput(out string) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyJsonnetOutput.String(), string(jsonx.Anonymize([]byte(out))))
+}
+
 func attrFlowID(id uuid.UUID) otelattr.KeyValue {
 	return otelattr.String(AttributeKeyFlowID.String(), id.String())
+}
+
+func attrCourierMessageID(id uuid.UUID) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyCourierMessageID.String(), id.String())
+}
+
+func attrCourierMessageChannel(channel string) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyCourierMessageChannel.String(), channel)
+}
+
+func attrCourierMessageTemplateType(templateType string) otelattr.KeyValue {
+	return otelattr.String(AttributeKeyCourierMessageTemplateType.String(), templateType)
 }
 
 func NewSessionIssued(ctx context.Context, aal string, sessionID, identityID uuid.UUID) (string, trace.EventOption) {
@@ -264,41 +321,64 @@ func NewRegistrationFailed(ctx context.Context, flowID uuid.UUID, flowType, meth
 			attrSelfServiceFlowType(flowType),
 			attrSelfServiceMethodUsed(method),
 			attrReason(err),
+			attrErrorReason(err),
 			attrFlowID(flowID),
 		)...)
 }
 
 func NewRecoveryFailed(ctx context.Context, flowID uuid.UUID, flowType, method string, err error) (string, trace.EventOption) {
-	return RecoveryFailed.String(),
-		trace.WithAttributes(append(
-			semconv.AttributesFromContext(ctx),
-			attrSelfServiceFlowType(flowType),
-			attrSelfServiceMethodUsed(method),
-			attrReason(err),
-			attrFlowID(flowID),
-		)...)
+	attrs := append(
+		semconv.AttributesFromContext(ctx),
+		attrSelfServiceFlowType(flowType),
+		attrSelfServiceMethodUsed(method),
+		attrReason(err),
+		attrErrorReason(err),
+		attrFlowID(flowID),
+	)
+
+	var identityIDError *x.WithIdentityIDError
+	if errors.As(err, &identityIDError) {
+		attrs = append(attrs, semconv.AttrIdentityID(identityIDError.IdentityID()))
+	}
+
+	return RecoveryFailed.String(), trace.WithAttributes(attrs...)
 }
 
 func NewSettingsFailed(ctx context.Context, flowID uuid.UUID, flowType, method string, err error) (string, trace.EventOption) {
-	return SettingsFailed.String(),
-		trace.WithAttributes(append(
-			semconv.AttributesFromContext(ctx),
-			attrSelfServiceFlowType(flowType),
-			attrSelfServiceMethodUsed(method),
-			attrReason(err),
-			attrFlowID(flowID),
-		)...)
+	attrs := append(
+		semconv.AttributesFromContext(ctx),
+		attrSelfServiceFlowType(flowType),
+		attrSelfServiceMethodUsed(method),
+		attrReason(err),
+		attrErrorReason(err),
+		attrFlowID(flowID),
+	)
+
+	var identityIDError *x.WithIdentityIDError
+	if errors.As(err, &identityIDError) {
+		attrs = append(attrs, semconv.AttrIdentityID(identityIDError.IdentityID()))
+	}
+
+	return SettingsFailed.String(), trace.WithAttributes(attrs...)
 }
 
 func NewVerificationFailed(ctx context.Context, flowID uuid.UUID, flowType, method string, err error) (string, trace.EventOption) {
+	attrs := append(
+		semconv.AttributesFromContext(ctx),
+		attrSelfServiceFlowType(flowType),
+		attrSelfServiceMethodUsed(method),
+		attrReason(err),
+		attrErrorReason(err),
+		attrFlowID(flowID),
+	)
+
+	var identityIDError *x.WithIdentityIDError
+	if errors.As(err, &identityIDError) {
+		attrs = append(attrs, semconv.AttrIdentityID(identityIDError.IdentityID()))
+	}
+
 	return VerificationFailed.String(),
-		trace.WithAttributes(append(
-			semconv.AttributesFromContext(ctx),
-			attrSelfServiceFlowType(flowType),
-			attrSelfServiceMethodUsed(method),
-			attrReason(err),
-			attrFlowID(flowID),
-		)...)
+		trace.WithAttributes(attrs...)
 }
 
 func NewIdentityCreated(ctx context.Context, identityID uuid.UUID) (string, trace.EventOption) {
@@ -332,15 +412,22 @@ func NewIdentityUpdated(ctx context.Context, identityID uuid.UUID) (string, trac
 }
 
 func NewLoginFailed(ctx context.Context, flowID uuid.UUID, flowType, requestedAAL string, isRefresh bool, err error) (string, trace.EventOption) {
-	return LoginFailed.String(),
-		trace.WithAttributes(append(
-			semconv.AttributesFromContext(ctx),
-			attrSelfServiceFlowType(flowType),
-			attLoginRequestedAAL(requestedAAL),
-			attLoginRequestedPrivilegedSession(isRefresh),
-			attrReason(err),
-			attrFlowID(flowID),
-		)...)
+	attrs := append(
+		semconv.AttributesFromContext(ctx),
+		attrSelfServiceFlowType(flowType),
+		attLoginRequestedAAL(requestedAAL),
+		attLoginRequestedPrivilegedSession(isRefresh),
+		attrReason(err),
+		attrErrorReason(err),
+		attrFlowID(flowID),
+	)
+
+	var identityIDError *x.WithIdentityIDError
+	if errors.As(err, &identityIDError) {
+		attrs = append(attrs, semconv.AttrIdentityID(identityIDError.IdentityID()))
+	}
+
+	return LoginFailed.String(), trace.WithAttributes(attrs...)
 }
 
 func NewSessionRevoked(ctx context.Context, sessionID, identityID uuid.UUID) (string, trace.EventOption) {
@@ -412,8 +499,61 @@ func NewWebhookFailed(ctx context.Context, err error, triggerID uuid.UUID, id st
 				attrWebhookID(id),
 				attrWebhookTriggerID(triggerID),
 				otelattr.String("Error", err.Error()),
+				attrErrorReason(err),
 			)...,
 		)
+}
+
+// NewJsonnetMappingFailed is used to log errors that occur during the Jsonnet
+// mapping process. The jsonnetInput and jsonnetOutput is anonymized before
+// emitting the event.
+func NewJsonnetMappingFailed(ctx context.Context, err error, jsonnetInput []byte, jsonnetOutput, provider string, method string) (string, trace.EventOption) {
+	attrs := append(
+		semconv.AttributesFromContext(ctx),
+		attrErrorReason(err),
+		attrJsonnetInput(jsonnetInput),
+		attrSelfServiceSSOProviderUsed(provider),
+		attrSelfServiceMethodUsed(method),
+	)
+	if jsonnetOutput != "" {
+		attrs = append(attrs, attrJsonnetOutput(jsonnetOutput))
+	}
+	return JsonnetMappingFailed.String(),
+		trace.WithAttributes(
+			attrs...,
+		)
+}
+
+func NewLoginInitiated(ctx context.Context, flowID uuid.UUID, flowType string, refresh bool, organizationID uuid.NullUUID, requestedAAL string) (string, trace.EventOption) {
+	attrs := append(semconv.AttributesFromContext(ctx),
+		attrFlowID(flowID),
+		attrSelfServiceFlowType(flowType),
+		attrFlowRefresh(refresh),
+		attrFlowRequestedAAL(requestedAAL),
+	)
+
+	if organizationID.Valid {
+		attrs = append(attrs,
+			attrOrganizationID(organizationID.UUID.String()))
+	}
+
+	return LoginInitiated.String(),
+		trace.WithAttributes(attrs...)
+}
+
+func NewRegistrationInitiated(ctx context.Context, flowID uuid.UUID, flowType string, organizationID uuid.NullUUID) (string, trace.EventOption) {
+	attrs := append(semconv.AttributesFromContext(ctx),
+		attrFlowID(flowID),
+		attrSelfServiceFlowType(flowType),
+	)
+
+	if organizationID.Valid {
+		attrs = append(attrs,
+			attrOrganizationID(organizationID.UUID.String()))
+	}
+
+	return RegistrationInitiated.String(),
+		trace.WithAttributes(attrs...)
 }
 
 func reasonForError(err error) string {
@@ -424,4 +564,28 @@ func reasonForError(err error) string {
 		return r.Reason()
 	}
 	return err.Error()
+}
+
+func NewCourierMessageAbandoned(ctx context.Context, messageID uuid.UUID, channel string, templateType string) (string, trace.EventOption) {
+	return CourierMessageAbandoned.String(),
+		trace.WithAttributes(
+			append(
+				semconv.AttributesFromContext(ctx),
+				attrCourierMessageID(messageID),
+				attrCourierMessageChannel(channel),
+				attrCourierMessageTemplateType(templateType),
+			)...,
+		)
+}
+
+func NewCourierMessageDispatched(ctx context.Context, messageID uuid.UUID, channel string, templateType string) (string, trace.EventOption) {
+	return CourierMessageDispatched.String(),
+		trace.WithAttributes(
+			append(
+				semconv.AttributesFromContext(ctx),
+				attrCourierMessageID(messageID),
+				attrCourierMessageChannel(channel),
+				attrCourierMessageTemplateType(templateType),
+			)...,
+		)
 }

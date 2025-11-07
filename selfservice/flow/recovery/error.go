@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/gofrs/uuid"
 
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/x/events"
 
+	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
 
 	"github.com/ory/kratos/ui/node"
@@ -39,7 +42,7 @@ type (
 		errorx.ManagementProvider
 		x.WriterProvider
 		x.LoggingProvider
-		x.CSRFTokenGeneratorProvider
+		nosurfx.CSRFTokenGeneratorProvider
 		config.Provider
 		StrategyProvider
 
@@ -120,6 +123,8 @@ func (s *ErrorHandler) WriteFlowError(
 				http.Redirect(w, r, newFlow.AppendTo(s.d.Config().SelfServiceFlowRecoveryUI(r.Context())).String(), http.StatusSeeOther)
 			}
 		} else {
+			trace.SpanFromContext(r.Context()).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(r.Context(), "no_continue_with_transition_recovery_error_handler"))
+
 			// We need to use the new flow, as that flow will be a browser flow. Bug fix for:
 			//
 			// https://github.com/ory/kratos/issues/2049!!

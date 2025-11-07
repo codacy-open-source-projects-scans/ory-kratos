@@ -4,13 +4,13 @@
 package passkey_test
 
 import (
+	"context"
 	_ "embed"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
-
-	"github.com/ory/x/assertx"
-
-	"github.com/ory/kratos/selfservice/flow"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,12 +18,17 @@ import (
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/internal"
 	"github.com/ory/kratos/internal/registrationhelpers"
 	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
+	"github.com/ory/x/assertx"
+	"github.com/ory/x/contextx"
 	"github.com/ory/x/randx"
+	"github.com/ory/x/snapshotx"
 	"github.com/ory/x/sqlxx"
 )
 
@@ -82,7 +87,7 @@ func TestRegistration(t *testing.T) {
 	t.Run("AssertSchemaDoesNotExist", func(t *testing.T) {
 		t.Parallel()
 		reg := newRegistrationRegistry(t)
-		registrationhelpers.AssertSchemDoesNotExist(t, reg, flows, func(v url.Values) {
+		registrationhelpers.AssertSchemaDoesNotExist(t, reg, flows, func(v url.Values) {
 			v.Set(node.PasskeyRegister, "{}")
 			v.Del("method")
 		})
@@ -116,7 +121,7 @@ func TestRegistration(t *testing.T) {
 				client := testhelpers.NewClientWithCookies(t)
 				f := testhelpers.InitializeRegistrationFlowViaBrowser(t, client, fix.publicTS, flowIsSPA(flowType), false, false)
 				testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{
-					"2.attributes.value",
+					"0.attributes.value",
 					"3.attributes.src",
 					"3.attributes.nonce",
 					"6.attributes.value",
@@ -469,6 +474,154 @@ func TestRegistration(t *testing.T) {
 					assert.Equal(t, email, gjson.GetBytes(i.Traits, "username").String(), "%s", actual)
 				})
 			}
+		})
+	})
+
+	t.Run("case=multi-schema registration", func(t *testing.T) {
+		t.Parallel()
+		fix := newRegistrationFixture(t)
+		fix.enableSessionAfterRegistration()
+
+		var values = func(email string) func(v url.Values) {
+			return func(v url.Values) {
+				v.Set("traits.username", email)
+				v.Set("traits.foobar", "bazbar")
+				v.Set(node.PasskeyRegister, string(registrationFixtureSuccessResponse))
+				v.Del("method")
+			}
+		}
+		var invalidValues = func(email string) func(v url.Values) {
+			return func(v url.Values) {
+				v.Set("traits.username", email)
+				v.Set("traits.foobar", "b")
+				v.Set(node.PasskeyRegister, string(registrationFixtureSuccessResponse))
+				v.Del("method")
+			}
+		}
+
+		fix.conf.MustSet(fix.ctx, config.ViperKeyDefaultIdentitySchemaID, "does-not-exist")
+		fix.conf.MustSet(fix.ctx, config.ViperKeyIdentitySchemas, config.Schemas{
+			{ID: "does-not-exist", URL: "file://./stub/profile.schema.json"},
+			{ID: "advanced-user", URL: "file://./stub/registration.schema.json", SelfserviceSelectable: true},
+		})
+
+		for _, f := range flows {
+			t.Run("type="+f, func(t *testing.T) {
+				t.Run("should create the identity and a session and use the correct schema", func(t *testing.T) {
+					email := testhelpers.RandomEmail()
+					userID := f + "-user-" + randx.MustString(8, randx.AlphaNum)
+					actual := fix.makeSuccessfulRegistration(t, f, fix.redirTS.URL+"/registration-return-ts", values(email), withUserID(userID), withInitFlowWithOption([]testhelpers.InitFlowWithOption{testhelpers.InitFlowWithIdentitySchema("advanced-user")}))
+
+					prefix := getPrefix(f)
+
+					assert.Equal(t, email, gjson.Get(actual, prefix+"identity.traits.username").String(), "%s", actual)
+					assert.True(t, gjson.Get(actual, prefix+"active").Bool(), "%s", actual)
+
+					i, _, err := fix.reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(fix.ctx, identity.CredentialsTypePasskey, userID)
+					require.NoError(t, err)
+					assert.Equal(t, email, gjson.GetBytes(i.Traits, "username").String(), "%s", actual)
+					assert.Equal(t, "advanced-user", i.SchemaID, "%s", actual)
+				})
+
+				t.Run("registration should fail with invalid form data using the correct schema", func(t *testing.T) {
+					email := testhelpers.RandomEmail()
+					userID := f + "-user-" + randx.MustString(8, randx.AlphaNum)
+					actual, res := fix.makeUnsuccessfulRegistration(t, f, fix.redirTS.URL+"/registration-return-ts", invalidValues(email), withUserID(userID), withInitFlowWithOption([]testhelpers.InitFlowWithOption{testhelpers.InitFlowWithIdentitySchema("advanced-user")}))
+
+					if f == "browser" {
+						assert.Equal(t, http.StatusOK, res.StatusCode, "%s", actual)
+					} else {
+						assert.Equal(t, http.StatusBadRequest, res.StatusCode, "%s", actual)
+					}
+					assert.Equal(t, int64(4000003), gjson.Get(actual, "ui.nodes.#(attributes.name==traits.foobar).messages.0.id").Int(), "%s", actual)
+					assert.Equal(t, "length must be \u003e= 2, but got 1", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.foobar).messages.0.text").String(), "%s", actual)
+				})
+			})
+		}
+	})
+}
+
+func TestPopulateRegistrationMethod(t *testing.T) {
+	ctx := context.Background()
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+
+	ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://stub/registration.schema.json")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyPasskeyRPDisplayName, "localhost")
+	ctx = contextx.WithConfigValue(ctx, config.ViperKeyPasskeyRPID, "localhost")
+
+	s, err := reg.AllRegistrationStrategies().Strategy(identity.CredentialsTypePasskey)
+	require.NoError(t, err)
+
+	fh, ok := s.(registration.FormHydrator)
+	require.True(t, ok)
+
+	toSnapshot := func(t *testing.T, f node.Nodes, except ...snapshotx.Opt) {
+		t.Helper()
+		// The CSRF token has a unique value that messes with the snapshot - ignore it.
+		f.ResetNodes("csrf_token")
+		snapshotx.SnapshotT(t, f, append(except, snapshotx.ExceptNestedKeys("nonce", "src"))...)
+	}
+
+	newFlow := func(ctx context.Context, t *testing.T) (*http.Request, *registration.Flow) {
+		r := httptest.NewRequest("GET", "/self-service/registration/browser", nil)
+		r = r.WithContext(ctx)
+		t.Helper()
+		f, err := registration.NewFlow(conf, time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f.UI.Nodes = make(node.Nodes, 0)
+		require.NoError(t, err)
+		return r, f
+	}
+
+	t.Run("method=PopulateRegistrationMethod", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethod(r, f))
+		toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+	})
+
+	t.Run("method=PopulateRegistrationMethodProfile", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+		toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+	})
+
+	t.Run("method=PopulateRegistrationMethodCredentials", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+		require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+		toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+	})
+
+	t.Run("method=idempotency", func(t *testing.T) {
+		r, f := newFlow(ctx, t)
+
+		var snapshots []node.Nodes
+
+		t.Run("case=1", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+		})
+
+		t.Run("case=2", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+		})
+
+		t.Run("case=3", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodProfile(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+		})
+
+		t.Run("case=4", func(t *testing.T) {
+			require.NoError(t, fh.PopulateRegistrationMethodCredentials(r, f))
+			snapshots = append(snapshots, f.UI.Nodes)
+			toSnapshot(t, f.UI.Nodes, snapshotx.ExceptPaths("1.attributes.value"))
+		})
+
+		t.Run("case=evaluate", func(t *testing.T) {
+			assertx.EqualAsJSON(t, snapshots[0], snapshots[2])
+			assertx.EqualAsJSONExcept(t, snapshots[1], snapshots[3], []string{"3.attributes.nonce"})
 		})
 	})
 }

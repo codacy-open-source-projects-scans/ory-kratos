@@ -9,13 +9,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/selfservice/strategy/code"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/sqlcon"
 )
@@ -42,9 +42,10 @@ func withCheckIdentityID(id uuid.UUID) codeOption {
 func useOneTimeCode[P any, U interface {
 	*P
 	oneTimeCodeProvider
-}](ctx context.Context, p *Persister, flowID uuid.UUID, userProvidedCode string, flowTableName string, foreignKeyName string, opts ...codeOption,
+}](ctx context.Context, p *Persister, flowID uuid.UUID, userProvidedCode, flowTableName, foreignKeyName string, opts ...codeOption,
 ) (target U, err error) {
-	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.useOneTimeCode")
+	maxSubmissions := p.r.Config().SelfServiceCodeMethodMaxSubmissions(ctx)
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.useOneTimeCode", trace.WithAttributes(attribute.Int("max_submissions", maxSubmissions)))
 	defer otelx.End(span, &err)
 
 	o := new(codeOptions)
@@ -60,7 +61,8 @@ func useOneTimeCode[P any, U interface {
 	if err != nil {
 		return nil, err
 	}
-	if submitCount > 5 {
+
+	if submitCount > maxSubmissions {
 		return nil, errors.WithStack(code.ErrCodeSubmittedTooOften)
 	}
 

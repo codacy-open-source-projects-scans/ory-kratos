@@ -57,8 +57,9 @@ func (s *Strategy) SettingsStrategyID() string {
 	return s.ID().String()
 }
 
-func (s *Strategy) decoderSettings(ctx context.Context, p *updateSettingsFlowWithOidcMethod, r *http.Request) error {
-	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(ctx)
+func (s *Strategy) decoderSettings(ctx context.Context, p *updateSettingsFlowWithOidcMethod, r *http.Request, settingsFlow *settings.Flow) error {
+	schema := flow.IdentitySchema(settingsFlow.Identity.SchemaID)
+	ds, err := schema.URL(ctx, s.d.Config())
 	if err != nil {
 		return err
 	}
@@ -260,7 +261,7 @@ func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.
 	defer otelx.End(span, &err)
 
 	var p updateSettingsFlowWithOidcMethod
-	if err := s.decoderSettings(ctx, &p, r); err != nil {
+	if err := s.decoderSettings(ctx, &p, r, f); err != nil {
 		return nil, err
 	}
 	f.TransientPayload = p.TransientPayload
@@ -268,7 +269,7 @@ func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.
 	ctxUpdate, err := settings.PrepareUpdate(s.d, w, r, f, ss, settings.ContinuityKey(s.SettingsStrategyID()), &p)
 	if errors.Is(err, settings.ErrContinuePreviousAction) {
 		if !s.d.Config().SelfServiceStrategy(ctx, s.SettingsStrategyID()).Enabled {
-			return nil, errors.WithStack(herodot.ErrNotFound.WithReason(strategy.EndpointDisabledMessage))
+			return nil, s.handleMethodNotAllowedError(errors.WithStack(herodot.ErrNotFound.WithReason(strategy.EndpointDisabledMessage)))
 		}
 
 		if len(p.Link) > 0 {
@@ -285,7 +286,7 @@ func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.
 			return ctxUpdate, nil
 		}
 
-		return nil, s.handleSettingsError(ctx, w, r, ctxUpdate, &p, errors.WithStack(herodot.ErrInternalServerError.WithReason("Expected either link or unlink to be set when continuing flow but both are unset.")))
+		return nil, s.handleSettingsError(ctx, w, r, ctxUpdate, &p, errors.WithStack(herodot.ErrBadRequest.WithReason("Expected either link or unlink to be set when continuing flow but both are unset.")))
 	} else if err != nil {
 		return nil, s.handleSettingsError(ctx, w, r, ctxUpdate, &p, err)
 	}
@@ -296,7 +297,7 @@ func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.
 	}
 
 	if !s.d.Config().SelfServiceStrategy(ctx, s.SettingsStrategyID()).Enabled {
-		return nil, errors.WithStack(herodot.ErrNotFound.WithReason(strategy.EndpointDisabledMessage))
+		return nil, s.handleMethodNotAllowedError(errors.WithStack(herodot.ErrNotFound.WithReason(strategy.EndpointDisabledMessage)))
 	}
 
 	switch l, u := len(p.Link), len(p.Unlink); {
@@ -359,7 +360,7 @@ func (s *Strategy) initLinkProvider(ctx context.Context, w http.ResponseWriter, 
 		return s.handleSettingsError(ctx, w, r, ctxUpdate, p, errors.WithStack(settings.NewFlowNeedsReAuth()))
 	}
 
-	provider, err := s.provider(ctx, p.Link)
+	provider, err := s.Provider(ctx, p.Link)
 	if err != nil {
 		return s.handleSettingsError(ctx, w, r, ctxUpdate, p, err)
 	}
@@ -417,6 +418,20 @@ func (s *Strategy) linkProvider(ctx context.Context, w http.ResponseWriter, r *h
 	}
 
 	if err := s.linkCredentials(ctx, i, token, provider.Config().ID, claims.Subject, provider.Config().OrganizationID); err != nil {
+		return s.handleSettingsError(ctx, w, r, ctxUpdate, p, err)
+	}
+
+	// Add authentication method to session after
+	// linking with 3rd party OIDC provider
+	if err := s.d.SessionManager().SessionAddAuthenticationMethods(
+		ctx,
+		ctxUpdate.Session.ID,
+		session.AuthenticationMethod{
+			Method:       s.ID(),
+			AAL:          identity.AuthenticatorAssuranceLevel1,
+			Provider:     provider.Config().ID,
+			Organization: provider.Config().OrganizationID,
+		}); err != nil {
 		return s.handleSettingsError(ctx, w, r, ctxUpdate, p, err)
 	}
 

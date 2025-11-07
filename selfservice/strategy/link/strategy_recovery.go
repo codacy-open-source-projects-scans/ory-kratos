@@ -10,9 +10,9 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/gobuffalo/pop/v6"
+	"github.com/ory/kratos/x/redir"
+
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -28,6 +28,7 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/events"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/pointerx"
@@ -46,7 +47,7 @@ func (s *Strategy) RecoveryStrategyID() string {
 
 func (s *Strategy) RegisterPublicRecoveryRoutes(public *x.RouterPublic) {
 	s.d.CSRFHandler().IgnorePath(RouteAdminCreateRecoveryLink)
-	public.POST(RouteAdminCreateRecoveryLink, x.RedirectToAdminRoute(s.d))
+	public.POST(RouteAdminCreateRecoveryLink, redir.RedirectToAdminRoute(s.d))
 }
 
 func (s *Strategy) RegisterAdminRecoveryRoutes(admin *x.RouterAdmin) {
@@ -146,7 +147,7 @@ type recoveryLinkForIdentity struct {
 //	  400: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (s *Strategy) createRecoveryLinkForIdentity(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (s *Strategy) createRecoveryLinkForIdentity(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var p createRecoveryLinkForIdentityBody
@@ -273,9 +274,9 @@ func (s *Strategy) Recover(w http.ResponseWriter, r *http.Request, f *recovery.F
 
 	if _, err := s.d.SessionManager().FetchFromRequest(r.Context(), r); err == nil {
 		if x.IsJSONRequest(r) {
-			session.RespondWithJSONErrorOnAuthenticated(s.d.Writer(), recovery.ErrAlreadyLoggedIn)(w, r, nil)
+			session.RespondWithJSONErrorOnAuthenticated(s.d.Writer(), recovery.ErrAlreadyLoggedIn)(w, r)
 		} else {
-			session.RedirectOnAuthenticated(s.d)(w, r, nil)
+			session.RedirectOnAuthenticated(s.d)(w, r)
 		}
 		return errors.WithStack(flow.ErrCompletedByStrategy)
 	}
@@ -347,7 +348,7 @@ func (s *Strategy) recoveryIssueSession(ctx context.Context, w http.ResponseWrit
 		returnTo = returnToURL.String()
 	}
 
-	sf.RequestURL, err = x.TakeOverReturnToParameter(f.RequestURL, sf.RequestURL, returnTo)
+	sf.RequestURL, err = redir.TakeOverReturnToParameter(f.RequestURL, sf.RequestURL, returnTo)
 	if err != nil {
 		return s.retryRecoveryFlowWithError(w, r, flow.TypeBrowser, err)
 	}
@@ -504,7 +505,7 @@ func (s *Strategy) markRecoveryAddressVerified(w http.ResponseWriter, r *http.Re
 			id.VerifiableAddresses[k].Verified = true
 			id.VerifiableAddresses[k].VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now().UTC()))
 			id.VerifiableAddresses[k].Status = identity.VerifiableAddressStatusCompleted
-			if err := s.d.PrivilegedIdentityPool().UpdateVerifiableAddress(r.Context(), &id.VerifiableAddresses[k]); err != nil {
+			if err := s.d.PrivilegedIdentityPool().UpdateVerifiableAddress(r.Context(), &id.VerifiableAddresses[k], "verified", "verified_at", "status"); err != nil {
 				return s.HandleRecoveryError(w, r, f, nil, err)
 			}
 		}

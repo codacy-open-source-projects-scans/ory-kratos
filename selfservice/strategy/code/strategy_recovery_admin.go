@@ -9,9 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
-	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/trace"
 
@@ -24,6 +22,8 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/events"
+	"github.com/ory/kratos/x/redir"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/urlx"
@@ -35,7 +35,7 @@ const (
 
 func (s *Strategy) RegisterPublicRecoveryRoutes(public *x.RouterPublic) {
 	s.deps.CSRFHandler().IgnorePath(RouteAdminCreateRecoveryCode)
-	public.POST(RouteAdminCreateRecoveryCode, x.RedirectToAdminRoute(s.deps))
+	public.POST(RouteAdminCreateRecoveryCode, redir.RedirectToAdminRoute(s.deps))
 }
 
 func (s *Strategy) RegisterAdminRecoveryRoutes(admin *x.RouterAdmin) {
@@ -137,7 +137,7 @@ type recoveryCodeForIdentity struct {
 //	  400: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
-func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.Request) {
 	var p createRecoveryCodeForIdentityBody
 	if err := s.dx.Decode(r, &p, decoderx.HTTPJSONDecoder()); err != nil {
 		s.deps.Writer().WriteError(w, r, err)
