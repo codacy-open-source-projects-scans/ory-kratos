@@ -16,6 +16,7 @@ import (
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/continuity"
+	oidcv1 "github.com/ory/kratos/gen/oidc/v1"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/login"
@@ -99,7 +100,7 @@ type UpdateLoginFlowWithOidcMethod struct {
 	TransientPayload json.RawMessage `json:"transient_payload,omitempty" form:"transient_payload"`
 }
 
-func (s *Strategy) handleConflictingIdentity(ctx context.Context, w http.ResponseWriter, r *http.Request, loginFlow *login.Flow, token *identity.CredentialsOIDCEncryptedTokens, claims *Claims, provider Provider, container *AuthCodeContainer) (verdict ConflictingIdentityVerdict, id *identity.Identity, credentials *identity.Credentials, err error) {
+func (s *Strategy) handleConflictingIdentity(ctx context.Context, loginFlow *login.Flow, token *identity.CredentialsOIDCEncryptedTokens, claims *Claims, provider Provider, container *AuthCodeContainer) (verdict ConflictingIdentityVerdict, id *identity.Identity, credentials *identity.Credentials, err error) {
 	if s.conflictingIdentityPolicy == nil {
 		return ConflictingIdentityVerdictReject, nil, nil, nil
 	}
@@ -167,7 +168,7 @@ func (s *Strategy) ProcessLogin(ctx context.Context, w http.ResponseWriter, r *h
 	if err != nil {
 		if errors.Is(err, sqlcon.ErrNoRows) {
 			var verdict ConflictingIdentityVerdict
-			verdict, i, c, err = s.handleConflictingIdentity(ctx, w, r, loginFlow, token, claims, provider, container)
+			verdict, i, c, err = s.handleConflictingIdentity(ctx, loginFlow, token, claims, provider, container)
 			switch verdict {
 			case ConflictingIdentityVerdictMerge:
 				// Do nothing
@@ -302,7 +303,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		return nil, s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
 
-	req, err := s.validateFlow(ctx, r, f.ID)
+	req, err := s.validateFlow(ctx, r, f.ID, oidcv1.FlowKind_FLOW_KIND_LOGIN)
 	if err != nil {
 		return nil, s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
@@ -330,7 +331,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		return nil, errors.WithStack(flow.ErrCompletedByStrategy)
 	}
 
-	state, pkce, err := s.GenerateState(ctx, provider, f.ID)
+	state, pkce, err := s.GenerateState(ctx, provider, f)
 	if err != nil {
 		return nil, s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
