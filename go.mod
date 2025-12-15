@@ -49,7 +49,7 @@ require (
 	github.com/inhies/go-bytesize v0.0.0-20220417184213-4913239db9cf
 	github.com/jarcoal/httpmock v1.3.1
 	github.com/jmoiron/sqlx v1.4.0
-	github.com/julienschmidt/httprouter v1.3.0
+	github.com/julienschmidt/httprouter v1.3.1-0.20240130105656-484018016424
 	github.com/knadh/koanf/parsers/json v0.1.0
 	github.com/laher/mergefs v0.1.2-0.20230223191438-d16611b2f4e7 // indirect
 	github.com/lestrrat-go/jwx/v2 v2.1.1
@@ -64,7 +64,7 @@ require (
 	github.com/ory/jsonschema/v3 v3.0.9-0.20250317235931-280c5fc7bf0e
 	github.com/ory/mail/v3 v3.0.0
 	github.com/ory/nosurf v1.2.7
-	github.com/ory/pop/v6 v6.3.1
+	github.com/ory/pop/v6 v6.3.2-0.20251203152233-a32233875f7e
 	github.com/ory/x v0.0.0-00010101000000-000000000000
 	github.com/peterhellberg/link v1.2.0
 	github.com/phayes/freeport v0.0.0-20220201140144-74d24b5ae9f5
