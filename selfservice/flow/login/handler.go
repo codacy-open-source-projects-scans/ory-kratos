@@ -30,8 +30,9 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
-	"github.com/ory/x/decoderx"
 	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/sqlxx"
@@ -49,7 +50,7 @@ const (
 )
 
 type (
-	handlerDependencies interface {
+	dependencies interface {
 		HookExecutorProvider
 		FlowPersistenceProvider
 		errorx.ManagementProvider
@@ -57,25 +58,22 @@ type (
 		StrategyProvider
 		session.HandlerProvider
 		session.ManagementProvider
-		x.WriterProvider
+		httpx.WriterProvider
 		nosurfx.CSRFTokenGeneratorProvider
 		nosurfx.CSRFProvider
-		x.TracingProvider
+		otelx.Provider
 		config.Provider
 		ErrorHandlerProvider
 		sessiontokenexchange.PersistenceProvider
-		x.LoggingProvider
+		logrusx.Provider
 	}
 	HandlerProvider interface {
 		LoginHandler() *Handler
 	}
-	Handler struct {
-		d  handlerDependencies
-		hd *decoderx.HTTP
-	}
+	Handler struct{ d dependencies }
 )
 
-func NewHandler(d handlerDependencies) *Handler { return &Handler{d: d, hd: decoderx.NewHTTP()} }
+func NewHandler(d dependencies) *Handler { return &Handler{d: d} }
 
 func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
@@ -129,6 +127,12 @@ func WithFormErrorMessage(messages []text.Message) FlowOption {
 func WithIsAccountLinking() FlowOption {
 	return func(f *Flow) {
 		f.isAccountLinkingFlow = true
+	}
+}
+
+func WithLoginChallenge(loginChallenge string) FlowOption {
+	return func(f *Flow) {
+		f.OAuth2LoginChallenge = sqlxx.NullString(loginChallenge)
 	}
 }
 

@@ -12,6 +12,10 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/otelx"
+
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/x/httprouterx"
@@ -27,8 +31,6 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
-	"github.com/ory/x/decoderx"
-
 	"github.com/ory/herodot"
 
 	"github.com/ory/kratos/driver/config"
@@ -39,9 +41,9 @@ type (
 	handlerDependencies interface {
 		ManagementProvider
 		PersistenceProvider
-		x.WriterProvider
-		x.TracingProvider
-		x.LoggingProvider
+		httpx.WriterProvider
+		otelx.Provider
+		logrusx.Provider
 		nosurfx.CSRFProvider
 		config.Provider
 		sessiontokenexchange.PersistenceProvider
@@ -50,20 +52,10 @@ type (
 	HandlerProvider interface {
 		SessionHandler() *Handler
 	}
-	Handler struct {
-		r  handlerDependencies
-		dx *decoderx.HTTP
-	}
+	Handler struct{ r handlerDependencies }
 )
 
-func NewHandler(
-	r handlerDependencies,
-) *Handler {
-	return &Handler{
-		r:  r,
-		dx: decoderx.NewHTTP(),
-	}
-}
+func NewHandler(r handlerDependencies) *Handler { return &Handler{r: r} }
 
 const (
 	RouteCollection                  = "/sessions"
@@ -227,7 +219,7 @@ func (h *Handler) whoami(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Ory-Session-Cache-For", fmt.Sprintf("%d", int64(time.Minute.Seconds())))
 		}
 
-		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session found.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session found.")
 		h.r.Writer().WriteError(w, r, ErrNoSessionFound.WithWrap(err))
 		return
 	}
@@ -237,11 +229,11 @@ func (h *Handler) whoami(w http.ResponseWriter, r *http.Request) {
 		// For the time being we want to update the AAL in the database if it is unset.
 		UpsertAAL,
 	); errors.As(err, &aalErr) {
-		h.r.Audit().WithRequest(r).WithError(err).Info("Session was found but AAL is not satisfied for calling this endpoint.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("Session was found but AAL is not satisfied for calling this endpoint.")
 		h.r.Writer().WriteError(w, r, err)
 		return
 	} else if err != nil {
-		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized.WithWrap(err).WithReasonf("Unable to determine AAL."))
 		return
 	}
@@ -271,7 +263,7 @@ func (h *Handler) whoami(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.r.SessionManager().RefreshCookie(ctx, w, r, s); err != nil {
-		h.r.Audit().WithRequest(r).WithError(err).Info("Could not re-issue cookie.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("Could not re-issue cookie.")
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
@@ -685,7 +677,7 @@ type disableMyOtherSessions struct {
 func (h *Handler) deleteMySessions(w http.ResponseWriter, r *http.Request) {
 	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
 	if err != nil {
-		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized.WithWrap(err).WithReasonf("No valid session cookie found."))
 		return
 	}
@@ -751,7 +743,7 @@ func (h *Handler) deleteMySession(w http.ResponseWriter, r *http.Request) {
 
 	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
 	if err != nil {
-		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized.WithWrap(err).WithReasonf("No valid session cookie found."))
 		return
 	}
@@ -828,7 +820,7 @@ type listMySessionsResponse struct {
 func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request) {
 	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
 	if err != nil {
-		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrUnauthorized.WithWrap(err).WithReasonf("No valid session cookie found.")))
 		return
 	}
@@ -837,11 +829,11 @@ func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request) {
 
 	var aalErr *ErrAALNotSatisfied
 	if err := h.r.SessionManager().DoesSessionSatisfy(r.Context(), s, c.SessionWhoAmIAAL(r.Context())); errors.As(err, &aalErr) {
-		h.r.Audit().WithRequest(r).WithError(err).Info("Session was found but AAL is not satisfied for calling this endpoint.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("Session was found but AAL is not satisfied for calling this endpoint.")
 		h.r.Writer().WriteError(w, r, err)
 		return
 	} else if err != nil {
-		h.r.Audit().WithRequest(r).WithError(err).Info("No valid session cookie found.")
+		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized.WithWrap(err).WithReasonf("Unable to determine AAL."))
 		return
 	}

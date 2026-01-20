@@ -10,8 +10,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/ory/kratos/hydra"
+	"github.com/ory/kratos/x/nosurfx"
+
 	"github.com/samber/lo"
+
+	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/herodot"
@@ -33,8 +37,9 @@ import (
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
-	"github.com/ory/kratos/x/nosurfx"
-	"github.com/ory/x/decoderx"
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+	"github.com/ory/x/otelx"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/urlx"
 )
@@ -54,12 +59,12 @@ type (
 		*container.Container
 	}
 
-	strategyDependencies interface {
+	dependencies interface {
 		nosurfx.CSRFProvider
 		nosurfx.CSRFTokenGeneratorProvider
-		x.WriterProvider
-		x.LoggingProvider
-		x.TracingProvider
+		httpx.WriterProvider
+		logrusx.Provider
+		otelx.Provider
 		x.TransactionPersistenceProvider
 
 		config.Provider
@@ -106,12 +111,11 @@ type (
 		sessiontokenexchange.PersistenceProvider
 
 		continuity.ManagementProvider
+
+		hydra.Provider
 	}
 
-	Strategy struct {
-		deps strategyDependencies
-		dx   *decoderx.HTTP
-	}
+	Strategy struct{ deps dependencies }
 
 	codeIdentifier struct {
 		Identifier string `json:"identifier"`
@@ -175,9 +179,7 @@ func (s *Strategy) CountActiveMultiFactorCredentials(ctx context.Context, cc map
 	return validAddresses, nil
 }
 
-func NewStrategy(deps strategyDependencies) *Strategy {
-	return &Strategy{deps: deps, dx: decoderx.NewHTTP()}
-}
+func NewStrategy(deps dependencies) *Strategy { return &Strategy{deps: deps} }
 
 func (s *Strategy) ID() identity.CredentialsType {
 	return identity.CredentialsTypeCodeAuth

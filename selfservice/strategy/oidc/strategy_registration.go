@@ -146,7 +146,7 @@ func (s *Strategy) newLinkDecoder(ctx context.Context, p interface{}, r *http.Re
 		return errors.WithStack(err)
 	}
 
-	if err := s.dec.Decode(r, &p, compiler,
+	if err := decoderx.Decode(r, &p, compiler,
 		decoderx.HTTPKeepRequestBody(true),
 		decoderx.HTTPDecoderSetValidatePayloads(false),
 		decoderx.HTTPDecoderUseQueryAndBody(),
@@ -180,7 +180,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 
 	if !strings.EqualFold(strings.ToLower(p.Method), s.SettingsStrategyID()) && p.Method != "" {
 		// the user is sending a method that is not oidc, but the payload includes a provider
-		s.d.Audit().
+		s.d.Logger().
 			WithRequest(r).
 			WithField("provider", p.Provider).
 			WithField("method", p.Method).
@@ -274,6 +274,9 @@ func (s *Strategy) registrationToLogin(ctx context.Context, w http.ResponseWrite
 	}
 
 	opts = append(opts, login.WithInternalContext(rf.InternalContext), login.WithIsAccountLinking())
+	if rf.OAuth2LoginChallenge != "" {
+		opts = append(opts, login.WithLoginChallenge(rf.OAuth2LoginChallenge.String()))
+	}
 
 	lf, _, err := s.d.LoginHandler().NewLoginFlow(w, r, rf.Type, opts...)
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
 
 	"github.com/gofrs/uuid"
 
@@ -52,11 +53,11 @@ const (
 )
 
 type (
-	handlerDependencies interface {
+	dependencies interface {
 		PoolProvider
 		PrivilegedPoolProvider
 		ManagementProvider
-		x.WriterProvider
+		httpx.WriterProvider
 		config.Provider
 		nosurfx.CSRFProvider
 		cipher.Provider
@@ -65,18 +66,10 @@ type (
 	HandlerProvider interface {
 		IdentityHandler() *Handler
 	}
-	Handler struct {
-		r  handlerDependencies
-		dx *decoderx.HTTP
-	}
+	Handler struct{ r dependencies }
 )
 
-func NewHandler(r handlerDependencies) *Handler {
-	return &Handler{
-		r:  r,
-		dx: decoderx.NewHTTP(),
-	}
-}
+func NewHandler(r dependencies) *Handler { return &Handler{r: r} }
 
 func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.r.CSRFHandler().IgnoreGlobs(
@@ -940,7 +933,7 @@ type UpdateIdentityBody struct {
 //	  default: errorGeneric
 func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 	var ur UpdateIdentityBody
-	if err := h.dx.Decode(r, &ur,
+	if err := decoderx.Decode(r, &ur,
 		decoderx.HTTPJSONDecoder()); err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return

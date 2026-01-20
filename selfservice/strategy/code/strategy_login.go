@@ -159,7 +159,7 @@ func (s *Strategy) methodEnabledAndAllowedFromRequest(r *http.Request, f *login.
 		return nil, errors.WithStack(err)
 	}
 
-	if err := decoderx.NewHTTP().Decode(r, &method, compiler,
+	if err := decoderx.Decode(r, &method, compiler,
 		decoderx.HTTPKeepRequestBody(true),
 		decoderx.HTTPDecoderAllowedMethods("POST", "PUT", "PATCH", "GET"),
 		decoderx.HTTPDecoderSetValidatePayloads(false),
@@ -207,7 +207,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	}
 
 	var p updateLoginFlowWithCodeMethod
-	if err := s.dx.Decode(r, &p,
+	if err := decoderx.Decode(r, &p,
 		decoderx.HTTPDecoderSetValidatePayloads(true),
 		decoderx.HTTPKeepRequestBody(true),
 		decoderx.MustHTTPRawJSONSchemaCompiler(loginMethodSchema),
@@ -260,7 +260,7 @@ func (s *Strategy) FastLogin1FA(w http.ResponseWriter, r *http.Request, f *login
 	}
 
 	var p1 idfirst.UpdateLoginFlowWithIdentifierFirstMethod
-	if err := s.dx.Decode(r, &p1,
+	if err := decoderx.Decode(r, &p1,
 		decoderx.HTTPDecoderSetValidatePayloads(true),
 		decoderx.MustHTTPRawJSONSchemaCompiler(idfirst.LoginSchema),
 		decoderx.HTTPDecoderJSONFollowsFormFormat()); err != nil {
@@ -511,6 +511,14 @@ func (s *Strategy) loginSendCode(ctx context.Context, w http.ResponseWriter, r *
 	f.Active = identity.CredentialsTypeCodeAuth
 	if err = s.deps.LoginFlowPersister().UpdateLoginFlow(ctx, f); err != nil {
 		return err
+	}
+
+	if f.OAuth2LoginChallenge != "" {
+		hlr, err := s.deps.Hydra().GetLoginRequest(ctx, string(f.OAuth2LoginChallenge))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		f.HydraLoginRequest = hlr
 	}
 
 	if x.IsJSONRequest(r) {

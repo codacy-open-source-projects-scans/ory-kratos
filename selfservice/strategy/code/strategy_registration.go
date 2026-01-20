@@ -26,8 +26,10 @@ import (
 	"github.com/ory/x/urlx"
 )
 
-var _ registration.Strategy = new(Strategy)
-var _ registration.FormHydrator = new(Strategy)
+var (
+	_ registration.Strategy     = new(Strategy)
+	_ registration.FormHydrator = new(Strategy)
+)
 
 // Update Registration Flow with Code Method
 //
@@ -182,7 +184,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 	}
 
 	var p updateRegistrationFlowWithCodeMethod
-	if err := registration.DecodeBody(&p, r, s.dx, s.deps.Config(), registrationSchema, ds); err != nil {
+	if err := registration.DecodeBody(&p, r, registrationSchema, ds); err != nil {
 		return s.HandleRegistrationError(ctx, r, f, &p, err)
 	}
 
@@ -253,6 +255,14 @@ func (s *Strategy) registrationSendEmail(ctx context.Context, w http.ResponseWri
 	f.Active = identity.CredentialsTypeCodeAuth
 	if err := s.deps.RegistrationFlowPersister().UpdateRegistrationFlow(ctx, f); err != nil {
 		return errors.WithStack(err)
+	}
+
+	if f.OAuth2LoginChallenge != "" {
+		hlr, err := s.deps.Hydra().GetLoginRequest(ctx, string(f.OAuth2LoginChallenge))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		f.HydraLoginRequest = hlr
 	}
 
 	if x.IsJSONRequest(r) {

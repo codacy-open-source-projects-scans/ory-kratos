@@ -139,7 +139,7 @@ type recoveryCodeForIdentity struct {
 //	  default: errorGeneric
 func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.Request) {
 	var p createRecoveryCodeForIdentityBody
-	if err := s.dx.Decode(r, &p, decoderx.HTTPJSONDecoder()); err != nil {
+	if err := decoderx.Decode(r, &p, decoderx.HTTPJSONDecoder()); err != nil {
 		s.deps.Writer().WriteError(w, r, err)
 		return
 	}
@@ -228,7 +228,7 @@ func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.
 		events.NewRecoveryInitiatedByAdmin(ctx, recoveryFlow.ID, id.ID, flowType.String(), "code"),
 	)
 
-	s.deps.Audit().
+	s.deps.Logger().
 		WithField("identity_id", id.ID).
 		WithSensitiveField("recovery_code", rawCode).
 		Info("A recovery code has been created.")

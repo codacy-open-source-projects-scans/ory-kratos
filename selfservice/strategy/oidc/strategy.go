@@ -45,9 +45,10 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
-	"github.com/ory/x/decoderx"
 	"github.com/ory/x/httprouterx"
+	"github.com/ory/x/httpx"
 	"github.com/ory/x/jsonnetsecure"
+	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/reqlog"
@@ -74,13 +75,13 @@ type Dependencies interface {
 
 	config.Provider
 
-	x.LoggingProvider
+	logrusx.Provider
 	x.CookieProvider
 	nosurfx.CSRFProvider
 	nosurfx.CSRFTokenGeneratorProvider
-	x.WriterProvider
-	x.HTTPClientProvider
-	x.TracingProvider
+	httpx.WriterProvider
+	httpx.ClientProvider
+	otelx.Provider
 
 	identity.ValidationProvider
 	identity.PrivilegedPoolProvider
@@ -145,7 +146,6 @@ const (
 type Strategy struct {
 	d                           Dependencies
 	validator                   *schema.Validator
-	dec                         *decoderx.HTTP
 	credType                    identity.CredentialsType
 	handleUnknownProviderError  func(err error) error
 	handleMethodNotAllowedError func(err error) error

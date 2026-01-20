@@ -8,12 +8,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/pkg/errors"
 
+	"github.com/ory/x/httpx"
+	"github.com/ory/x/logrusx"
+
 	"github.com/ory/kratos/courier/template"
 	"github.com/ory/kratos/request"
-	"github.com/ory/kratos/x"
 	"github.com/ory/x/jsonnetsecure"
 	"github.com/ory/x/otelx"
 )
@@ -25,9 +28,9 @@ type (
 		d             channelDependencies
 	}
 	channelDependencies interface {
-		x.TracingProvider
-		x.LoggingProvider
-		x.HTTPClientProvider
+		otelx.Provider
+		logrusx.Provider
+		httpx.ClientProvider
 		jsonnetsecure.VMProvider
 		ConfigProvider
 	}
@@ -91,7 +94,11 @@ func (c *httpChannel) Dispatch(ctx context.Context, msg Message) (err error) {
 	}
 	req = req.WithContext(ctx)
 
-	res, err := c.d.HTTPClient(ctx).Do(req)
+	res, err := c.d.HTTPClient(ctx,
+		// fail fast and let the courier retry if needed instead of blocking the queue
+		httpx.ResilientClientWithMaxRetry(0),
+		httpx.ResilientClientWithConnectionTimeout(10*time.Second),
+	).Do(req)
 	if err != nil {
 		return errors.WithStack(err)
 	}
