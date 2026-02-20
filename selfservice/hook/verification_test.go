@@ -31,7 +31,6 @@ import (
 	"github.com/ory/kratos/selfservice/hook"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -140,7 +139,7 @@ func TestVerifier(t *testing.T) {
 				require.NoError(t, reg.IdentityManager().Create(context.Background(), i))
 				for _, address := range i.VerifiableAddresses {
 					address.Verified = true
-					address.VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now()))
+					address.VerifiedAt = new(sqlxx.NullTime(time.Now()))
 					address.Status = identity.VerifiableAddressStatusCompleted
 					require.NoError(t, reg.Persister().UpdateVerifiableAddress(context.Background(), &address))
 				}

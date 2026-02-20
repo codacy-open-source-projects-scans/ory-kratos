@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +34,6 @@ import (
 	"github.com/ory/x/configx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/ioutilx"
-	"github.com/ory/x/stringslice"
 )
 
 func setupServer(t *testing.T, reg *driver.RegistryDefault) *httptest.Server {
@@ -86,7 +86,7 @@ var basicSchema []byte
 var multifieldSchema []byte
 
 var skipIfNotEnabled = func(t *testing.T, flows []string, flow string) {
-	if !stringslice.Has(flows, flow) {
+	if !slices.Contains(flows, flow) {
 		t.Skipf("Skipping for %s flow because it was not included in the list of flows to be executed.", flow)
 	}
 }

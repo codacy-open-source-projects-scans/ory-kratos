@@ -3,13 +3,23 @@ version: "2"
 linters:
   enable:
     - gosec
+    - govet
     - errcheck
     - ineffassign
     - staticcheck
     - unused
+  disable:
+    - bodyclose # too many false negatives
+
+  settings:
+    gosec:
+      excludes:
+        - G101
+        - G117
+        - G306
+        - G704
+        - G705
   exclusions:
-    paths:
-      - "sdk"
     rules:
       - linters:
           - staticcheck

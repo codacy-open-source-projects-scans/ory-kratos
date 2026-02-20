@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 
 	"github.com/ory/kratos/x"
 
@@ -15,7 +16,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/ory/herodot"
-	"github.com/ory/x/stringslice"
+
 	"github.com/ory/x/stringsx"
 )
 
@@ -71,7 +72,7 @@ func (d *ProviderDiscord) AuthCodeURLOptions(r ider) []oauth2.AuthCodeOption {
 func (d *ProviderDiscord) Claims(ctx context.Context, exchange *oauth2.Token, query url.Values) (*Claims, error) {
 	grantedScopes := stringsx.Splitx(fmt.Sprintf("%s", exchange.Extra("scope")), " ")
 	for _, check := range d.Config().Scope {
-		if !stringslice.Has(grantedScopes, check) {
+		if !slices.Contains(grantedScopes, check) {
 			return nil, errors.WithStack(ErrScopeMissing)
 		}
 	}

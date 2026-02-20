@@ -65,7 +65,7 @@ func TestSender(t *testing.T) {
 	t.Run("method=SendRecoveryCode email", func(t *testing.T) {
 		recoveryCode := func(t *testing.T) {
 			t.Helper()
-			f, err := recovery.NewFlow(conf, time.Hour, "", u, code.NewStrategy(reg), flow.TypeBrowser)
+			f, err := recovery.NewFlow(conf, time.Hour, "", u, recovery.Strategies{code.NewStrategy(reg)}, flow.TypeBrowser)
 			require.NoError(t, err)
 
 			require.NoError(t, reg.RecoveryFlowPersister().CreateRecoveryFlow(ctx, f))
@@ -135,7 +135,7 @@ func TestSender(t *testing.T) {
 	t.Run("method=SendRecoveryCode sms", func(t *testing.T) {
 		recoveryCode := func(t *testing.T) {
 			t.Helper()
-			f, err := recovery.NewFlow(conf, time.Hour, "", u, code.NewStrategy(reg), flow.TypeBrowser)
+			f, err := recovery.NewFlow(conf, time.Hour, "", u, recovery.Strategies{code.NewStrategy(reg)}, flow.TypeBrowser)
 			require.NoError(t, err)
 
 			require.NoError(t, reg.RecoveryFlowPersister().CreateRecoveryFlow(ctx, f))
@@ -188,7 +188,7 @@ func TestSender(t *testing.T) {
 		verificationFlow := func(t *testing.T) {
 			t.Helper()
 
-			f, err := verification.NewFlow(conf, time.Hour, "", u, code.NewStrategy(reg), flow.TypeBrowser)
+			f, err := verification.NewFlow(conf, time.Hour, "", u, verification.Strategies{code.NewStrategy(reg)}, flow.TypeBrowser)
 			require.NoError(t, err)
 
 			require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -250,7 +250,7 @@ func TestSender(t *testing.T) {
 				flow:      "recovery",
 				configKey: config.ViperKeySelfServiceRecoveryNotifyUnknownRecipients,
 				send: func(t *testing.T) {
-					s, err := reg.RecoveryStrategies(ctx).Strategy("code")
+					s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("code")
 					require.NoError(t, err)
 					f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
 					require.NoError(t, err)
@@ -265,7 +265,7 @@ func TestSender(t *testing.T) {
 				flow:      "verification",
 				configKey: config.ViperKeySelfServiceVerificationNotifyUnknownRecipients,
 				send: func(t *testing.T) {
-					s, err := reg.VerificationStrategies(ctx).Strategy("code")
+					s, _, err := reg.VerificationStrategies(ctx).ActiveStrategies("code")
 					require.NoError(t, err)
 					f, err := verification.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
 					require.NoError(t, err)

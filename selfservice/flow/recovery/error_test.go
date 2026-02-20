@@ -74,7 +74,7 @@ func TestHandleError(t *testing.T) {
 
 	newFlow := func(t *testing.T, ttl time.Duration, ft flow.Type) *recovery.Flow {
 		req := &http.Request{URL: urlx.ParseOrPanic("/")}
-		s, err := reg.GetActiveRecoveryStrategy(context.Background())
+		s, _, err := reg.GetActiveRecoveryStrategies(context.Background())
 		require.NoError(t, err)
 		f, err := recovery.NewFlow(conf, ttl, nosurfx.FakeCSRFToken, req, s, ft)
 		require.NoError(t, err)
@@ -191,7 +191,7 @@ func TestHandleError(t *testing.T) {
 				c, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				require.NoError(t, c.Set(context.Background(), "selfservice.methods.code.enabled", false))
 				require.NoError(t, c.Set(context.Background(), config.ViperKeySelfServiceRecoveryUse, "code"))
-				_, err := reg.GetActiveRecoveryStrategy(context.Background())
+				_, _, err := reg.GetActiveRecoveryStrategies(context.Background())
 				recoveryFlow = newFlow(t, time.Minute, tc.t)
 				flowError = err
 				methodName = node.UiNodeGroup(recovery.RecoveryStrategyLink)
@@ -337,7 +337,7 @@ func TestHandleError_WithContinueWith(t *testing.T) {
 
 	newFlow := func(t *testing.T, ttl time.Duration, ft flow.Type) *recovery.Flow {
 		req := &http.Request{URL: urlx.ParseOrPanic("/")}
-		s, err := reg.GetActiveRecoveryStrategy(context.Background())
+		s, _, err := reg.GetActiveRecoveryStrategies(context.Background())
 		require.NoError(t, err)
 		f, err := recovery.NewFlow(conf, ttl, nosurfx.FakeCSRFToken, req, s, ft)
 		require.NoError(t, err)
@@ -462,7 +462,7 @@ func TestHandleError_WithContinueWith(t *testing.T) {
 				c, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 				require.NoError(t, c.Set(context.Background(), "selfservice.methods.code.enabled", false))
 				require.NoError(t, c.Set(context.Background(), config.ViperKeySelfServiceRecoveryUse, "code"))
-				_, err := reg.GetActiveRecoveryStrategy(context.Background())
+				_, _, err := reg.GetActiveRecoveryStrategies(context.Background())
 				recoveryFlow = newFlow(t, time.Minute, tc.t)
 				flowError = err
 				methodName = node.UiNodeGroup(recovery.RecoveryStrategyLink)

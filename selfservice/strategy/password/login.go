@@ -5,6 +5,7 @@ package password
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -31,7 +32,6 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/decoderx"
-	"github.com/ory/x/stringsx"
 )
 
 var _ login.AAL1FormHydrator = new(Strategy)
@@ -39,7 +39,7 @@ var _ login.AAL1FormHydrator = new(Strategy)
 func (s *Strategy) handleLoginError(r *http.Request, f *login.Flow, payload updateLoginFlowWithPasswordMethod, err error) error {
 	if f != nil {
 		f.UI.Nodes.ResetNodes("password")
-		f.UI.Nodes.SetValueAttribute("identifier", stringsx.Coalesce(payload.Identifier, payload.LegacyIdentifier))
+		f.UI.Nodes.SetValueAttribute("identifier", cmp.Or(payload.Identifier, payload.LegacyIdentifier))
 		if f.Type == flow.TypeBrowser {
 			f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 		}
@@ -74,7 +74,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		return nil, s.handleLoginError(r, f, p, err)
 	}
 
-	identifier := stringsx.Coalesce(p.Identifier, p.LegacyIdentifier)
+	identifier := cmp.Or(p.Identifier, p.LegacyIdentifier)
 	i, c, err := s.d.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, s.ID(), identifier)
 	if err != nil {
 		time.Sleep(x.RandomDelay(s.d.Config().HasherArgon2(ctx).ExpectedDuration, s.d.Config().HasherArgon2(ctx).ExpectedDeviation))

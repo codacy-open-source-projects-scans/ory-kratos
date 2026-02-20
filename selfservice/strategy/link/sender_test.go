@@ -70,7 +70,7 @@ func TestManager(t *testing.T) {
 
 		t.Run("case="+tc.d, func(t *testing.T) {
 			t.Run("method=SendRecoveryLink", func(t *testing.T) {
-				s, err := reg.RecoveryStrategies(ctx).Strategy("link")
+				s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("link")
 				require.NoError(t, err)
 				f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
 				require.NoError(t, err)
@@ -118,7 +118,7 @@ func TestManager(t *testing.T) {
 					config.ViperKeyCourierHTTPRequestConfig + ".url": srv.URL,
 				})
 
-				s, err := reg.RecoveryStrategies(ctx).Strategy("link")
+				s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("link")
 				require.NoError(t, err)
 				f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
 				require.NoError(t, err)
@@ -148,10 +148,10 @@ func TestManager(t *testing.T) {
 			})
 
 			t.Run("method=SendVerificationLink", func(t *testing.T) {
-				strategy, err := reg.GetActiveVerificationStrategy(ctx)
+				strategies, _, err := reg.GetActiveVerificationStrategies(ctx)
 				require.NoError(t, err)
 
-				f, err := verification.NewFlow(conf, time.Hour, "", u, strategy, flow.TypeBrowser)
+				f, err := verification.NewFlow(conf, time.Hour, "", u, strategies, flow.TypeBrowser)
 				require.NoError(t, err)
 
 				require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -190,7 +190,7 @@ func TestManager(t *testing.T) {
 				flow:      "recovery",
 				configKey: config.ViperKeySelfServiceRecoveryNotifyUnknownRecipients,
 				send: func(t *testing.T) {
-					s, err := reg.RecoveryStrategies(ctx).Strategy("link")
+					s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("link")
 					require.NoError(t, err)
 					f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
 					require.NoError(t, err)
@@ -205,7 +205,7 @@ func TestManager(t *testing.T) {
 				flow:      "verification",
 				configKey: config.ViperKeySelfServiceVerificationNotifyUnknownRecipients,
 				send: func(t *testing.T) {
-					s, err := reg.VerificationStrategies(ctx).Strategy("link")
+					s, _, err := reg.VerificationStrategies(ctx).ActiveStrategies("link")
 					require.NoError(t, err)
 					f, err := verification.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
 					require.NoError(t, err)

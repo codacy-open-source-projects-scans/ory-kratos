@@ -98,7 +98,7 @@ func TestFromOldFlow(t *testing.T) {
 			flow.TypeBrowser,
 		} {
 			t.Run(fmt.Sprintf("case=original flow is %s", ft), func(t *testing.T) {
-				f, err := recovery.NewFlow(conf, 0, "csrf", &r, code.NewStrategy(reg), ft)
+				f, err := recovery.NewFlow(conf, 0, "csrf", &r, recovery.Strategies{code.NewStrategy(reg)}, ft)
 				require.NoError(t, err)
 				nF, err := recovery.FromOldFlow(conf, time.Duration(time.Hour), f.CSRFToken, &r, nil, *f)
 				require.NoError(t, err)
@@ -113,7 +113,7 @@ func TestFromOldFlow(t *testing.T) {
 			flow.TypeBrowser,
 		} {
 			t.Run(fmt.Sprintf("case=original flow is %s", ft), func(t *testing.T) {
-				f, err := recovery.NewFlow(conf, 0, "csrf", &r, link.NewStrategy(reg), ft)
+				f, err := recovery.NewFlow(conf, 0, "csrf", &r, recovery.Strategies{link.NewStrategy(reg)}, ft)
 				require.NoError(t, err)
 				nF, err := recovery.FromOldFlow(conf, time.Duration(time.Hour), f.CSRFToken, &r, nil, *f)
 				require.NoError(t, err)

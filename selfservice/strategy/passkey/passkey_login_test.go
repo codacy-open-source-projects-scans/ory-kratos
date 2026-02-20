@@ -4,9 +4,11 @@
 package passkey_test
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,6 +33,7 @@ import (
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/contextx"
+	"github.com/ory/x/ioutilx"
 	"github.com/ory/x/snapshotx"
 )
 
@@ -50,9 +53,23 @@ func TestPopulateLoginMethod(t *testing.T) {
 	fix := newLoginFixture(t)
 	s := passkey.NewStrategy(fix.reg)
 
-	t.Run("case=should not handle API flows", func(t *testing.T) {
-		loginFlow := &login.Flow{Type: flow.TypeAPI}
-		assert.Nil(t, s.PopulateLoginMethodFirstFactor(nil, loginFlow))
+	t.Run("case=API flow builds standard nodes and skips JS", func(t *testing.T) {
+		// Build a properly initialized API flow to avoid nil UI/container issues.
+		r := httptest.NewRequest("GET", "/self-service/login/api", nil).WithContext(t.Context())
+		f, err := login.NewFlow(fix.conf, time.Minute, "csrf_token", r, flow.TypeAPI)
+		require.NoError(t, err)
+		f.UI.Nodes = make(node.Nodes, 0)
+
+		// For API flows, the strategy should build standard nodes and return before adding JS nodes.
+		assert.Nil(t, s.PopulateLoginMethodFirstFactor(r, f))
+
+		// Assert that the passkey challenge input exists (standard node built for API as well).
+		require.NotNil(t, f.UI.Nodes.Find("passkey_challenge"))
+
+		// Assert no script nodes are present for API flows (JS injection is skipped).
+		for _, n := range f.UI.Nodes {
+			assert.NotEqual(t, node.Script, n.Type, "API flow must not include script nodes")
+		}
 	})
 }
 
@@ -79,6 +96,66 @@ func TestCompleteLogin(t *testing.T) {
 			})
 		})
 
+		// Assert API-specific CSRF/header failures (Cookie/Origin) similar to registration tests
+		t.Run("AssertCSRFFailuresAPI", func(t *testing.T) {
+			fix := newLoginFixture(t)
+			// Create identity with passkey credentials so the test setup is valid
+			fix.createIdentityWithPasskey(t, identity.Credentials{
+				Config:  loginPasswordlessCredentials,
+				Version: 1,
+			})
+
+			apiClient := testhelpers.NewDebugClient(t)
+
+			// Now test the specific CSRF error causes for API flows: adding Cookie and Origin headers
+			for _, tc := range []struct {
+				mod    func(http.Header)
+				expKey string
+			}{
+				{
+					mod:    func(h http.Header) { h.Add("Cookie", "name=bar") },
+					expKey: "Cookie",
+				},
+				{
+					mod:    func(h http.Header) { h.Add("Origin", "www.bar.com") },
+					expKey: "Origin",
+				},
+			} {
+				t.Run(fmt.Sprintf("case=should_fail_with_correct_CSRF_error_cause_local/type=api/%s", tc.expKey), func(t *testing.T) {
+					f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false)
+
+					// Attach internal context to the flow
+					interim, err := fix.reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(f.Id))
+					require.NoError(t, err)
+					interim.InternalContext = loginPasswordlessContext
+					require.NoError(t, fix.reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), interim))
+
+					values := url.Values{
+						"csrf_token": {"invalid_token"},
+					}
+					values.Set(node.PasskeyLogin, string(loginPasswordlessResponse))
+					values.Del("method")
+
+					req, err := http.NewRequest("POST", f.Ui.Action, bytes.NewBufferString(testhelpers.EncodeFormAsJSON(t, true, values)))
+					require.NoError(t, err)
+					req.Header.Set("Accept", "application/json")
+					req.Header.Set("Content-Type", "application/json")
+					tc.mod(req.Header)
+
+					res, err := apiClient.Do(req)
+					require.NoError(t, err)
+					defer func() { _ = res.Body.Close() }()
+
+					bodyBytes := ioutilx.MustReadAll(res.Body)
+					actual := string(bodyBytes)
+					require.EqualValues(t, http.StatusBadRequest, res.StatusCode)
+
+					msg := gjson.Get(actual, "ui.messages.0.text").String()
+					assert.Contains(t, msg, tc.expKey, "actual payload: %s", actual)
+				})
+			}
+		})
+
 		t.Run("case=passkey shows error if user tries to sign in but no such user exists", func(t *testing.T) {
 			payload := func(v url.Values) {
 				v.Set("method", "passkey")
@@ -98,6 +175,21 @@ func TestCompleteLogin(t *testing.T) {
 
 			t.Run("type=spa", func(t *testing.T) {
 				body, res := fix.loginViaBrowser(t, true, payload, testhelpers.NewClientWithCookies(t))
+				check(t, false, body, res)
+			})
+
+			t.Run("type=api", func(t *testing.T) {
+				apiClient := testhelpers.NewDebugClient(t)
+				f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false)
+				// Inject internal context required for replaying the WebAuthn response
+				interim, err := fix.reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(f.Id))
+				require.NoError(t, err)
+				interim.InternalContext = loginPasswordlessContext
+				require.NoError(t, fix.reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), interim))
+
+				values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
+				payload(values)
+				body, res := testhelpers.LoginMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
 				check(t, false, body, res)
 			})
 		})
@@ -123,6 +215,21 @@ func TestCompleteLogin(t *testing.T) {
 				body, res := fix.loginViaBrowser(t, true, payload, testhelpers.NewClientWithCookies(t))
 				check(t, false, body, res)
 			})
+
+			t.Run("type=api", func(t *testing.T) {
+				apiClient := testhelpers.NewDebugClient(t)
+				f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false)
+				// Inject internal context required for replaying the WebAuthn response
+				interim, err := fix.reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(f.Id))
+				require.NoError(t, err)
+				interim.InternalContext = loginPasswordlessContext
+				require.NoError(t, fix.reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), interim))
+
+				values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
+				payload(values)
+				body, res := testhelpers.LoginMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
+				check(t, false, body, res)
+			})
 		})
 
 		t.Run("case=should fail if passkey login is empty", func(t *testing.T) {
@@ -138,6 +245,17 @@ func TestCompleteLogin(t *testing.T) {
 			t.Run("type=spa", func(t *testing.T) {
 				body, res := fix.loginViaBrowser(t, true, payload, testhelpers.NewClientWithCookies(t))
 				fix.checkURL(t, false, res)
+				assert.Equal(t, "browser_location_change_required", gjson.Get(body, "error.id").String(), "%s", body)
+			})
+
+			t.Run("type=api", func(t *testing.T) {
+				apiClient := testhelpers.NewDebugClient(t)
+				f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false)
+
+				values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
+				payload(values)
+				body, res := testhelpers.LoginMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
+				assert.Equal(t, http.StatusUnprocessableEntity, res.StatusCode)
 				assert.Equal(t, "browser_location_change_required", gjson.Get(body, "error.id").String(), "%s", body)
 			})
 		})
@@ -180,6 +298,35 @@ func TestCompleteLogin(t *testing.T) {
 			t.Run("type=spa", func(t *testing.T) {
 				run(t, true)
 			})
+
+			t.Run("type=api", func(t *testing.T) {
+				fix.conf.MustSet(t.Context(), config.ViperKeySessionWhoAmIAAL, "aal1")
+				fix.createIdentityWithPasskey(t, identity.Credentials{
+					Config:  loginPasswordlessCredentials,
+					Version: 1,
+				})
+
+				apiClient := testhelpers.NewDebugClient(t)
+				f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false)
+
+				// Inject invalid internal context
+				interim, err := fix.reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(f.Id))
+				require.NoError(t, err)
+				interim.InternalContext = []byte("invalid context")
+				require.NoError(t, fix.reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), interim))
+
+				values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
+				values.Set(node.PasskeyLogin, string(loginPasswordlessResponse))
+				body, res := testhelpers.LoginMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
+
+				assert.Equal(t, http.StatusInternalServerError, res.StatusCode)
+				assert.Equal(
+					t,
+					"Expected WebAuthN in internal context to be an object but got: unexpected end of JSON input",
+					gjson.Get(body, "error.reason").String(),
+					"%s", body,
+				)
+			})
 		})
 
 		t.Run("case=succeeds with passwordless login", func(t *testing.T) {
@@ -195,6 +342,13 @@ func TestCompleteLogin(t *testing.T) {
 				body, res, f := fix.submitWebAuthnLoginWithClient(t, spa, loginPasswordlessContext, browserClient, func(values url.Values) {
 					values.Set(node.PasskeyLogin, string(loginPasswordlessResponse))
 				}, testhelpers.InitFlowWithAAL(identity.AuthenticatorAssuranceLevel1))
+
+				testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{
+					"0.attributes.value",
+					"2.attributes.nonce",
+					"2.attributes.src",
+					"5.attributes.value",
+				})
 
 				prefix := ""
 				if spa {
@@ -221,6 +375,47 @@ func TestCompleteLogin(t *testing.T) {
 				}
 			}
 
+			runAPI := func(t *testing.T) {
+				fix.conf.MustSet(t.Context(), config.ViperKeySessionWhoAmIAAL, "aal1")
+				id := fix.createIdentityWithPasskey(t, identity.Credentials{
+					Config:  loginPasswordlessCredentials,
+					Version: 1,
+				})
+
+				apiClient := testhelpers.NewDebugClient(t)
+				f := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, false)
+
+				// Inject internal context
+				interim, err := fix.reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(f.Id))
+				require.NoError(t, err)
+				interim.InternalContext = loginPasswordlessContext
+				require.NoError(t, fix.reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), interim))
+
+				values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
+				values.Set(node.PasskeyLogin, string(loginPasswordlessResponse))
+				body, res := testhelpers.LoginMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
+
+				testhelpers.SnapshotTExcept(t, f.Ui.Nodes, []string{
+					"0.attributes.value",
+					"4.attributes.value", // passkey_challenge value for API (no script node)
+				})
+
+				assert.Equal(t, http.StatusOK, res.StatusCode)
+				assert.Contains(t, res.Request.URL.String(), fix.publicTS.URL+login.RouteSubmitFlow)
+
+				assert.True(t, gjson.Get(body, "session.active").Bool(), "%s", body)
+				assert.EqualValues(t, identity.AuthenticatorAssuranceLevel1, gjson.Get(body, "session.authenticator_assurance_level").String(), "%s", body)
+				assert.EqualValues(t, identity.CredentialsTypePasskey, gjson.Get(body, "session.authentication_methods.#(method==passkey).method").String(), "%s", body)
+				assert.EqualValues(t, id.ID.String(), gjson.Get(body, "session.identity.id").String(), "%s", body)
+
+				actualFlow, err := fix.reg.LoginFlowPersister().GetLoginFlow(context.Background(), uuid.FromStringOrNil(f.Id))
+				require.NoError(t, err)
+
+				assert.Empty(t, gjson.GetBytes(actualFlow.InternalContext, flow.PrefixInternalContextKey(identity.CredentialsTypePasskey, passkey.InternalContextKeySessionData)))
+				// API flows don't have continue_with redirect
+				assert.Empty(t, gjson.Get(body, "continue_with").Array(), "%s", body)
+			}
+
 			// We test here that login works even if the identity schema contains
 			// { webauthn: { identifier: true } } instead of
 			// { passkey: { display_name: true } }
@@ -228,11 +423,13 @@ func TestCompleteLogin(t *testing.T) {
 				testhelpers.SetDefaultIdentitySchema(fix.conf, "file://./stub/login_webauthn.schema.json")
 				t.Run("type=browser", func(t *testing.T) { run(t, false) })
 				t.Run("type=spa", func(t *testing.T) { run(t, true) })
+				t.Run("type=api", func(t *testing.T) { runAPI(t) })
 			})
 			t.Run("passkey_display_name", func(t *testing.T) {
 				testhelpers.SetDefaultIdentitySchema(fix.conf, "file://./stub/login.schema.json")
 				t.Run("type=browser", func(t *testing.T) { run(t, false) })
 				t.Run("type=spa", func(t *testing.T) { run(t, true) })
+				t.Run("type=api", func(t *testing.T) { runAPI(t) })
 			})
 		})
 	})
@@ -297,9 +494,37 @@ func TestCompleteLogin(t *testing.T) {
 				for _, f := range []string{
 					"browser",
 					"spa",
+					"api",
 				} {
 					t.Run(f, func(t *testing.T) {
-						run(t, t.Context(), id, tc.context, tc.response, f == "spa", expectedAAL)
+						if f == "api" {
+							// API refresh flow
+							apiClient := testhelpers.NewHTTPClientWithIdentitySessionToken(t.Context(), t, fix.reg, id)
+							// Pass true for forced to enable refresh in API flow
+							apiFlow := testhelpers.InitializeLoginFlowViaAPI(t, apiClient, fix.publicTS, true)
+
+							// Inject internal context
+							interim, err := fix.reg.LoginFlowPersister().GetLoginFlow(t.Context(), uuid.FromStringOrNil(apiFlow.Id))
+							require.NoError(t, err)
+							interim.InternalContext = tc.context
+							require.NoError(t, fix.reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), interim))
+
+							values := testhelpers.SDKFormFieldsToURLValues(apiFlow.Ui.Nodes)
+							values.Set("identifier", loginFixtureSuccessEmail)
+							values.Set(node.PasskeyLogin, string(tc.response))
+							body, res := testhelpers.LoginMakeRequest(t, true, false, apiFlow, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
+
+							assert.Equal(t, http.StatusOK, res.StatusCode)
+							assert.Contains(t, res.Request.URL.String(), fix.publicTS.URL+login.RouteSubmitFlow, "%s", body)
+
+							assert.True(t, gjson.Get(body, "session.active").Bool(), "%s", body)
+							assert.EqualValues(t, expectedAAL, gjson.Get(body, "session.authenticator_assurance_level").String(), "%s", body)
+							assert.EqualValues(t, identity.CredentialsTypePasskey, gjson.Get(body, "session.authentication_methods.#(method==passkey).method").String(), "%s", body)
+							assert.Len(t, gjson.Get(body, "session.authentication_methods").Array(), 2, "%s", body)
+							assert.EqualValues(t, id.ID.String(), gjson.Get(body, "session.identity.id").String(), "%s", body)
+						} else {
+							run(t, t.Context(), id, tc.context, tc.response, f == "spa", expectedAAL)
+						}
 					})
 				}
 			})
@@ -430,6 +655,8 @@ func TestFormHydration(t *testing.T) {
 
 					r, f := newFlow(ctx, t)
 					require.NoError(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentityHint(id)))
+					// Verify passkey button is present
+					assert.NotNil(t, f.UI.Nodes.Find(node.PasskeyLoginTrigger), "passkey button should be present when user has credentials")
 					toSnapshot(t, f)
 				})
 
@@ -437,6 +664,8 @@ func TestFormHydration(t *testing.T) {
 					id := identity.NewIdentity("default")
 					r, f := newFlow(ctx, t)
 					require.ErrorIs(t, fh.PopulateLoginMethodIdentifierFirstCredentials(r, f, login.WithIdentityHint(id)), idfirst.ErrNoCredentialsFound)
+					// Verify passkey button is NOT present
+					assert.Nil(t, f.UI.Nodes.Find(node.PasskeyLoginTrigger), "passkey button should not be present when user has no credentials")
 					toSnapshot(t, f)
 				})
 			})

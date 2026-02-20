@@ -22,7 +22,6 @@ import (
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/stringsx"
 )
@@ -286,13 +285,13 @@ func (p *Persister) UpsertSession(ctx context.Context, s *session.Session) (err 
 			device := &(s.Devices[i])
 			device.SessionID = s.ID
 			device.NID = s.NID
-			device.IdentityID = pointerx.Ptr(s.IdentityID)
+			device.IdentityID = new(s.IdentityID)
 
 			if device.Location != nil {
-				device.Location = pointerx.Ptr(stringsx.TruncateByteLen(*device.Location, SessionDeviceLocationMaxLength))
+				device.Location = new(stringsx.TruncateByteLen(*device.Location, SessionDeviceLocationMaxLength))
 			}
 			if device.UserAgent != nil {
-				device.UserAgent = pointerx.Ptr(stringsx.TruncateByteLen(*device.UserAgent, SessionDeviceUserAgentMaxLength))
+				device.UserAgent = new(stringsx.TruncateByteLen(*device.UserAgent, SessionDeviceUserAgentMaxLength))
 			}
 
 			if err := p.CreateDevice(ctx, device); err != nil {

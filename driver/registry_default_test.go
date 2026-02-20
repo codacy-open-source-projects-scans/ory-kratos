@@ -917,11 +917,11 @@ func TestGetActiveRecoveryStrategy(t *testing.T) {
 			config.ViperKeySelfServiceRecoveryUse: "code",
 		})
 
-		_, err := reg.GetActiveRecoveryStrategy(ctx)
+		_, _, err := reg.GetActiveRecoveryStrategies(ctx)
 		require.Error(t, err)
 	})
 
-	t.Run("returns active strategy", func(t *testing.T) {
+	t.Run("returns active strategies", func(t *testing.T) {
 		for _, sID := range []string{
 			"code", "link",
 		} {
@@ -931,9 +931,10 @@ func TestGetActiveRecoveryStrategy(t *testing.T) {
 					config.ViperKeySelfServiceRecoveryUse:              sID,
 				})
 
-				s, err := reg.GetActiveRecoveryStrategy(ctx)
+				s, ps, err := reg.GetActiveRecoveryStrategies(ctx)
 				require.NoError(t, err)
-				require.Equal(t, sID, s.RecoveryStrategyID())
+				require.Len(t, s, 1)
+				require.Equal(t, sID, ps.RecoveryStrategyID())
 			})
 		}
 	})
@@ -948,7 +949,7 @@ func TestGetActiveVerificationStrategy(t *testing.T) {
 			"selfservice.methods.code.enabled":        false,
 			config.ViperKeySelfServiceVerificationUse: "code",
 		})
-		_, err := reg.GetActiveVerificationStrategy(ctx)
+		_, _, err := reg.GetActiveVerificationStrategies(ctx)
 		require.Error(t, err)
 	})
 
@@ -962,7 +963,7 @@ func TestGetActiveVerificationStrategy(t *testing.T) {
 					config.ViperKeySelfServiceVerificationUse:          sID,
 				})
 
-				s, err := reg.GetActiveVerificationStrategy(ctx)
+				_, s, err := reg.GetActiveVerificationStrategies(ctx)
 				require.NoError(t, err)
 				require.Equal(t, sID, s.VerificationStrategyID())
 			})

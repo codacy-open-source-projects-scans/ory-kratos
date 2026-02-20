@@ -20,7 +20,6 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/randx"
 )
 
@@ -253,13 +252,13 @@ func NewInactiveSession() *Session {
 func (s *Session) SetSessionDeviceInformation(r *http.Request) {
 	device := Device{
 		SessionID:  s.ID,
-		IdentityID: pointerx.Ptr(s.IdentityID),
-		IPAddress:  pointerx.Ptr(httpx.ClientIP(r)),
+		IdentityID: new(s.IdentityID),
+		IPAddress:  new(httpx.ClientIP(r)),
 	}
 
 	agent := r.Header["User-Agent"]
 	if len(agent) > 0 {
-		device.UserAgent = pointerx.Ptr(strings.Join(agent, " "))
+		device.UserAgent = new(strings.Join(agent, " "))
 	}
 
 	var clientGeoLocation []string
@@ -269,7 +268,8 @@ func (s *Session) SetSessionDeviceInformation(r *http.Request) {
 	if r.Header.Get("Cf-Ipcountry") != "" {
 		clientGeoLocation = append(clientGeoLocation, r.Header.Get("Cf-Ipcountry"))
 	}
-	device.Location = pointerx.Ptr(strings.Join(clientGeoLocation, ", "))
+	loc := strings.Join(clientGeoLocation, ", ")
+	device.Location = &loc
 
 	s.Devices = append(s.Devices, device)
 }

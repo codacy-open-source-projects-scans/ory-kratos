@@ -301,7 +301,7 @@ func (s *Strategy) retryVerificationFlowWithMessage(ctx context.Context, w http.
 		Debug("A verification flow is being retried because a validation error occurred.")
 
 	f, err := verification.NewFlow(s.deps.Config(),
-		s.deps.Config().SelfServiceFlowVerificationRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, s, ft)
+		s.deps.Config().SelfServiceFlowVerificationRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, verification.Strategies{s}, ft)
 	if err != nil {
 		return s.handleVerificationError(r, f, nil, err)
 	}
@@ -329,7 +329,7 @@ func (s *Strategy) retryVerificationFlowWithError(ctx context.Context, w http.Re
 		Debug("A verification flow is being retried because an error occurred.")
 
 	f, err := verification.NewFlow(s.deps.Config(),
-		s.deps.Config().SelfServiceFlowVerificationRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, s, ft)
+		s.deps.Config().SelfServiceFlowVerificationRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, verification.Strategies{s}, ft)
 	if err != nil {
 		return s.handleVerificationError(r, f, nil, err)
 	}

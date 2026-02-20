@@ -28,7 +28,6 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/otelx"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
 )
@@ -632,7 +631,7 @@ func (s *Strategy) verifyAddress(ctx context.Context, i *identity.Identity, veri
 		}
 
 		address.Verified = true
-		address.VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now().UTC()))
+		address.VerifiedAt = new(sqlxx.NullTime(time.Now().UTC()))
 		address.Status = identity.VerifiableAddressStatusCompleted
 		if persistNow {
 			if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, address, "verified", "verified_at", "status"); errors.Is(err, sqlcon.ErrNoRows) {

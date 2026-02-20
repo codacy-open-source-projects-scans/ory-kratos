@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ory/x/configx"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlcon"
 
 	_ "embed"
@@ -529,7 +528,7 @@ func TestManager(t *testing.T) {
 			// mock successful verification process
 			addr := original.VerifiableAddresses[0]
 			addr.Verified = true
-			addr.VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now().UTC()))
+			addr.VerifiedAt = new(sqlxx.NullTime(time.Now().UTC()))
 			require.NoError(t, reg.PrivilegedIdentityPool().UpdateVerifiableAddress(t.Context(), &addr))
 
 			// reload to properly set the verified address

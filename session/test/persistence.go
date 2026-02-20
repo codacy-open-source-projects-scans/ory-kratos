@@ -25,7 +25,6 @@ import (
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/sqlcon"
 )
@@ -206,7 +205,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "active only",
-					active: pointerx.Bool(true),
+					active: new(true),
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[0],
 						seedSessionIDs[2],
@@ -215,7 +214,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "active only and except",
-					active: pointerx.Bool(true),
+					active: new(true),
 					except: seedSessionsList[0].ID,
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[2],
@@ -224,7 +223,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "inactive only",
-					active: pointerx.Bool(false),
+					active: new(false),
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[1],
 						seedSessionIDs[3],
@@ -232,7 +231,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "inactive only and except",
-					active: pointerx.Bool(false),
+					active: new(false),
 					except: seedSessionsList[3].ID,
 					expectedSessionIds: []uuid.UUID{
 						seedSessionIDs[1],
@@ -273,7 +272,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "active only",
-					active: pointerx.Bool(true),
+					active: new(true),
 					expected: []session.Session{
 						seedSessionsList[0],
 						seedSessionsList[2],
@@ -283,7 +282,7 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				},
 				{
 					desc:   "inactive only",
-					active: pointerx.Bool(false),
+					active: new(false),
 					expected: []session.Session{
 						seedSessionsList[1],
 						seedSessionsList[3],

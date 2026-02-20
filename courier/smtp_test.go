@@ -79,8 +79,8 @@ func TestNewSMTP(t *testing.T) {
 	// Test cert based SMTP client auth
 	clientCert, clientKey, err := generateTestClientCert(t)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.Remove(clientCert.Name()) })
-	t.Cleanup(func() { _ = os.Remove(clientKey.Name()) })
+	t.Cleanup(func() { _ = os.Remove(clientCert.Name()) }) //nolint:gosec
+	t.Cleanup(func() { _ = os.Remove(clientKey.Name()) })  //nolint:gosec
 
 	conf.MustSet(t.Context(), config.ViperKeyCourierSMTPClientCertPath, clientCert.Name())
 	conf.MustSet(t.Context(), config.ViperKeyCourierSMTPClientKeyPath, clientKey.Name())

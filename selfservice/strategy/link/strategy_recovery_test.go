@@ -39,7 +39,6 @@ import (
 	"github.com/ory/x/assertx"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/ioutilx"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -88,16 +87,16 @@ func TestAdminStrategy(t *testing.T) {
 	}
 
 	t.Run("no panic on empty body #1384", func(t *testing.T) {
-		s, err := reg.RecoveryStrategies(t.Context()).Strategy("link")
+		s, ps, err := reg.RecoveryStrategies(t.Context()).ActiveStrategies("link")
 		require.NoError(t, err)
 
 		r := &http.Request{URL: new(url.URL)}
 		f, err := recovery.NewFlow(reg.Config(), time.Minute, "", r, s, flow.TypeBrowser)
 		require.NoError(t, err)
 
-		require.IsType(t, &link.Strategy{}, s)
+		require.IsType(t, &link.Strategy{}, ps)
 		expectedErr := errors.New("test")
-		err = s.(*link.Strategy).HandleRecoveryError(r, f, nil, expectedErr)
+		err = ps.(*link.Strategy).HandleRecoveryError(r, f, nil, expectedErr)
 		require.ErrorIs(t, err, expectedErr)
 	})
 
@@ -117,7 +116,7 @@ func TestAdminStrategy(t *testing.T) {
 
 		rl, _, err := adminSDK.IdentityAPI.CreateRecoveryLinkForIdentity(t.Context()).CreateRecoveryLinkForIdentityBody(kratos.CreateRecoveryLinkForIdentityBody{
 			IdentityId: id.ID.String(),
-			ExpiresIn:  pointerx.Ptr("100ms"),
+			ExpiresIn:  new("100ms"),
 		}).Execute()
 		require.NoError(t, err)
 
@@ -141,7 +140,7 @@ func TestAdminStrategy(t *testing.T) {
 
 		rl, _, err := adminSDK.IdentityAPI.CreateRecoveryLinkForIdentity(t.Context()).CreateRecoveryLinkForIdentityBody(kratos.CreateRecoveryLinkForIdentityBody{
 			IdentityId: id.ID.String(),
-			ExpiresIn:  pointerx.Ptr("100ms"),
+			ExpiresIn:  new("100ms"),
 		}).Execute()
 		require.NoError(t, err)
 

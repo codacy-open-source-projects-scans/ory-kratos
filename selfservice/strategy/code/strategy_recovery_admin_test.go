@@ -32,7 +32,6 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/configx"
 	"github.com/ory/x/ioutilx"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/snapshotx"
 )
 
@@ -61,14 +60,15 @@ func TestAdminStrategy(t *testing.T) {
 
 	t.Run("no panic on empty body #1384", func(t *testing.T) {
 		ctx := context.Background()
-		s, err := reg.RecoveryStrategies(ctx).Strategy("code")
+		s, ps, err := reg.RecoveryStrategies(ctx).ActiveStrategies("code")
 		require.NoError(t, err)
+		require.Len(t, s, 1)
 		w := httptest.NewRecorder()
 		r := &http.Request{URL: new(url.URL)}
 		f, err := recovery.NewFlow(reg.Config(), time.Minute, "", r, s, flow.TypeBrowser)
 		require.NoError(t, err)
 		require.NotPanics(t, func() {
-			require.Error(t, s.(*Strategy).HandleRecoveryError(w, r, f, nil, errors.New("test")))
+			require.Error(t, ps.(*Strategy).HandleRecoveryError(w, r, f, nil, errors.New("test")))
 		})
 	})
 
@@ -80,13 +80,13 @@ func TestAdminStrategy(t *testing.T) {
 	})
 
 	t.Run("description=should fail on malformed expiry time", func(t *testing.T) {
-		_, _, err := createCode(createCodeParams{IdentityId: x.NewUUID().String(), ExpiresIn: pointerx.Ptr("not-a-valid-value")})
+		_, _, err := createCode(createCodeParams{IdentityId: x.NewUUID().String(), ExpiresIn: new("not-a-valid-value")})
 		require.IsType(t, err, new(kratos.GenericOpenAPIError), "%T", err)
 		snapshotx.SnapshotT(t, err.(*kratos.GenericOpenAPIError).Model())
 	})
 
 	t.Run("description=should fail on negative expiry time", func(t *testing.T) {
-		_, _, err := createCode(createCodeParams{IdentityId: x.NewUUID().String(), ExpiresIn: pointerx.Ptr("-1h")})
+		_, _, err := createCode(createCodeParams{IdentityId: x.NewUUID().String(), ExpiresIn: new("-1h")})
 		require.IsType(t, err, new(kratos.GenericOpenAPIError), "%T", err)
 		snapshotx.SnapshotT(t, err.(*kratos.GenericOpenAPIError).Model())
 	})
@@ -135,7 +135,7 @@ func TestAdminStrategy(t *testing.T) {
 		require.NotEmpty(t, code.RecoveryCode)
 		require.True(t, code.ExpiresAt.Before(time.Now().Add(conf.SelfServiceFlowRecoveryRequestLifespan(t.Context()))))
 
-		client := pointerx.Ptr(*publicTS.Client())
+		client := new(*publicTS.Client())
 		client.Jar, _ = cookiejar.New(nil)
 		body := submitRecoveryCode(t, client, code.RecoveryLink, code.RecoveryCode)
 		testhelpers.AssertMessage(t, body, "You successfully recovered your account. Please change your password or set up an alternative login method (e.g. social sign in) within the next 60.00 minutes.")
@@ -153,7 +153,7 @@ func TestAdminStrategy(t *testing.T) {
 		require.NoError(t, reg.IdentityManager().Create(context.Background(),
 			&id, identity.ManagerAllowWriteProtectedTraits))
 
-		code, _, err := createCode(createCodeParams{IdentityId: id.ID.String(), ExpiresIn: pointerx.Ptr("100ms")})
+		code, _, err := createCode(createCodeParams{IdentityId: id.ID.String(), ExpiresIn: new("100ms")})
 		require.NoError(t, err)
 
 		time.Sleep(time.Millisecond * 100)
@@ -192,9 +192,9 @@ func TestAdminStrategy(t *testing.T) {
 		email := testhelpers.RandomEmail()
 		i := createIdentityToRecover(t, reg, email)
 
-		c1, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), ExpiresIn: pointerx.Ptr("1h")})
+		c1, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), ExpiresIn: new("1h")})
 		require.NoError(t, err)
-		c2, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), ExpiresIn: pointerx.Ptr("1h")})
+		c2, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), ExpiresIn: new("1h")})
 		require.NoError(t, err)
 		code2 := c2.RecoveryCode
 		require.NotEmpty(t, code2)
@@ -208,7 +208,7 @@ func TestAdminStrategy(t *testing.T) {
 		email := testhelpers.RandomEmail()
 		i := createIdentityToRecover(t, reg, email)
 
-		c1, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), ExpiresIn: pointerx.Ptr("1h")})
+		c1, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), ExpiresIn: new("1h")})
 		require.NoError(t, err)
 
 		res, err := http.Get(c1.RecoveryLink)
@@ -222,7 +222,7 @@ func TestAdminStrategy(t *testing.T) {
 		email := testhelpers.RandomEmail()
 		i := createIdentityToRecover(t, reg, email)
 
-		code, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), FlowType: pointerx.Ptr(string(flow.TypeAPI))})
+		code, _, err := createCode(createCodeParams{IdentityId: i.ID.String(), FlowType: new(string(flow.TypeAPI))})
 		require.NoError(t, err)
 
 		res, err := publicTS.Client().Get(code.RecoveryLink)

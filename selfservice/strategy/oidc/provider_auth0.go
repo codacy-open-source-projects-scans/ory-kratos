@@ -4,6 +4,7 @@
 package oidc
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"github.com/ory/x/httpx"
-	"github.com/ory/x/stringsx"
 
 	"github.com/tidwall/sjson"
 
@@ -120,7 +120,7 @@ func (g *ProviderAuth0) Claims(ctx context.Context, exchange *oauth2.Token, quer
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithWrap(err).WithReasonf("%s", err))
 	}
 
-	claims.Issuer = stringsx.Coalesce(claims.Issuer, g.config.IssuerURL)
+	claims.Issuer = cmp.Or(claims.Issuer, g.config.IssuerURL)
 	return &claims, nil
 }
 

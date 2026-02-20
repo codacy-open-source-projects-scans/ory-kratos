@@ -121,21 +121,22 @@ func (h *Handler) listCourierMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	l, nextPage, err := h.r.CourierPersister().ListMessages(r.Context(), filter, paginator)
+	messages, nextPage, err := h.r.CourierPersister().ListMessages(r.Context(), filter, paginator)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
 
 	if !h.r.Config().IsInsecureDevMode(r.Context()) {
-		for i := range l {
-			l[i].Body = "<redacted-unless-dev-mode>"
+		for i := range messages {
+			messages[i].Body = "<redacted-unless-dev-mode>"
+			messages[i].Subject = "<redacted-unless-dev-mode>"
 		}
 	}
 
 	u := *r.URL
 	keysetpagination.SetLinkHeader(w, keys, &u, nextPage)
-	h.r.Writer().Write(w, r, l)
+	h.r.Writer().Write(w, r, messages)
 }
 
 func parseMessagesFilter(r *http.Request, keys [][32]byte) (ListCourierMessagesParameters, []keysetpagination.Option, error) {
@@ -211,6 +212,7 @@ func (h *Handler) getCourierMessage(w http.ResponseWriter, r *http.Request) {
 
 	if !h.r.Config().IsInsecureDevMode(r.Context()) {
 		message.Body = "<redacted-unless-dev-mode>"
+		message.Subject = "<redacted-unless-dev-mode>"
 	}
 
 	h.r.Writer().Write(w, r, message)

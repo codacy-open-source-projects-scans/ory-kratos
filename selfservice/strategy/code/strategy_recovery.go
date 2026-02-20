@@ -17,7 +17,6 @@ import (
 	"github.com/ory/kratos/x/redir"
 
 	"github.com/ory/x/otelx/semconv"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/sqlcon"
 
 	"github.com/gofrs/uuid"
@@ -46,6 +45,10 @@ func (s *Strategy) RecoveryStrategyID() string {
 	return string(recovery.RecoveryStrategyCode)
 }
 
+func (s *Strategy) IsPrimary() bool {
+	return true
+}
+
 // This builds the initial UI (first recovery screen).
 func (s *Strategy) PopulateRecoveryMethod(r *http.Request, f *recovery.Flow) error {
 	switch f.State {
@@ -60,7 +63,9 @@ func (s *Strategy) PopulateRecoveryMethod(r *http.Request, f *recovery.Flow) err
 		f.UI = &container.Container{
 			Method: "POST",
 			Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+			Nodes:  f.UI.Nodes,
 		}
+		f.UI.Nodes.ClearTransientNodes()
 		f.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
 		f.UI.GetNodes().Append(
 			node.NewInputField("recovery_address", nil, node.CodeGroup, node.InputAttributeTypeText, node.WithRequiredInputAttribute).
@@ -410,7 +415,7 @@ func (s *Strategy) retryRecoveryFlow(w http.ResponseWriter, r *http.Request, ft 
 	ctx := r.Context()
 	config := s.deps.Config()
 
-	f, err := recovery.NewFlow(config, config.SelfServiceFlowRecoveryRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, s, ft)
+	f, err := recovery.NewFlow(config, config.SelfServiceFlowRecoveryRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, recovery.Strategies{s}, ft)
 	if err != nil {
 		return err
 	}
@@ -501,7 +506,9 @@ func (s *Strategy) recoveryV2HandleStateAwaitingAddress(r *http.Request, f *reco
 	f.UI = &container.Container{
 		Method: "POST",
 		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+		Nodes:  f.UI.Nodes,
 	}
+	f.UI.Nodes.ClearTransientNodes()
 
 	f.UI.SetCSRF(f.CSRFToken)
 
@@ -568,7 +575,9 @@ func (s *Strategy) recoveryV2HandleStateAwaitingAddressChoice(r *http.Request, f
 	f.UI = &container.Container{
 		Method: "POST",
 		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+		Nodes:  f.UI.Nodes,
 	}
+	f.UI.Nodes.ClearTransientNodes()
 	f.UI.SetCSRF(f.CSRFToken)
 
 	f.State = flow.StateRecoveryAwaitingAddressConfirm
@@ -654,7 +663,9 @@ func (s *Strategy) recoveryV2HandleStateConfirmingAddress(r *http.Request, f *re
 	f.UI = &container.Container{
 		Method: "POST",
 		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+		Nodes:  f.UI.Nodes,
 	}
+	f.UI.Nodes.ClearTransientNodes()
 	f.UI.SetCSRF(f.CSRFToken)
 
 	f.State = flow.StateRecoveryAwaitingCode
@@ -776,7 +787,9 @@ func (s *Strategy) recoveryHandleFormSubmission(w http.ResponseWriter, r *http.R
 	f.UI = &container.Container{
 		Method: "POST",
 		Action: flow.AppendFlowTo(urlx.AppendPaths(s.deps.Config().SelfPublicURL(r.Context()), recovery.RouteSubmitFlow), f.ID).String(),
+		Nodes:  f.UI.Nodes,
 	}
+	f.UI.Nodes.ClearTransientNodes()
 
 	f.UI.SetCSRF(s.deps.GenerateCSRFToken(r))
 
@@ -811,7 +824,7 @@ func (s *Strategy) markRecoveryAddressVerified(w http.ResponseWriter, r *http.Re
 	for k, v := range id.VerifiableAddresses {
 		if v.Value == recoveryAddress.Value {
 			id.VerifiableAddresses[k].Verified = true
-			id.VerifiableAddresses[k].VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now().UTC()))
+			id.VerifiableAddresses[k].VerifiedAt = new(sqlxx.NullTime(time.Now().UTC()))
 			id.VerifiableAddresses[k].Status = identity.VerifiableAddressStatusCompleted
 			if err := s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(r.Context(), &id.VerifiableAddresses[k], "verified", "verified_at", "status"); err != nil {
 				return s.HandleRecoveryError(w, r, f, nil, err)

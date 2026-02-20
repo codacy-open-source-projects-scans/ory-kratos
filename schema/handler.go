@@ -231,7 +231,7 @@ func (h *Handler) ReadSchema(ctx context.Context, uri *url.URL) (data []byte, er
 
 	switch uri.Scheme {
 	case "file":
-		data, err = os.ReadFile(uri.Host + uri.Path)
+		data, err = os.ReadFile(uri.Host + uri.Path) //nolint:gosec
 		if err != nil {
 			return nil, errors.WithStack(fmt.Errorf("could not read schema file: %w", err))
 		}

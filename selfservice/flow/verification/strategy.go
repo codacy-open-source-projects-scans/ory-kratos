@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/ory/herodot"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/ui/node"
 
@@ -27,30 +28,41 @@ type (
 		NodeGroup() node.UiNodeGroup
 		PopulateVerificationMethod(*http.Request, *Flow) error
 		Verify(w http.ResponseWriter, r *http.Request, f *Flow) (err error)
+	}
+	PrimaryStrategy interface {
+		Strategy
 		SendVerificationCode(context.Context, *Flow, *identity.Identity, *identity.VerifiableAddress) error
 	}
 	Strategies       []Strategy
 	StrategyProvider interface {
 		VerificationStrategies(ctx context.Context) Strategies
 		AllVerificationStrategies() Strategies
-		GetActiveVerificationStrategy(context.Context) (Strategy, error)
+		GetActiveVerificationStrategies(context.Context) (active Strategies, primary PrimaryStrategy, err error)
 	}
 )
 
-func (s Strategies) Strategy(id string) (Strategy, error) {
+func (s Strategies) ActiveStrategies(id string) (active Strategies, primary PrimaryStrategy, err error) {
 	ids := make([]string, len(s))
+	activeStrategies := Strategies{}
 	for k, ss := range s {
 		ids[k] = ss.VerificationStrategyID()
-		if ss.VerificationStrategyID() == id {
-			return ss, nil
+		if ps, isPrimary := ss.(PrimaryStrategy); ss.VerificationStrategyID() == id || !isPrimary {
+			activeStrategies = append(activeStrategies, ss)
+			if isPrimary {
+				primary = ps
+			}
 		}
 	}
 
-	return nil, errors.Errorf(`unable to find strategy for %s have %v`, id, ids)
+	if primary == nil {
+		return nil, nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("unable to find strategy for %s have %v", id, ids))
+	}
+
+	return activeStrategies, primary, nil
 }
 
 func (s Strategies) MustStrategy(id string) Strategy {
-	strategy, err := s.Strategy(id)
+	_, strategy, err := s.ActiveStrategies(id)
 	if err != nil {
 		panic(err)
 	}

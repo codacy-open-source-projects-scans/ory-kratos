@@ -116,7 +116,7 @@ type Flow struct {
 
 var _ flow.Flow = (*Flow)(nil)
 
-func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, ft flow.Type) (*Flow, error) {
+func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, ft flow.Type) (*Flow, error) {
 	now := time.Now().UTC()
 	id := x.NewUUID()
 
@@ -153,8 +153,10 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 		Type:      ft,
 	}
 
-	if strategy != nil {
-		f.Active = sqlxx.NullString(strategy.NodeGroup())
+	for _, strategy := range strategies {
+		if strategy.IsPrimary() {
+			f.Active = sqlxx.NullString(strategy.NodeGroup())
+		}
 		if err := strategy.PopulateRecoveryMethod(r, f); err != nil {
 			return nil, err
 		}
@@ -163,13 +165,13 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 	return f, nil
 }
 
-func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategy Strategy, of Flow) (*Flow, error) {
+func FromOldFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, strategies Strategies, of Flow) (*Flow, error) {
 	f := of.Type
 	// Using the same flow in the recovery/verification context can lead to using API flow in a verification/recovery email
 	if of.Type == flow.TypeAPI && of.Active.String() == string(RecoveryStrategyLink) {
 		f = flow.TypeBrowser
 	}
-	nf, err := NewFlow(conf, exp, csrf, r, strategy, f)
+	nf, err := NewFlow(conf, exp, csrf, r, strategies, f)
 	if err != nil {
 		return nil, err
 	}

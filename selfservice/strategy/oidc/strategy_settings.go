@@ -5,6 +5,7 @@ package oidc
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -22,7 +23,6 @@ import (
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/sqlxx"
-	"github.com/ory/x/stringsx"
 
 	"github.com/ory/kratos/continuity"
 	oidcv1 "github.com/ory/kratos/gen/oidc/v1"
@@ -171,7 +171,7 @@ func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, 
 		if l.Config().OrganizationID != "" {
 			continue
 		}
-		sr.UI.GetNodes().Append(NewLinkNode(l.Config().ID, stringsx.Coalesce(l.Config().Label, l.Config().ID)))
+		sr.UI.GetNodes().Append(NewLinkNode(l.Config().ID, cmp.Or(l.Config().Label, l.Config().ID)))
 	}
 
 	count, err := s.d.IdentityManager().CountActiveFirstFactorCredentials(ctx, id)
@@ -183,7 +183,7 @@ func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, 
 		// This means that we're able to remove a connection because it is the last configured credential. If it is
 		// removed, the identity is no longer able to sign in.
 		for _, l := range linked {
-			sr.UI.GetNodes().Append(NewUnlinkNode(l.Config().ID, stringsx.Coalesce(l.Config().Label, l.Config().ID)))
+			sr.UI.GetNodes().Append(NewUnlinkNode(l.Config().ID, cmp.Or(l.Config().Label, l.Config().ID)))
 		}
 	}
 

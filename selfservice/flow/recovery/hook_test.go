@@ -34,7 +34,7 @@ func TestRecoveryExecutor(t *testing.T) {
 	conf, reg := pkg.NewFastRegistryWithMocks(t,
 		configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/identity.schema.json")),
 	)
-	s := code.NewStrategy(reg)
+	s := recovery.Strategies{code.NewStrategy(reg)}
 
 	newServer := func(t *testing.T, i *identity.Identity, ft flow.Type) *httptest.Server {
 		router := http.NewServeMux()

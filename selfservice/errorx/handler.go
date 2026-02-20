@@ -4,6 +4,7 @@
 package errorx
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/ory/nosurf"
 	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/httpx"
-	"github.com/ory/x/stringsx"
 )
 
 const RouteGet = "/self-service/errors"
@@ -100,10 +100,7 @@ func (h *Handler) publicFetchError(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) fetchError(w http.ResponseWriter, r *http.Request) error {
-	id :=
-		stringsx.Coalesce(
-			r.URL.Query().Get("error"), // https://github.com/ory/kratos/issues/1507
-			r.URL.Query().Get("id"))
+	id := cmp.Or(r.URL.Query().Get("error"), r.URL.Query().Get("id"))
 	switch id {
 	case "stub:500":
 		h.r.Writer().Write(w, r, &ErrorContainer{ID: x.NewUUID(), Errors: stub500})

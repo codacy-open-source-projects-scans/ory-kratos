@@ -116,7 +116,7 @@ func (e *Verifier) do(
 	// This is called after the identity has been created so we can safely assume that all addresses are available
 	// already.
 
-	strategy, err := e.r.GetActiveVerificationStrategy(ctx)
+	strategies, primaryStrategy, err := e.r.GetActiveVerificationStrategies(ctx)
 	if err != nil {
 		return err
 	}
@@ -154,7 +154,7 @@ func (e *Verifier) do(
 
 		verificationFlow, err := verification.NewPostHookFlow(e.r.Config(),
 			e.r.Config().SelfServiceFlowVerificationRequestLifespan(ctx),
-			csrf, r, strategy, f)
+			csrf, r, strategies, f)
 		if err != nil {
 			return err
 		}
@@ -164,7 +164,7 @@ func (e *Verifier) do(
 		}
 
 		verificationFlow.State = flow.StateEmailSent
-		if err := strategy.PopulateVerificationMethod(r, verificationFlow); err != nil {
+		if err := primaryStrategy.PopulateVerificationMethod(r, verificationFlow); err != nil {
 			return err
 		}
 
@@ -177,7 +177,7 @@ func (e *Verifier) do(
 			return err
 		}
 
-		if err := strategy.SendVerificationCode(ctx, verificationFlow, i, address); err != nil {
+		if err := primaryStrategy.SendVerificationCode(ctx, verificationFlow, i, address); err != nil {
 			return err
 		}
 

@@ -11,10 +11,10 @@ import (
 )
 
 func (p *Persister) hmacValue(ctx context.Context, value string) string {
-	return hmacValueWithSecret(ctx, value, p.r.Config().SecretsSession(ctx)[0])
+	return hmacValueWithSecret(value, p.r.Config().SecretsSession(ctx)[0])
 }
 
-func hmacValueWithSecret(ctx context.Context, value string, secret []byte) string {
+func hmacValueWithSecret(value string, secret []byte) string {
 	h := hmac.New(sha512.New512_256, secret)
 	_, _ = h.Write([]byte(value))
 	return fmt.Sprintf("%x", h.Sum(nil))

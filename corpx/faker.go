@@ -18,7 +18,6 @@ import (
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/randx"
 )
 
@@ -32,13 +31,13 @@ func registerFakes() {
 	_ = faker.SetRandomMapAndSliceSize(4)
 
 	if err := faker.AddProvider("ptr_geo_location", func(v reflect.Value) (interface{}, error) {
-		return pointerx.Ptr("Munich, Germany"), nil
+		return new("Munich, Germany"), nil
 	}); err != nil {
 		panic(err)
 	}
 
 	if err := faker.AddProvider("ptr_ipv4", func(v reflect.Value) (interface{}, error) {
-		return pointerx.Ptr(faker.IPv4()), nil
+		return new(faker.IPv4()), nil
 	}); err != nil {
 		panic(err)
 	}

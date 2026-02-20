@@ -38,7 +38,6 @@ import (
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/pagination/keysetpagination"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/popx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
@@ -342,7 +341,7 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, ident
 
 			identifiers = append(identifiers, &identity.CredentialIdentifier{
 				Identifier:                identifier,
-				IdentityID:                pointerx.Ptr(cred.IdentityID),
+				IdentityID:                new(cred.IdentityID),
 				IdentityCredentialsID:     cred.ID,
 				IdentityCredentialsTypeID: ct,
 				NID:                       p.NetworkID(ctx),
@@ -556,7 +555,7 @@ func (p *IdentityPersister) normalizeVerifiableAddresses(ctx context.Context, id
 
 		// If verified is true but no timestamp is set, we default to time.Now
 		if v.Verified && (v.VerifiedAt == nil || time.Time(*v.VerifiedAt).IsZero()) {
-			v.VerifiedAt = pointerx.Ptr(sqlxx.NullTime(time.Now()))
+			v.VerifiedAt = new(sqlxx.NullTime(time.Now()))
 		}
 		if !v.Verified {
 			v.VerifiedAt = nil

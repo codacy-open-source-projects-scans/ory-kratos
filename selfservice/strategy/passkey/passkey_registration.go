@@ -97,11 +97,6 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, regFlow *reg
 	ctx, span := s.d.Tracer(r.Context()).Tracer().Start(r.Context(), "selfservice.strategy.passkey.Strategy.Register")
 	defer otelx.End(span, &err)
 
-	if regFlow.Type != flow.TypeBrowser {
-		span.SetAttributes(attribute.String("not_responsible_reason", "flow type is not browser"))
-		return flow.ErrStrategyNotResponsible
-	}
-
 	ds, err := regFlow.IdentitySchema.URL(ctx, s.d.Config())
 	if err != nil {
 		return err
@@ -206,9 +201,6 @@ type passkeyCreateData struct {
 
 func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.Flow) error {
 	ctx := r.Context()
-	if f.Type != flow.TypeBrowser {
-		return nil
-	}
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	opts, err := s.hydratePassKeyRegistrationOptions(ctx, f)
@@ -218,8 +210,21 @@ func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.F
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	f.UI.Nodes.Upsert(injectOptions(opts))
-	f.UI.Nodes.Upsert(passkeyRegisterTrigger())
-	f.UI.Nodes.Upsert(webauthnx.NewWebAuthnScript(s.d.Config().SelfPublicURL(ctx)))
+
+	trigger := passkeyRegisterTrigger()
+	if f.Type == flow.TypeAPI {
+		// API flows should not have raw JS onClick handlers, but keep onClickTrigger
+		// as a semantic enum for SPA/native apps to key off of.
+		if attr, ok := trigger.Attributes.(*node.InputAttributes); ok {
+			attr.OnClick = ""
+		}
+	}
+	f.UI.Nodes.Upsert(trigger)
+
+	if f.Type == flow.TypeBrowser {
+		f.UI.Nodes.Upsert(webauthnx.NewWebAuthnScript(s.d.Config().SelfPublicURL(ctx)))
+	}
+
 	f.UI.Nodes.Upsert(passkeyRegister())
 	return nil
 }
@@ -239,9 +244,6 @@ func (s *Strategy) validateCredentials(ctx context.Context, i *identity.Identity
 
 func (s *Strategy) PopulateRegistrationMethodCredentials(r *http.Request, f *registration.Flow, options ...registration.FormHydratorModifier) error {
 	ctx := r.Context()
-	if f.Type != flow.TypeBrowser {
-		return nil
-	}
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	opts, err := s.hydratePassKeyRegistrationOptions(ctx, f)
@@ -251,17 +253,27 @@ func (s *Strategy) PopulateRegistrationMethodCredentials(r *http.Request, f *reg
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	f.UI.Nodes.Upsert(injectOptions(opts))
-	f.UI.Nodes.Upsert(passkeyRegisterTrigger())
-	f.UI.Nodes.Upsert(webauthnx.NewWebAuthnScript(s.d.Config().SelfPublicURL(ctx)))
+
+	trigger := passkeyRegisterTrigger()
+	if f.Type == flow.TypeAPI {
+		// API flows should not have raw JS onClick handlers, but keep onClickTrigger
+		// as a semantic enum for SPA/native apps to key off of.
+		if attr, ok := trigger.Attributes.(*node.InputAttributes); ok {
+			attr.OnClick = ""
+		}
+	}
+	f.UI.Nodes.Upsert(trigger)
+
+	if f.Type == flow.TypeBrowser {
+		f.UI.Nodes.Upsert(webauthnx.NewWebAuthnScript(s.d.Config().SelfPublicURL(ctx)))
+	}
+
 	f.UI.Nodes.Upsert(passkeyRegister())
 	return nil
 }
 
 func (s *Strategy) PopulateRegistrationMethodProfile(r *http.Request, f *registration.Flow, options ...registration.FormHydratorModifier) error {
 	ctx := r.Context()
-	if f.Type != flow.TypeBrowser {
-		return nil
-	}
 
 	opts, err := s.hydratePassKeyRegistrationOptions(ctx, f)
 	if err != nil {

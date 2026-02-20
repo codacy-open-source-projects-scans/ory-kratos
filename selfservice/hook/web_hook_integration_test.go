@@ -50,7 +50,6 @@ import (
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
-	"github.com/ory/x/pointerx"
 	"github.com/ory/x/snapshotx"
 )
 
@@ -1351,7 +1350,7 @@ func TestWebhookEvents(t *testing.T) {
 			URL:                webhookReceiver.URL + "/fail",
 			Method:             "GET",
 			TemplateURI:        "file://stub/test_body.jsonnet",
-			EmitAnalyticsEvent: pointerx.Ptr(false),
+			EmitAnalyticsEvent: new(false),
 		})
 
 		recorder := tracetest.NewSpanRecorder()

@@ -94,10 +94,10 @@ func (s *ErrorHandler) WriteFlowError(
 	trace.SpanFromContext(r.Context()).AddEvent(events.NewVerificationFailed(r.Context(), f.ID, string(f.Type), f.Active.String(), err))
 
 	if e := new(flow.ExpiredError); errors.As(err, &e) {
-		strategy, err := s.d.VerificationStrategies(r.Context()).Strategy(f.Active.String())
+		strategies, _, err := s.d.VerificationStrategies(r.Context()).ActiveStrategies(f.Active.String())
 		if err != nil {
-			strategy, err = s.d.GetActiveVerificationStrategy(r.Context())
-			// Can't retry the verification if no strategy has been set
+			strategies, _, err = s.d.GetActiveVerificationStrategies(r.Context())
+			// Can't retry the verification if no primary strategy has been set
 			if err != nil {
 				s.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
 				return
@@ -105,7 +105,7 @@ func (s *ErrorHandler) WriteFlowError(
 		}
 		// create new flow because the old one is not valid
 		a, err := FromOldFlow(s.d.Config(), s.d.Config().SelfServiceFlowVerificationRequestLifespan(r.Context()),
-			s.d.CSRFHandler().RegenerateToken(w, r), r, strategy, f)
+			s.d.CSRFHandler().RegenerateToken(w, r), r, strategies, f)
 		if err != nil {
 			// failed to create a new session and redirect to it, handle that error as a new one
 			s.WriteFlowError(w, r, f, group, err)

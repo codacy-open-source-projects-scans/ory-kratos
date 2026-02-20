@@ -227,10 +227,10 @@ func SubmitRecoveryForm(
 	return b
 }
 
-func PersistNewRecoveryFlow(t *testing.T, strategy recovery.Strategy, conf *config.Config, reg *driver.RegistryDefault) *recovery.Flow {
+func PersistNewRecoveryFlow(t *testing.T, strategies recovery.Strategies, conf *config.Config, reg *driver.RegistryDefault) *recovery.Flow {
 	t.Helper()
 	req := NewTestHTTPRequest(t, "GET", conf.SelfPublicURL(context.Background()).String()+"/test", nil)
-	f, err := recovery.NewFlow(conf, conf.SelfServiceFlowRecoveryRequestLifespan(context.Background()), reg.GenerateCSRFToken(req), req, strategy, flow.TypeBrowser)
+	f, err := recovery.NewFlow(conf, conf.SelfServiceFlowRecoveryRequestLifespan(context.Background()), reg.GenerateCSRFToken(req), req, strategies, flow.TypeBrowser)
 	require.NoError(t, err, "Expected no error when creating a new recovery flow: %s", err)
 
 	err = reg.RecoveryFlowPersister().CreateRecoveryFlow(context.Background(), f)

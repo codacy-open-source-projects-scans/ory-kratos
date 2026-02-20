@@ -72,9 +72,9 @@ func TestHandleError(t *testing.T) {
 	newFlow := func(t *testing.T, ttl time.Duration, ft flow.Type) *verification.Flow {
 		t.Helper()
 		req := &http.Request{URL: urlx.ParseOrPanic("/")}
-		strategy, err := reg.GetActiveVerificationStrategy(context.Background())
+		strategies, _, err := reg.GetActiveVerificationStrategies(context.Background())
 		require.NoError(t, err)
-		f, err := verification.NewFlow(conf, ttl, nosurfx.FakeCSRFToken, req, strategy, ft)
+		f, err := verification.NewFlow(conf, ttl, nosurfx.FakeCSRFToken, req, strategies, ft)
 		require.NoError(t, err)
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(context.Background(), f))
 		f, err = reg.VerificationFlowPersister().GetVerificationFlow(context.Background(), f.ID)

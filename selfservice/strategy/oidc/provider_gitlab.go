@@ -4,12 +4,11 @@
 package oidc
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/url"
 	"path"
-
-	"github.com/ory/x/stringsx"
 
 	"github.com/hashicorp/go-retryablehttp"
 
@@ -105,7 +104,7 @@ func (g *ProviderGitLab) Claims(ctx context.Context, exchange *oauth2.Token, que
 		return nil, errors.WithStack(herodot.ErrUpstreamError.WithWrap(err).WithReasonf("%s", err))
 	}
 
-	claims.Issuer = stringsx.Coalesce(claims.Issuer, g.config.IssuerURL)
+	claims.Issuer = cmp.Or(claims.Issuer, g.config.IssuerURL)
 	return &claims, nil
 }
 

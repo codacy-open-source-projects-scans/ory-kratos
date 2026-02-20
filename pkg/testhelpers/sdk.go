@@ -13,8 +13,6 @@ import (
 
 	"github.com/ory/kratos/ui/node"
 
-	"github.com/ory/x/pointerx"
-
 	kratos "github.com/ory/kratos/pkg/httpclient"
 )
 
@@ -68,7 +66,7 @@ func NewFakeCSRFNode() *kratos.UiNode {
 		Type:  "input",
 		Attributes: kratos.UiNodeInputAttributesAsUiNodeAttributes(&kratos.UiNodeInputAttributes{
 			Name:     "csrf_token",
-			Required: pointerx.Bool(true),
+			Required: new(true),
 			Type:     "hidden",
 			Value:    nosurfx.FakeCSRFToken,
 		}),
@@ -82,7 +80,7 @@ func NewSDKEmailNode(group string) *kratos.UiNode {
 		Attributes: kratos.UiNodeInputAttributesAsUiNodeAttributes(&kratos.UiNodeInputAttributes{
 			Name:     "email",
 			Type:     "email",
-			Required: pointerx.Bool(true),
+			Required: new(true),
 			Value:    "email",
 		}),
 	}
@@ -107,7 +105,7 @@ func NewPasswordNode() *kratos.UiNode {
 		Attributes: kratos.UiNodeInputAttributesAsUiNodeAttributes(&kratos.UiNodeInputAttributes{
 			Name:     "password",
 			Type:     "password",
-			Required: pointerx.Bool(true),
+			Required: new(true),
 		}),
 	}
 }

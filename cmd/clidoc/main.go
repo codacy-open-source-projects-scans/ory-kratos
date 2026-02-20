@@ -267,18 +267,19 @@ func sortMessages() []*text.Message {
 }
 
 func writeMessages(path string, sortedMessages []*text.Message) error {
-	content, err := os.ReadFile(path) // #nosec G304 -- path is supplied by us
+	//nolint:gosec
+	content, err := os.ReadFile(path) // #nosec
 	if err != nil {
 		return err
 	}
 
 	var w bytes.Buffer
 	for _, m := range sortedMessages {
-		w.WriteString(fmt.Sprintf(`###### %s (%d)
+		fmt.Fprintf(&w, `###### %s (%d)
 
 %s
 
-`, m.Text, m.ID, "```json\n"+codeEncode(m)+"\n```"))
+`, m.Text, m.ID, "```json\n"+codeEncode(m)+"\n```")
 	}
 
 	r := regexp.MustCompile(`(?s)<!-- START MESSAGE TABLE -->(.*?)<!-- END MESSAGE TABLE -->`)

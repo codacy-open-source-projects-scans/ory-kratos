@@ -22,7 +22,6 @@ import (
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/jsonschemax"
 	"github.com/ory/x/jsonx"
-	"github.com/ory/x/stringslice"
 
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/text"
@@ -339,7 +338,7 @@ func (c *Container) SetValue(id string, n *node.Node) {
 // AddMessage adds the provided error, and if a non-empty names list is set,
 // adds the error on the corresponding field.
 func (c *Container) AddMessage(group node.UiNodeGroup, err *text.Message, setForFields ...string) {
-	if len(stringslice.TrimSpaceEmptyFilter(setForFields)) == 0 {
+	if !slices.ContainsFunc(setForFields, func(s string) bool { return strings.TrimSpace(s) != "" }) {
 		c.Messages = append(c.Messages, *err)
 		return
 	}

@@ -299,17 +299,7 @@ func (s *Strategy) populateChooseMethodFlow(r *http.Request, f flow.Flow) error 
 func (s *Strategy) populateEmailSentFlow(ctx context.Context, f flow.Flow) error {
 	// fresh ui node group
 	freshNodes := f.GetUI().Nodes
-	freshNodes.RemoveGroups(
-		node.DefaultGroup,
-		node.PasswordGroup,
-		node.OpenIDConnectGroup,
-		node.CodeGroup,
-		node.WebAuthnGroup,
-		node.PasskeyGroup,
-		node.IdentifierFirstGroup,
-		node.ProfileGroup,
-		node.SAMLGroup,
-	)
+	freshNodes.ClearTransientNodes()
 	var route string
 	var codeMetaLabel *text.Message
 	var message *text.Message

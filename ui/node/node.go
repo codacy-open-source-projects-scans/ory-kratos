@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/ory/kratos/schema"
 
 	"github.com/ory/kratos/text"
-	"github.com/ory/x/stringslice"
 )
 
 // swagger:enum UiNodeType
@@ -170,7 +170,7 @@ func (n Nodes) FindAll(id string) []Node {
 func (n Nodes) Reset(exclude ...string) {
 	for k, nn := range n {
 		nn.Messages = nil
-		if !stringslice.Has(exclude, nn.ID()) {
+		if !slices.Contains(exclude, nn.ID()) {
 			nn.Reset()
 		}
 		n[k] = nn
@@ -179,7 +179,7 @@ func (n Nodes) Reset(exclude ...string) {
 
 func (n Nodes) ResetNodes(reset ...string) {
 	for k, nn := range n {
-		if stringslice.Has(reset, nn.ID()) {
+		if slices.Contains(reset, nn.ID()) {
 			nn.Reset()
 		}
 		n[k] = nn
@@ -361,6 +361,24 @@ func (n *Nodes) RemoveGroups(group ...UiNodeGroup) {
 	for _, g := range group {
 		n.RemoveGroup(g)
 	}
+}
+
+// ClearTransientNodes removes all nodes that belong to transient groups.
+func (n *Nodes) ClearTransientNodes() {
+	n.RemoveGroups(
+		DefaultGroup,
+		PasswordGroup,
+		OpenIDConnectGroup,
+		ProfileGroup,
+		LinkGroup,
+		CodeGroup,
+		TOTPGroup,
+		LookupGroup,
+		WebAuthnGroup,
+		PasskeyGroup,
+		IdentifierFirstGroup,
+		SAMLGroup,
+	)
 }
 
 // Upsert updates or appends a node.

@@ -191,6 +191,7 @@ func TestHandler(t *testing.T) {
 
 					for _, item := range parsed.Array() {
 						assert.Equal(t, "<redacted-unless-dev-mode>", item.Get("body").String())
+						assert.Equal(t, "<redacted-unless-dev-mode>", item.Get("subject").String())
 					}
 				})
 			}
@@ -204,6 +205,7 @@ func TestHandler(t *testing.T) {
 
 					for _, item := range parsed.Array() {
 						assert.Equal(t, "body content", item.Get("body").String())
+						assert.NotEqual(t, "<redacted-unless-dev-mode>", item.Get("subject").String())
 					}
 				})
 			}
@@ -243,6 +245,7 @@ func TestHandler(t *testing.T) {
 					assert.Equal(t, message.ID.String(), body.Get("id").String())
 					assert.Equal(t, message.Recipient, body.Get("recipient").String())
 					assert.Equal(t, message.Body, body.Get("body").String())
+					assert.Equal(t, message.Subject, body.Get("subject").String())
 
 					// assert Eager works
 					assert.NotEmpty(t, body.Get("dispatches").Array())
@@ -257,6 +260,7 @@ func TestHandler(t *testing.T) {
 					body := getCourierMessag(tc.s, message.ID.String())
 					assert.Equal(t, message.ID.String(), body.Get("id").String())
 					assert.Equal(t, "<redacted-unless-dev-mode>", body.Get("body").String())
+					assert.Equal(t, "<redacted-unless-dev-mode>", body.Get("subject").String())
 				})
 			}
 		})

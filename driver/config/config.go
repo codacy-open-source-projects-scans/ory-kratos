@@ -42,8 +42,6 @@ import (
 	"github.com/ory/x/jsonschemax"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
-	"github.com/ory/x/pointerx"
-	"github.com/ory/x/stringsx"
 	"github.com/ory/x/watcherx"
 )
 
@@ -531,7 +529,7 @@ func (p *Config) MustSet(_ context.Context, key string, value interface{}) {
 }
 
 func (p *Config) SessionName(ctx context.Context) string {
-	return stringsx.Coalesce(p.GetProvider(ctx).String(ViperKeySessionName), DefaultSessionCookieName)
+	return cmp.Or(p.GetProvider(ctx).String(ViperKeySessionName), DefaultSessionCookieName)
 }
 
 func (p *Config) HasherArgon2(ctx context.Context) *Argon2 {
@@ -1496,7 +1494,7 @@ func (p *Config) WebAuthnConfig(ctx context.Context) *webauthn.Config {
 	scheme := p.SelfPublicURL(ctx).Scheme
 	id := p.GetProvider(ctx).String(ViperKeyWebAuthnRPID)
 	origin := p.GetProvider(ctx).String(ViperKeyWebAuthnRPOrigin)
-	origins := p.GetProvider(ctx).StringsF(ViperKeyWebAuthnRPOrigins, []string{stringsx.Coalesce(origin, scheme+"://"+id)})
+	origins := p.GetProvider(ctx).StringsF(ViperKeyWebAuthnRPOrigins, []string{cmp.Or(origin, scheme+"://"+id)})
 	return &webauthn.Config{
 		RPDisplayName: p.GetProvider(ctx).String(ViperKeyWebAuthnRPDisplayName),
 		RPID:          id,
@@ -1518,7 +1516,7 @@ func (p *Config) PasskeyConfig(ctx context.Context) *webauthn.Config {
 		RPOrigins:     origins,
 		AuthenticatorSelection: protocol.AuthenticatorSelection{
 			AuthenticatorAttachment: "platform",
-			RequireResidentKey:      pointerx.Ptr(true),
+			RequireResidentKey:      new(true),
 			ResidentKey:             protocol.ResidentKeyRequirementRequired,
 			UserVerification:        protocol.VerificationPreferred,
 		},

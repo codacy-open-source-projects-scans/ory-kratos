@@ -5,6 +5,7 @@ package oidc
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -30,7 +31,6 @@ import (
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
-	"github.com/ory/x/stringsx"
 )
 
 var (
@@ -476,7 +476,7 @@ func (s *Strategy) PopulateLoginMethodIdentifierFirstCredentials(r *http.Request
 			if lc.OrganizationID != "" {
 				continue
 			}
-			AddProvider(f.UI, lc.ID, text.NewInfoLoginWith(stringsx.Coalesce(lc.Label, lc.ID), lc.ID), s.ID())
+			AddProvider(f.UI, lc.ID, text.NewInfoLoginWith(cmp.Or(lc.Label, lc.ID), lc.ID), s.ID())
 		}
 	}
 

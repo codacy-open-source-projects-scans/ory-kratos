@@ -24,6 +24,7 @@ const (
 type (
 	Strategy interface {
 		RecoveryStrategyID() string
+		IsPrimary() bool
 		NodeGroup() node.UiNodeGroup
 		PopulateRecoveryMethod(*http.Request, *Flow) error
 		Recover(w http.ResponseWriter, r *http.Request, f *Flow) (err error)
@@ -32,18 +33,25 @@ type (
 	StrategyProvider interface {
 		AllRecoveryStrategies() Strategies
 		RecoveryStrategies(ctx context.Context) Strategies
-		GetActiveRecoveryStrategy(ctx context.Context) (Strategy, error)
+		GetActiveRecoveryStrategies(ctx context.Context) (active Strategies, primary Strategy, err error)
 	}
 )
 
-func (s Strategies) Strategy(id string) (Strategy, error) {
+func (s Strategies) ActiveStrategies(id string) (active Strategies, primary Strategy, err error) {
 	ids := make([]string, len(s))
 	for k, ss := range s {
 		ids[k] = ss.RecoveryStrategyID()
-		if ss.RecoveryStrategyID() == id {
-			return ss, nil
+		if ss.RecoveryStrategyID() == id || !ss.IsPrimary() {
+			active = append(active, ss)
+			if ss.IsPrimary() {
+				primary = ss
+			}
 		}
 	}
 
-	return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("unable to find strategy for %s have %v", id, ids))
+	if primary == nil {
+		return nil, nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("unable to find strategy for %s have %v", id, ids))
+	}
+
+	return active, primary, nil
 }

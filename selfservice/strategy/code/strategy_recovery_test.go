@@ -4564,7 +4564,7 @@ func TestDisabledStrategy(t *testing.T) {
 		c := testhelpers.NewClientWithCookies(t)
 
 		t.Run("description=can not recover an account by post request when code method is disabled", func(t *testing.T) {
-			f := testhelpers.PersistNewRecoveryFlow(t, code.NewStrategy(reg), conf, reg)
+			f := testhelpers.PersistNewRecoveryFlow(t, recovery.Strategies{code.NewStrategy(reg)}, conf, reg)
 			u := publicTS.URL + recovery.RouteSubmitFlow + "?flow=" + f.ID.String()
 
 			res, err := c.PostForm(u, url.Values{

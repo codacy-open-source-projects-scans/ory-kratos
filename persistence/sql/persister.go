@@ -51,7 +51,6 @@ type (
 		mb  *popx.MigrationBox
 		mbs popx.MigrationStatuses
 		r   persisterDependencies
-		p   *networkx.Manager
 
 		identity.PrivilegedPool
 		session.DevicePersister
@@ -108,7 +107,6 @@ func NewPersister(r persisterDependencies, c *pop.Connection, opts ...Option) (*
 		r:               r,
 		PrivilegedPool:  idpersistence.NewPersister(r, c),
 		DevicePersister: devices.NewPersister(r, c),
-		p:               networkx.NewManager(c, r.Logger()),
 	}, nil
 }
 
@@ -132,7 +130,7 @@ func (p Persister) WithNetworkID(nid uuid.UUID) persistence.Persister {
 }
 
 func (p *Persister) DetermineNetwork(ctx context.Context) (*networkx.Network, error) {
-	return p.p.Determine(ctx)
+	return networkx.Determine(p.Connection(ctx))
 }
 
 func (p *Persister) Connection(ctx context.Context) *pop.Connection {

@@ -78,7 +78,7 @@ func (e *AddressVerifier) ExecuteLoginPostHook(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	strategy, err := e.r.GetActiveVerificationStrategy(ctx)
+	strategies, primaryStrategy, err := e.r.GetActiveVerificationStrategies(ctx)
 	if err != nil {
 		return err
 	}
@@ -99,14 +99,19 @@ func (e *AddressVerifier) ExecuteLoginPostHook(w http.ResponseWriter, r *http.Re
 
 		verificationFlow, err := verification.NewPostHookFlow(e.r.Config(),
 			e.r.Config().SelfServiceFlowVerificationRequestLifespan(ctx),
-			e.r.GenerateCSRFToken(r), r, strategy, f)
+			e.r.GenerateCSRFToken(r), r, strategies, f)
 		if err != nil {
 			return err
 		}
 
 		verificationFlow.State = flow.StateEmailSent
-		if err := strategy.PopulateVerificationMethod(r, verificationFlow); err != nil {
-			return err
+		for _, strategy := range strategies {
+			if ps, isPrimary := strategy.(verification.PrimaryStrategy); isPrimary {
+				verificationFlow.Active = sqlxx.NullString(ps.NodeGroup())
+			}
+			if err := strategy.PopulateVerificationMethod(r, verificationFlow); err != nil {
+				return err
+			}
 		}
 
 		verificationFlow.SessionID = uuid.NullUUID{UUID: s.ID, Valid: true}
@@ -117,12 +122,11 @@ func (e *AddressVerifier) ExecuteLoginPostHook(w http.ResponseWriter, r *http.Re
 				WithMetaLabel(text.NewInfoNodeResendOTP()),
 		)
 
-		verificationFlow.Active = sqlxx.NullString(strategy.NodeGroup())
 		if err := e.r.VerificationFlowPersister().CreateVerificationFlow(ctx, verificationFlow); err != nil {
 			return err
 		}
 
-		if err := strategy.SendVerificationCode(ctx, verificationFlow, i, address); err != nil {
+		if err := primaryStrategy.SendVerificationCode(ctx, verificationFlow, i, address); err != nil {
 			return err
 		}
 

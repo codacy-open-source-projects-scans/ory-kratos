@@ -291,7 +291,14 @@ func (fix *fixture) submitPasskeyRegistration(
 	}
 
 	isSPA := flowType == "spa"
-	regFlow := testhelpers.InitializeRegistrationFlowViaBrowserCtx(ctx, t, client, fix.publicTS, isSPA, false, false, o.initFlowOpts...)
+	isAPI := flowType == "api"
+
+	var regFlow *kratos.RegistrationFlow
+	if isAPI {
+		regFlow = testhelpers.InitializeRegistrationFlowViaAPI(t, client, fix.publicTS, o.initFlowOpts...)
+	} else {
+		regFlow = testhelpers.InitializeRegistrationFlowViaBrowserCtx(ctx, t, client, fix.publicTS, isSPA, false, false, o.initFlowOpts...)
+	}
 
 	// First step: fill out traits and click on "sign up with passkey"
 	values := testhelpers.SDKFormFieldsToURLValues(regFlow.Ui.Nodes)
@@ -299,12 +306,22 @@ func (fix *fixture) submitPasskeyRegistration(
 	passkeyRegisterVal := values.Get(node.PasskeyRegister) // needed in the second step
 	values.Del(node.PasskeyRegister)
 	values.Set("method", "passkey")
-	_, _ = testhelpers.RegistrationMakeRequest(t, false, isSPA, regFlow, client, values.Encode())
+
+	// Encode payload based on flow type
+	var payload string
+	if isAPI {
+		payload = testhelpers.EncodeFormAsJSON(t, true, values)
+	} else {
+		payload = values.Encode()
+	}
+	_, _ = testhelpers.RegistrationMakeRequest(t, isAPI, isSPA, regFlow, client, payload)
 
 	// We inject the session to replay
 	interim, err := fix.reg.RegistrationFlowPersister().GetRegistrationFlow(ctx, uuid.FromStringOrNil(regFlow.Id))
 	require.NoError(t, err)
-	interim.InternalContext = o.internalContext
+	if len(o.internalContext) > 0 {
+		interim.InternalContext = o.internalContext
+	}
 	if o.userID != "" {
 		interim.InternalContext, err = sjson.SetBytes(interim.InternalContext, "passkey_session_data.user_id", o.userID)
 		require.NoError(t, err)
@@ -313,7 +330,12 @@ func (fix *fixture) submitPasskeyRegistration(
 
 	// Second step: fill out passkey response
 	values.Set(node.PasskeyRegister, passkeyRegisterVal)
-	body, res := testhelpers.RegistrationMakeRequest(t, false, isSPA, regFlow, client, values.Encode())
+	if isAPI {
+		payload = testhelpers.EncodeFormAsJSON(t, true, values)
+	} else {
+		payload = values.Encode()
+	}
+	body, res := testhelpers.RegistrationMakeRequest(t, isAPI, isSPA, regFlow, client, payload)
 
 	return body, res, regFlow
 }
@@ -330,6 +352,11 @@ func (fix *fixture) makeSuccessfulRegistration(t *testing.T, flowType string, ex
 	actual, res, _ := fix.makeRegistration(t, flowType, values, opts...)
 	if flowType == "spa" {
 		expectReturnTo = fix.publicTS.URL
+	}
+	if flowType == "api" {
+		// API does not redirect; response body should contain JSON with identity/session fields.
+		// Leave detailed assertions to the calling test.
+		return actual
 	}
 	assert.Contains(t, res.Request.URL.String(), expectReturnTo, "%+v\n\t%s", res.Request, assertx.PrettifyJSONPayload(t, actual))
 	return actual

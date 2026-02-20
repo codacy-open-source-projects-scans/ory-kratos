@@ -88,17 +88,17 @@ func (s *ErrorHandler) WriteFlowError(
 	trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), f.ID, string(f.Type), f.Active.String(), recoveryErr))
 
 	if expiredError := new(flow.ExpiredError); errors.As(recoveryErr, &expiredError) {
-		strategy, err := s.d.RecoveryStrategies(r.Context()).Strategy(f.Active.String())
+		strategies, _, err := s.d.RecoveryStrategies(r.Context()).ActiveStrategies(f.Active.String())
 		if err != nil {
-			strategy, err = s.d.GetActiveRecoveryStrategy(r.Context())
-			// Can't retry the recovery if no strategy has been set
+			strategies, _, err = s.d.GetActiveRecoveryStrategies(r.Context())
+			// Can't retry the recovery if no primary strategy has been set
 			if err != nil {
 				s.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
 				return
 			}
 		}
 		// create new flow because the old one is not valid
-		newFlow, err := FromOldFlow(s.d.Config(), s.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), s.d.GenerateCSRFToken(r), r, strategy, *f)
+		newFlow, err := FromOldFlow(s.d.Config(), s.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), s.d.GenerateCSRFToken(r), r, strategies, *f)
 		if err != nil {
 			// failed to create a new session and redirect to it, handle that error as a new one
 			s.WriteFlowError(w, r, f, group, err)

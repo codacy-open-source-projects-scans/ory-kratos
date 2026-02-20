@@ -4,11 +4,11 @@
 package password
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
-	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/x/otelx"
