@@ -101,6 +101,7 @@ type UpdateRegistrationFlowWithOidcMethod struct {
 	// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
 	// - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
 	// - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
+	// - `acr_values` (string): The `acr_values` specifies the Authentication Context Class Reference values for the authorization request.
 	//
 	// required: false
 	UpstreamParameters json.RawMessage `json:"upstream_parameters"`
@@ -242,6 +243,22 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 		}),
 		continuity.WithLifespan(time.Minute*30)); err != nil {
 		return s.HandleError(ctx, w, r, f, pid, nil, err)
+	}
+
+	// For API/native flows, persist TransientPayload in InternalContext so it
+	// survives the OIDC redirect. Browser flows restore it from the continuity
+	// cookie instead, which is not available in native flows because the
+	// callback comes from a different user agent (system browser/webview).
+	if f.Type == flow.TypeAPI && len(f.TransientPayload) > 0 {
+		f.EnsureInternalContext()
+		ic, err := sjson.SetRawBytes(f.InternalContext, "transient_payload", f.TransientPayload)
+		if err != nil {
+			return s.HandleError(ctx, w, r, f, pid, nil, err)
+		}
+		f.InternalContext = ic
+		if err := s.d.RegistrationFlowPersister().UpdateRegistrationFlow(ctx, f); err != nil {
+			return s.HandleError(ctx, w, r, f, pid, nil, err)
+		}
 	}
 
 	var up map[string]string

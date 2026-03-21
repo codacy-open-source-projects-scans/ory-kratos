@@ -538,6 +538,14 @@ func (s *Strategy) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	case *login.Flow:
 		a.Active = s.ID()
 		a.TransientPayload = cntnr.TransientPayload
+		// For API/native flows, the continuity cookie is not available so
+		// cntnr.TransientPayload is empty. Fall back to the value persisted
+		// in InternalContext during Login().
+		if len(a.TransientPayload) == 0 {
+			if tp := gjson.GetBytes(a.GetInternalContext(), "transient_payload"); tp.Exists() {
+				a.TransientPayload = json.RawMessage(tp.Raw)
+			}
+		}
 		a.IdentitySchema = cntnr.IdentitySchema
 		if ff, err := s.ProcessLogin(ctx, w, r, a, et, claims, provider, cntnr); err != nil {
 			if errors.Is(err, flow.ErrCompletedByStrategy) {
@@ -553,6 +561,14 @@ func (s *Strategy) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	case *registration.Flow:
 		a.Active = s.ID()
 		a.TransientPayload = cntnr.TransientPayload
+		// For API/native flows, the continuity cookie is not available so
+		// cntnr.TransientPayload is empty. Fall back to the value persisted
+		// in InternalContext during Register().
+		if len(a.TransientPayload) == 0 {
+			if tp := gjson.GetBytes(a.GetInternalContext(), "transient_payload"); tp.Exists() {
+				a.TransientPayload = json.RawMessage(tp.Raw)
+			}
+		}
 		a.IdentitySchema = cntnr.IdentitySchema
 		if ff, err := s.processRegistration(ctx, w, r, a, et, claims, provider, cntnr); errors.Is(err, flow.ErrCompletedByStrategy) {
 			return
@@ -918,8 +934,8 @@ func getAuthRedirectURL(ctx context.Context, provider Provider, req ider, state 
 		if err != nil {
 			return "", err
 		}
-		opts = append(opts, UpstreamParameters(upstreamParameters)...)
 		opts = append(opts, p.AuthCodeURLOptions(req)...)
+		opts = append(opts, UpstreamParameters(upstreamParameters)...)
 
 		return c.AuthCodeURL(state, opts...), nil
 	case OAuth1Provider:

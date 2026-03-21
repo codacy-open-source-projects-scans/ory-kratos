@@ -145,10 +145,6 @@ func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, 
 	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.oidc.Strategy.PopulateSettingsMethod")
 	defer otelx.End(span, &err)
 
-	if sr.Type != flow.TypeBrowser {
-		return nil
-	}
-
 	conf, err := s.Config(ctx)
 	if err != nil {
 		return err
@@ -237,6 +233,7 @@ type updateSettingsFlowWithOidcMethod struct {
 	// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
 	// - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
 	// - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
+	// - `acr_values` (string): The `acr_values` specifies the Authentication Context Class Reference values for the authorization request.
 	//
 	// required: false
 	UpstreamParameters json.RawMessage `json:"upstream_parameters"`
@@ -517,7 +514,8 @@ func (s *Strategy) unlinkProvider(ctx context.Context, w http.ResponseWriter, r 
 }
 
 func (s *Strategy) handleSettingsError(ctx context.Context, w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithOidcMethod, err error) error {
-	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) {
+	// Do not pause flow if the flow type is an API flow as we can't save cookies in those flows.
+	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) && ctxUpdate.Flow != nil && ctxUpdate.Flow.Type == flow.TypeBrowser {
 		if err := s.d.ContinuityManager().Pause(ctx, w, r,
 			settings.ContinuityKey(s.SettingsStrategyID()), settings.ContinuityOptions(p, ctxUpdate.Session.Identity)...); err != nil {
 			return err
