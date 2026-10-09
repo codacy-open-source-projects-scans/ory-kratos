@@ -192,6 +192,10 @@ func (s *Strategy) addIdentifierNode(r *http.Request, sr *login.Flow) error {
 	}
 
 	sr.UI.SetNode(node.NewInputField("identifier", "", node.DefaultGroup, node.InputAttributeTypeText, node.WithRequiredInputAttribute).WithMetaLabel(identifierLabel))
+	// node.WithInputAttributes(func(a *node.InputAttributes) { // TODO: https://github.com/ory-corp/cloud/issues/12416
+	// 	// Hint password managers to autofill the saved username for this site.
+	// 	a.Autocomplete = node.InputAttributeAutocompleteUsername
+	// })).WithMetaLabel(identifierLabel))
 	return nil
 }
 

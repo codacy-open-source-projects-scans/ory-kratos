@@ -19,19 +19,24 @@ import (
 // checks if the DeviceAuthnKey type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &DeviceAuthnKey{}
 
-// DeviceAuthnKey struct for DeviceAuthnKey
+// DeviceAuthnKey Represents a hardware-backed signing key enrolled from a mobile device. The private key resides inside the device and never exists on the server.  To list the identity's enrolled keys, fetch a settings flow: each key's remove button (a `ui.nodes` entry named `deviceauthn_remove` in group `deviceauthn`) carries the key, with its PIN state redacted, in the node label's `context`.
 type DeviceAuthnKey struct {
-	// ClientKeyID is a client-chosen id for the key and is unique per identity.
+	Attestation *DeviceAuthnAttestation `json:"attestation,omitempty"`
+	// The key's stable id, unique per identity. Submit it as the `client_key_id` when logging in with the key, deleting it, or rotating its pin_secret.  The device can also compute the id without reading it back from the server: it is the lowercase-hex SHA-256 of `public_key` (the key's PKIX, ASN.1 DER encoding). Keys enrolled before the server derived the id keep their original client-chosen value, so prefer reading this field over recomputing it for older keys.
 	ClientKeyId *string `json:"client_key_id,omitempty"`
-	// CreatedAt is the timestamp of when the key was created. Only used for troubleshooting/UI.
+	// When the key was enrolled. Only used for troubleshooting and UI.
 	CreatedAt *time.Time `json:"created_at,omitempty"`
-	// DeviceName is a human readable name for the device, helping the user to distinguish it from others.
-	DeviceName *string `json:"device_name,omitempty"`
-	DeviceType *string `json:"device_type,omitempty"`
-	// PublicKey is an EC (in v1) public key, used to verify signatures, stored as uncompressed bytes. The private key resides inside the device and does not exist on the server.
-	PublicKey []int32 `json:"public_key,omitempty"`
-	State     *string `json:"state,omitempty"`
-	// v1 uses SHA256 + EC256. v2 (in the future) may use ML-DSA which is post-quantum resistant. This requires Android/iOS support so we have to wait. We intentionally avoid storing the cryptographic algorithm here a la JWT/TLS to avoid security issues and algorithm negotiation.
+	// A human-readable name for the device, helping the user tell this key apart from others.
+	DeviceName *string     `json:"device_name,omitempty"`
+	DeviceType *DeviceType `json:"device_type,omitempty"`
+	Pin        *PINConfig  `json:"pin,omitempty"`
+	// The device's public key (an elliptic-curve key on P-224, P-256, P-384, or P-521 in version 1) in PKIX, ASN.1 DER (SubjectPublicKeyInfo) form, base64-encoded. Signatures are verified against this key.
+	PublicKey *string `json:"public_key,omitempty"`
+	// Set only when the key's attestation chain was accepted under relaxed rules (software roots, expired certificates, software security level) rather than strict hardware attestation. Such keys are refused at login after this time, or immediately once relaxed attestation is turned off. Absent for hardware-attested keys that pass strict validation.
+	RelaxedAttestationExpiresAt *time.Time        `json:"relaxed_attestation_expires_at,omitempty"`
+	State                       *KeyState         `json:"state,omitempty"`
+	UserVerification            *UserVerification `json:"user_verification,omitempty"`
+	// The cryptography version of the key. Version 1 uses ECDSA with SHA-256 on an elliptic curve (P-224, P-256, P-384, or P-521); further versions are reserved for future signature suites.
 	Version              *int64 `json:"version,omitempty"`
 	AdditionalProperties map[string]interface{}
 }
@@ -53,6 +58,38 @@ func NewDeviceAuthnKey() *DeviceAuthnKey {
 func NewDeviceAuthnKeyWithDefaults() *DeviceAuthnKey {
 	this := DeviceAuthnKey{}
 	return &this
+}
+
+// GetAttestation returns the Attestation field value if set, zero value otherwise.
+func (o *DeviceAuthnKey) GetAttestation() DeviceAuthnAttestation {
+	if o == nil || IsNil(o.Attestation) {
+		var ret DeviceAuthnAttestation
+		return ret
+	}
+	return *o.Attestation
+}
+
+// GetAttestationOk returns a tuple with the Attestation field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *DeviceAuthnKey) GetAttestationOk() (*DeviceAuthnAttestation, bool) {
+	if o == nil || IsNil(o.Attestation) {
+		return nil, false
+	}
+	return o.Attestation, true
+}
+
+// HasAttestation returns a boolean if a field has been set.
+func (o *DeviceAuthnKey) HasAttestation() bool {
+	if o != nil && !IsNil(o.Attestation) {
+		return true
+	}
+
+	return false
+}
+
+// SetAttestation gets a reference to the given DeviceAuthnAttestation and assigns it to the Attestation field.
+func (o *DeviceAuthnKey) SetAttestation(v DeviceAuthnAttestation) {
+	o.Attestation = &v
 }
 
 // GetClientKeyId returns the ClientKeyId field value if set, zero value otherwise.
@@ -152,9 +189,9 @@ func (o *DeviceAuthnKey) SetDeviceName(v string) {
 }
 
 // GetDeviceType returns the DeviceType field value if set, zero value otherwise.
-func (o *DeviceAuthnKey) GetDeviceType() string {
+func (o *DeviceAuthnKey) GetDeviceType() DeviceType {
 	if o == nil || IsNil(o.DeviceType) {
-		var ret string
+		var ret DeviceType
 		return ret
 	}
 	return *o.DeviceType
@@ -162,7 +199,7 @@ func (o *DeviceAuthnKey) GetDeviceType() string {
 
 // GetDeviceTypeOk returns a tuple with the DeviceType field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *DeviceAuthnKey) GetDeviceTypeOk() (*string, bool) {
+func (o *DeviceAuthnKey) GetDeviceTypeOk() (*DeviceType, bool) {
 	if o == nil || IsNil(o.DeviceType) {
 		return nil, false
 	}
@@ -178,23 +215,55 @@ func (o *DeviceAuthnKey) HasDeviceType() bool {
 	return false
 }
 
-// SetDeviceType gets a reference to the given string and assigns it to the DeviceType field.
-func (o *DeviceAuthnKey) SetDeviceType(v string) {
+// SetDeviceType gets a reference to the given DeviceType and assigns it to the DeviceType field.
+func (o *DeviceAuthnKey) SetDeviceType(v DeviceType) {
 	o.DeviceType = &v
 }
 
-// GetPublicKey returns the PublicKey field value if set, zero value otherwise.
-func (o *DeviceAuthnKey) GetPublicKey() []int32 {
-	if o == nil || IsNil(o.PublicKey) {
-		var ret []int32
+// GetPin returns the Pin field value if set, zero value otherwise.
+func (o *DeviceAuthnKey) GetPin() PINConfig {
+	if o == nil || IsNil(o.Pin) {
+		var ret PINConfig
 		return ret
 	}
-	return o.PublicKey
+	return *o.Pin
+}
+
+// GetPinOk returns a tuple with the Pin field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *DeviceAuthnKey) GetPinOk() (*PINConfig, bool) {
+	if o == nil || IsNil(o.Pin) {
+		return nil, false
+	}
+	return o.Pin, true
+}
+
+// HasPin returns a boolean if a field has been set.
+func (o *DeviceAuthnKey) HasPin() bool {
+	if o != nil && !IsNil(o.Pin) {
+		return true
+	}
+
+	return false
+}
+
+// SetPin gets a reference to the given PINConfig and assigns it to the Pin field.
+func (o *DeviceAuthnKey) SetPin(v PINConfig) {
+	o.Pin = &v
+}
+
+// GetPublicKey returns the PublicKey field value if set, zero value otherwise.
+func (o *DeviceAuthnKey) GetPublicKey() string {
+	if o == nil || IsNil(o.PublicKey) {
+		var ret string
+		return ret
+	}
+	return *o.PublicKey
 }
 
 // GetPublicKeyOk returns a tuple with the PublicKey field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *DeviceAuthnKey) GetPublicKeyOk() ([]int32, bool) {
+func (o *DeviceAuthnKey) GetPublicKeyOk() (*string, bool) {
 	if o == nil || IsNil(o.PublicKey) {
 		return nil, false
 	}
@@ -210,15 +279,47 @@ func (o *DeviceAuthnKey) HasPublicKey() bool {
 	return false
 }
 
-// SetPublicKey gets a reference to the given []int32 and assigns it to the PublicKey field.
-func (o *DeviceAuthnKey) SetPublicKey(v []int32) {
-	o.PublicKey = v
+// SetPublicKey gets a reference to the given string and assigns it to the PublicKey field.
+func (o *DeviceAuthnKey) SetPublicKey(v string) {
+	o.PublicKey = &v
+}
+
+// GetRelaxedAttestationExpiresAt returns the RelaxedAttestationExpiresAt field value if set, zero value otherwise.
+func (o *DeviceAuthnKey) GetRelaxedAttestationExpiresAt() time.Time {
+	if o == nil || IsNil(o.RelaxedAttestationExpiresAt) {
+		var ret time.Time
+		return ret
+	}
+	return *o.RelaxedAttestationExpiresAt
+}
+
+// GetRelaxedAttestationExpiresAtOk returns a tuple with the RelaxedAttestationExpiresAt field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *DeviceAuthnKey) GetRelaxedAttestationExpiresAtOk() (*time.Time, bool) {
+	if o == nil || IsNil(o.RelaxedAttestationExpiresAt) {
+		return nil, false
+	}
+	return o.RelaxedAttestationExpiresAt, true
+}
+
+// HasRelaxedAttestationExpiresAt returns a boolean if a field has been set.
+func (o *DeviceAuthnKey) HasRelaxedAttestationExpiresAt() bool {
+	if o != nil && !IsNil(o.RelaxedAttestationExpiresAt) {
+		return true
+	}
+
+	return false
+}
+
+// SetRelaxedAttestationExpiresAt gets a reference to the given time.Time and assigns it to the RelaxedAttestationExpiresAt field.
+func (o *DeviceAuthnKey) SetRelaxedAttestationExpiresAt(v time.Time) {
+	o.RelaxedAttestationExpiresAt = &v
 }
 
 // GetState returns the State field value if set, zero value otherwise.
-func (o *DeviceAuthnKey) GetState() string {
+func (o *DeviceAuthnKey) GetState() KeyState {
 	if o == nil || IsNil(o.State) {
-		var ret string
+		var ret KeyState
 		return ret
 	}
 	return *o.State
@@ -226,7 +327,7 @@ func (o *DeviceAuthnKey) GetState() string {
 
 // GetStateOk returns a tuple with the State field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *DeviceAuthnKey) GetStateOk() (*string, bool) {
+func (o *DeviceAuthnKey) GetStateOk() (*KeyState, bool) {
 	if o == nil || IsNil(o.State) {
 		return nil, false
 	}
@@ -242,9 +343,41 @@ func (o *DeviceAuthnKey) HasState() bool {
 	return false
 }
 
-// SetState gets a reference to the given string and assigns it to the State field.
-func (o *DeviceAuthnKey) SetState(v string) {
+// SetState gets a reference to the given KeyState and assigns it to the State field.
+func (o *DeviceAuthnKey) SetState(v KeyState) {
 	o.State = &v
+}
+
+// GetUserVerification returns the UserVerification field value if set, zero value otherwise.
+func (o *DeviceAuthnKey) GetUserVerification() UserVerification {
+	if o == nil || IsNil(o.UserVerification) {
+		var ret UserVerification
+		return ret
+	}
+	return *o.UserVerification
+}
+
+// GetUserVerificationOk returns a tuple with the UserVerification field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *DeviceAuthnKey) GetUserVerificationOk() (*UserVerification, bool) {
+	if o == nil || IsNil(o.UserVerification) {
+		return nil, false
+	}
+	return o.UserVerification, true
+}
+
+// HasUserVerification returns a boolean if a field has been set.
+func (o *DeviceAuthnKey) HasUserVerification() bool {
+	if o != nil && !IsNil(o.UserVerification) {
+		return true
+	}
+
+	return false
+}
+
+// SetUserVerification gets a reference to the given UserVerification and assigns it to the UserVerification field.
+func (o *DeviceAuthnKey) SetUserVerification(v UserVerification) {
+	o.UserVerification = &v
 }
 
 // GetVersion returns the Version field value if set, zero value otherwise.
@@ -289,6 +422,9 @@ func (o DeviceAuthnKey) MarshalJSON() ([]byte, error) {
 
 func (o DeviceAuthnKey) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
+	if !IsNil(o.Attestation) {
+		toSerialize["attestation"] = o.Attestation
+	}
 	if !IsNil(o.ClientKeyId) {
 		toSerialize["client_key_id"] = o.ClientKeyId
 	}
@@ -301,11 +437,20 @@ func (o DeviceAuthnKey) ToMap() (map[string]interface{}, error) {
 	if !IsNil(o.DeviceType) {
 		toSerialize["device_type"] = o.DeviceType
 	}
+	if !IsNil(o.Pin) {
+		toSerialize["pin"] = o.Pin
+	}
 	if !IsNil(o.PublicKey) {
 		toSerialize["public_key"] = o.PublicKey
 	}
+	if !IsNil(o.RelaxedAttestationExpiresAt) {
+		toSerialize["relaxed_attestation_expires_at"] = o.RelaxedAttestationExpiresAt
+	}
 	if !IsNil(o.State) {
 		toSerialize["state"] = o.State
+	}
+	if !IsNil(o.UserVerification) {
+		toSerialize["user_verification"] = o.UserVerification
 	}
 	if !IsNil(o.Version) {
 		toSerialize["version"] = o.Version
@@ -332,12 +477,16 @@ func (o *DeviceAuthnKey) UnmarshalJSON(data []byte) (err error) {
 	additionalProperties := make(map[string]interface{})
 
 	if err = json.Unmarshal(data, &additionalProperties); err == nil {
+		delete(additionalProperties, "attestation")
 		delete(additionalProperties, "client_key_id")
 		delete(additionalProperties, "created_at")
 		delete(additionalProperties, "device_name")
 		delete(additionalProperties, "device_type")
+		delete(additionalProperties, "pin")
 		delete(additionalProperties, "public_key")
+		delete(additionalProperties, "relaxed_attestation_expires_at")
 		delete(additionalProperties, "state")
+		delete(additionalProperties, "user_verification")
 		delete(additionalProperties, "version")
 		o.AdditionalProperties = additionalProperties
 	}

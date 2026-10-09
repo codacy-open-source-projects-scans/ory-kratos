@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/pkg"
@@ -38,8 +39,8 @@ func TestSettingsExecutor(t *testing.T) {
 			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
 			conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToServer.URL)
 
-			reg.WithHooks(map[string]func(config.SelfServiceHook) interface{}{
-				"err": func(c config.SelfServiceHook) interface{} {
+			reg.WithHooks(map[string]driver.NewHookFn{
+				"err": func(c config.SelfServiceHook, _ driver.Registry) interface{} {
 					return &hook.Error{Config: c.Config}
 				},
 			})
@@ -54,7 +55,7 @@ func TestSettingsExecutor(t *testing.T) {
 					}
 					sess, _ := testhelpers.NewActiveSession(r, reg, i, time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
 
-					f, err := settings.NewFlow(conf, time.Minute, r, sess.Identity, ft)
+					f, err := settings.NewFlow(reg, r, sess.Identity, ft)
 					require.NoError(t, err)
 					if handleErr(t, w, r, reg.SettingsHookExecutor().PreSettingsHook(r.Context(), w, r, f, sess)) {
 						_, _ = w.Write([]byte("ok"))
@@ -67,7 +68,7 @@ func TestSettingsExecutor(t *testing.T) {
 					}
 					sess, _ := testhelpers.NewActiveSession(r, reg, i, time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
 
-					a, err := settings.NewFlow(conf, time.Minute, r, sess.Identity, ft)
+					a, err := settings.NewFlow(reg, r, sess.Identity, ft)
 					require.NoError(t, err)
 					a.RequestURL = x.RequestURL(r).String()
 					require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(r.Context(), a))

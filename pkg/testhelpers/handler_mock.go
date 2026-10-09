@@ -73,9 +73,9 @@ func MockMakeAuthenticatedRequestWithClient(t *testing.T, reg mockDeps, conf *co
 func MockMakeAuthenticatedRequestWithClientAndID(t *testing.T, reg mockDeps, conf *config.Config, router *httprouterx.RouterPublic, req *http.Request, client *http.Client, id *identity.Identity) ([]byte, *http.Response) {
 	set := "/" + uuid.Must(uuid.NewV4()).String() + "/set"
 	if id == nil {
-		router.Handler("GET", set, MockSetSession(t, reg, conf))
+		router.GET(set, MockSetSession(t, reg, conf))
 	} else {
-		router.Handler("GET", set, MockSetSessionWithIdentity(t, reg, conf, id))
+		router.GET(set, MockSetSessionWithIdentity(t, reg, conf, id))
 	}
 
 	MockHydrateCookieClient(t, client, "http://"+req.URL.Host+set+"?"+req.URL.Query().Encode())
@@ -91,17 +91,40 @@ func MockMakeAuthenticatedRequestWithClientAndID(t *testing.T, reg mockDeps, con
 	return body, res
 }
 
+// NewTestTransport returns a transport dedicated to a single test client.
+//
+// Test helpers spin up short-lived httptest.Server instances and close them
+// when the helper returns. httptest.Server.Close unconditionally calls
+// http.DefaultTransport.CloseIdleConnections as a courtesy for users of the
+// default transport. When many parallel subtests share http.DefaultTransport
+// (the zero value of http.Client.Transport), one subtest closing its server
+// tears down idle connections that another subtest's in-flight request is
+// using, surfacing as "http: CloseIdleConnections called". Giving every test
+// client its own transport means that courtesy close only ever affects the
+// unused global transport, never a live test client.
+func NewTestTransport(t testing.TB) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	t.Cleanup(transport.CloseIdleConnections)
+	return transport
+}
+
+// NewTestClient returns a jar-less client with a dedicated transport, see NewTestTransport.
+func NewTestClient(t testing.TB) *http.Client {
+	return &http.Client{Transport: NewTestTransport(t)}
+}
+
 func NewClientWithCookies(t *testing.T) *http.Client {
 	cj, err := cookiejar.New(&cookiejar.Options{})
 	require.NoError(t, err)
-	return &http.Client{Jar: cj}
+	return &http.Client{Jar: cj, Transport: NewTestTransport(t)}
 }
 
 func NewNoRedirectClientWithCookies(t *testing.T) *http.Client {
 	cj, err := cookiejar.New(&cookiejar.Options{})
 	require.NoError(t, err)
 	return &http.Client{
-		Jar: cj,
+		Jar:       cj,
+		Transport: NewTestTransport(t),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

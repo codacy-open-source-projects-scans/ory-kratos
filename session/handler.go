@@ -5,6 +5,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 	"github.com/ory/herodot"
 
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/x"
 )
 
@@ -78,6 +80,18 @@ const (
 	AdminRouteIdentity           = "/identities"
 	AdminRouteIdentitiesSessions = AdminRouteIdentity + "/{id}/sessions"
 	AdminRouteSessionExtendId    = RouteSession + "/extend"
+
+	// ManageSessionsMaxIDs caps the number of explicit IDs accepted per call.
+	// Picked defensively — not validated against a production dataset.
+	// Tied to MaxManageSessionsBodySize in cloudlib/ratelimit/inflight: 500 UUIDs
+	// serialise to ~20 KiB, so 32 KiB has ~40% headroom. Raise both together.
+	ManageSessionsMaxIDs = 500
+
+	// manageSessionsWildcardBatchSize is the per-statement chunk size for the
+	// wildcard ("*") variants. One HTTP call processes at most this many rows;
+	// the caller drains larger networks by re-issuing the request while the
+	// response reports `more: true`.
+	manageSessionsWildcardBatchSize = 5000
 )
 
 func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
@@ -88,6 +102,7 @@ func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 	admin.GET(AdminRouteIdentitiesSessions, h.listIdentitySessions)
 	admin.DELETE(AdminRouteIdentitiesSessions, h.deleteIdentitySessions)
 	admin.PATCH(AdminRouteSessionExtendId, h.adminSessionExtend)
+	admin.POST(RouteCollection, h.manageSessions)
 
 	admin.DELETE(RouteCollection, redir.RedirectToPublicRoute(h.r))
 }
@@ -102,7 +117,7 @@ func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.r.CSRFHandler().IgnoreGlob(AdminRouteIdentity + "/*/sessions")
 
 	for _, m := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodConnect, http.MethodOptions, http.MethodTrace} {
-		public.Handler(m, RouteWhoami, http.HandlerFunc(h.whoami))
+		public.Handle(m+" "+RouteWhoami, http.HandlerFunc(h.whoami))
 	}
 
 	public.DELETE(RouteCollection, h.deleteMySessions)
@@ -224,7 +239,10 @@ func (h *Handler) whoami(w http.ResponseWriter, r *http.Request) {
 	ctx, span := h.r.Tracer(r.Context()).Tracer().Start(r.Context(), "sessions.Handler.whoami")
 	defer span.End()
 
-	s, err := h.r.SessionManager().FetchFromRequest(ctx, r)
+	// Whoami strips the credentials from the response below (CopyWithoutCredentials), so there is
+	// no point in loading them from the database: it is by far the most expensive part of fetching
+	// a session.
+	s, err := h.r.SessionManager().FetchFromRequest(ctx, r, ExpandEverything, identity.ExpandEverythingButCredentials)
 	c := h.r.Config()
 	if err != nil {
 		// We cache errors (and set cache header only when configured) where no session was found.
@@ -706,7 +724,8 @@ type disableMyOtherSessions struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: kratos-public-low
 func (h *Handler) deleteMySessions(w http.ResponseWriter, r *http.Request) {
-	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
+	// Only session columns are read below, so skip loading the devices and the identity.
+	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r, ExpandNothing, identity.ExpandNothing)
 	if err != nil {
 		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized().WithWrap(err).WithReasonf("No valid session cookie found."))
@@ -775,7 +794,8 @@ func (h *Handler) deleteMySession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
+	// Only session columns are read below, so skip loading the devices and the identity.
+	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r, ExpandNothing, identity.ExpandNothing)
 	if err != nil {
 		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, herodot.ErrUnauthorized().WithWrap(err).WithReasonf("No valid session cookie found."))
@@ -792,7 +812,7 @@ func (h *Handler) deleteMySession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.r.SessionPersister().RevokeSession(r.Context(), s.Identity.ID, sessionID); err != nil {
+	if err := h.r.SessionPersister().RevokeSession(r.Context(), s.IdentityID, sessionID); err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
@@ -855,7 +875,9 @@ type listMySessionsResponse struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: kratos-public-medium
 func (h *Handler) listMySessions(w http.ResponseWriter, r *http.Request) {
-	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r)
+	// Only session columns are read below; DoesSessionSatisfy loads the identity lazily when the
+	// AAL check needs it.
+	s, err := h.r.SessionManager().FetchFromRequest(r.Context(), r, ExpandNothing, identity.ExpandNothing)
 	if err != nil {
 		h.r.Logger().WithRequest(r).WithError(err).Info("No valid session cookie found.")
 		h.r.Writer().WriteError(w, r, errors.WithStack(herodot.ErrUnauthorized().WithWrap(err).WithReasonf("No valid session cookie found.")))
@@ -895,7 +917,9 @@ const (
 func (h *Handler) IsAuthenticated(wrap http.HandlerFunc, onUnauthenticated http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		sess, err := h.r.SessionManager().FetchFromRequest(ctx, r)
+		// The session is stored in the request context for downstream handlers, which may read
+		// any of its associations - keep the full expansion.
+		sess, err := h.r.SessionManager().FetchFromRequest(ctx, r, ExpandEverything, identity.ExpandEverything)
 		if err != nil {
 			if onUnauthenticated != nil {
 				onUnauthenticated(w, r)
@@ -984,7 +1008,7 @@ func (h *Handler) adminSessionExtend(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) IsNotAuthenticated(wrap http.HandlerFunc, onAuthenticated http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := h.r.SessionManager().FetchFromRequest(r.Context(), r); err != nil {
+		if err := h.r.SessionManager().SessionActiveForRequest(r.Context(), r); err != nil {
 			if e := new(ErrNoActiveSessionFound); errors.As(err, &e) {
 				wrap(w, r)
 				return
@@ -1135,4 +1159,278 @@ func (h *Handler) exchangeCode(w http.ResponseWriter, r *http.Request) {
 		Token:   sess.Token,
 		Session: sess,
 	})
+}
+
+// ManageSessionsAction enumerates the supported actions for the manage-sessions
+// endpoint.
+//
+// swagger:enum ManageSessionsAction
+type ManageSessionsAction string
+
+const (
+	ManageSessionsActionDisable ManageSessionsAction = "disable"
+	ManageSessionsActionDelete  ManageSessionsAction = "delete"
+)
+
+// ManageSessionsAllToken is the explicit-consent value that callers must pass
+// in `identities` or `sessions` to operate on every row in the network. It
+// must be the only element of the array and may not be mixed with explicit
+// IDs.
+const ManageSessionsAllToken = "*"
+
+// Manage Sessions Body
+//
+// Body for the bulk session management endpoint. Exactly one of `identities`
+// or `sessions` must be provided. To operate on every session in the network,
+// pass `identities: ["*"]` — the wildcard must appear alone, never mixed with
+// explicit IDs.
+//
+// swagger:model manageSessionsBody
+type ManageSessionsBody struct {
+	// Action to perform on the matching sessions.
+	//
+	// required: true
+	// enum: disable,delete
+	Action ManageSessionsAction `json:"action"`
+
+	// Identity IDs whose sessions should be disabled or deleted, or `["*"]`
+	// to operate on every session in the network. Mutually exclusive with
+	// `sessions`.
+	Identities []string `json:"identities"`
+
+	// Session IDs to disable or delete. Mutually exclusive with `identities`.
+	// The wildcard `["*"]` is not accepted in this field — pass
+	// `identities: ["*"]` to scope the operation to every session in the
+	// network.
+	Sessions []string `json:"sessions"`
+}
+
+// swagger:parameters manageSessions
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type manageSessionsParameters struct {
+	// in: body
+	// required: true
+	Body ManageSessionsBody
+}
+
+// Manage Sessions Response
+//
+// Response body for the bulk session management endpoint. Reports how many
+// rows the call processed and, for the wildcard variant, whether the network
+// still has matching rows left. Explicit-IDs requests always return
+// `more: false`. Wildcard callers drain the network by re-issuing the same
+// request while `more` is `true`.
+//
+// swagger:model manageSessionsResponse
+type ManageSessionsResponse struct {
+	// Number of sessions processed in this call. For `disable`, counts only
+	// sessions that were active before the call (already-inactive sessions
+	// are skipped). For `delete`, counts every matching row removed.
+	Processed int `json:"processed"`
+
+	// True when the call reached the per-call batch limit and additional
+	// matching rows may remain. Always false for explicit-IDs requests.
+	More bool `json:"more"`
+}
+
+// swagger:route POST /admin/sessions identity manageSessions
+//
+// # Manage sessions in bulk
+//
+// Disable or delete sessions for a list of identities or a list of sessions in
+// a single call. The `action` field selects the operation:
+//
+//   - `disable` — deactivate matching sessions (sets `active = false`, preserves
+//     audit data).
+//   - `delete` — permanently delete matching sessions.
+//
+// Exactly one of `identities` or `sessions` must be provided. To scope the
+// operation to every session in the network, pass `identities: ["*"]`; the
+// wildcard is not accepted in the `sessions` field. Up to 500 explicit IDs
+// are accepted per call.
+//
+// All requests return `200 OK` with `{processed, more}`. `processed` reports
+// how many rows the call affected; for `disable` it counts only sessions
+// that were active before the call. `more` is `true` only when a wildcard
+// request reached the per-call batch limit and additional rows may remain;
+// callers drain the network by re-issuing the same request while `more` is
+// `true`. Explicit-IDs requests always return `more: false`.
+//
+//	Consumes:
+//	- application/json
+//
+//	Schemes: http, https
+//
+//	Security:
+//	  oryAccessToken:
+//
+//	Responses:
+//	  200: manageSessionsResponse
+//	  400: errorGeneric
+//	  401: errorGeneric
+//	  default: errorGeneric
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-admin-low
+func (h *Handler) manageSessions(w http.ResponseWriter, r *http.Request) {
+	var body ManageSessionsBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest().WithError(err.Error()).WithReason("Invalid JSON body."))
+		return
+	}
+
+	switch body.Action {
+	case ManageSessionsActionDisable, ManageSessionsActionDelete:
+	default:
+		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest().WithReasonf(
+			"The 'action' field must be one of '%s' or '%s'.",
+			ManageSessionsActionDisable, ManageSessionsActionDelete))
+		return
+	}
+
+	identitiesSet := len(body.Identities) > 0
+	sessionsSet := len(body.Sessions) > 0
+	if identitiesSet == sessionsSet {
+		h.r.Writer().WriteError(w, r, herodot.ErrBadRequest().WithReason(
+			"Exactly one of 'identities' or 'sessions' must be a non-empty array."))
+		return
+	}
+
+	var resp *ManageSessionsResponse
+	var err error
+	switch {
+	case identitiesSet:
+		resp, err = h.manageByIdentities(r.Context(), body.Action, body.Identities)
+	case sessionsSet:
+		resp, err = h.manageBySessions(r.Context(), body.Action, body.Sessions)
+	default:
+		err = errors.WithStack(herodot.ErrInternalServerError().WithReason(
+			"neither 'identities' nor 'sessions' set after validation"))
+	}
+	if err != nil {
+		h.r.Writer().WriteError(w, r, err)
+		return
+	}
+	h.r.Writer().Write(w, r, resp)
+}
+
+// manageByIdentities applies the requested action to all sessions belonging
+// to the given identity IDs, or to a single bounded batch of every session in
+// the network when raw is ["*"]. `more` is set only on the wildcard variant
+// when the call hit the per-call batch limit; explicit-IDs always return
+// `more: false`.
+func (h *Handler) manageByIdentities(ctx context.Context, action ManageSessionsAction, raw []string) (*ManageSessionsResponse, error) {
+	ids, wildcard, err := parseManageSessionsIDsOrWildcard(raw)
+	if err != nil {
+		return nil, herodot.ErrBadRequest().WithReasonf("Could not parse 'identities' field: %s", err)
+	}
+
+	p := h.r.SessionPersister()
+	switch action {
+	case ManageSessionsActionDisable:
+		if wildcard {
+			return wildcardBatch(ctx, p.RevokeAllSessions)
+		}
+		n, err := p.RevokeSessionsByIdentities(ctx, ids)
+		return explicitBatch(n), err
+	case ManageSessionsActionDelete:
+		if wildcard {
+			return wildcardBatch(ctx, p.DeleteAllSessions)
+		}
+		n, err := p.DeleteSessionsByIdentities(ctx, ids)
+		return explicitBatch(n), err
+	default:
+		return nil, errors.WithStack(herodot.ErrInternalServerError().WithReasonf(
+			"unhandled session action %q", action))
+	}
+}
+
+// manageBySessions applies the requested action to the given explicit session
+// IDs. The wildcard ["*"] is not supported in this field; callers that need
+// network-wide scope must use `identities: ["*"]`. See manageByIdentities for
+// the response-shape contract.
+func (h *Handler) manageBySessions(ctx context.Context, action ManageSessionsAction, raw []string) (*ManageSessionsResponse, error) {
+	ids, err := parseManageSessionsIDs(raw)
+	if err != nil {
+		return nil, herodot.ErrBadRequest().WithReasonf("Could not parse 'sessions' field: %s", err)
+	}
+	p := h.r.SessionPersister()
+	switch action {
+	case ManageSessionsActionDisable:
+		n, err := p.RevokeSessionsByIDs(ctx, ids)
+		return explicitBatch(n), err
+	case ManageSessionsActionDelete:
+		n, err := p.DeleteSessionsByIDs(ctx, ids)
+		return explicitBatch(n), err
+	default:
+		return nil, errors.WithStack(herodot.ErrInternalServerError().WithReasonf(
+			"unhandled session action %q", action))
+	}
+}
+
+// parseManageSessionsIDsOrWildcard recognizes the network-wide wildcard form
+// ["*"] and otherwise delegates to parseManageSessionsIDs. Use it in fields
+// that accept the wildcard (currently `identities`); fields that do not
+// accept wildcard should call parseManageSessionsIDs directly so the token is
+// rejected.
+func parseManageSessionsIDsOrWildcard(raw []string) (ids []uuid.UUID, wildcard bool, err error) {
+	if len(raw) == 1 && raw[0] == ManageSessionsAllToken {
+		return nil, true, nil
+	}
+	ids, err = parseManageSessionsIDs(raw)
+	return ids, false, err
+}
+
+// parseManageSessionsIDs interprets a manage-sessions filter array as a list
+// of explicit UUIDs and rejects any input containing the wildcard token.
+// Callers that accept the wildcard must use parseManageSessionsIDsOrWildcard.
+func parseManageSessionsIDs(raw []string) ([]uuid.UUID, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("array must not be empty")
+	}
+	if len(raw) > ManageSessionsMaxIDs {
+		return nil, fmt.Errorf("at most %d IDs may be provided per call", ManageSessionsMaxIDs)
+	}
+	ids := make([]uuid.UUID, 0, len(raw))
+	for _, s := range raw {
+		if s == ManageSessionsAllToken {
+			return nil, errors.New("the wildcard '*' is not accepted here")
+		}
+		id, err := uuid.FromString(s)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse %q as UUID: %w", s, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// wildcardBatch runs a single chunked bulk-session operation and packages the
+// row count plus a `more` flag for the response. `more` is true when the call
+// reached the per-call batch limit, signaling that the caller should re-issue
+// the request to drain the rest.
+//
+// When the row count is an exact multiple of the batch size, `more` is set
+// even though no rows are left; the caller will issue one extra request that
+// returns `{processed: 0, more: false}`. This is intentional — distinguishing
+// "exactly batch-size" from "batch-size and more" would cost an extra DB
+// query on every call to save one round-trip in a rare edge case.
+func wildcardBatch(ctx context.Context, op func(context.Context, int) (int, error)) (*ManageSessionsResponse, error) {
+	n, err := op(ctx, manageSessionsWildcardBatchSize)
+	if err != nil {
+		return nil, err
+	}
+	return &ManageSessionsResponse{
+		Processed: n,
+		More:      n == manageSessionsWildcardBatchSize,
+	}, nil
+}
+
+// explicitBatch packages the row count from an explicit-IDs bulk call.
+// `more` is always false because explicit-IDs requests are bounded by
+// ManageSessionsMaxIDs and complete in a single statement.
+func explicitBatch(n int) *ManageSessionsResponse {
+	return &ManageSessionsResponse{Processed: n, More: false}
 }

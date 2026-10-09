@@ -71,7 +71,7 @@ type createRecoveryCodeForIdentityBody struct {
 	// `selfservice.methods.code.config.lifespan`.
 	//
 	//
-	// pattern: ^([0-9]+(ns|us|ms|s|m|h))*$
+	// pattern: ^([0-9]+([.][0-9]+)?(ns|us|µs|ms|s|m|h))+$
 	// example:
 	//	- 1h
 	//	- 1m
@@ -157,7 +157,7 @@ func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.
 		expiresIn, err = time.ParseDuration(p.ExpiresIn)
 		if err != nil {
 			s.deps.Writer().WriteError(w, r, errors.WithStack(herodot.ErrBadRequest().
-				WithReasonf(`Unable to parse "expires_in" whose format should match "[0-9]+(ns|us|ms|s|m|h)" but did not: %s`, p.ExpiresIn)))
+				WithReasonf(`Unable to parse "expires_in" as a duration string (e.g. "1h", "1m30s", "500ms"): %s`, p.ExpiresIn)))
 			return
 		}
 	}
@@ -176,7 +176,7 @@ func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.
 		return
 	}
 
-	recoveryFlow, err := recovery.NewFlow(config, expiresIn, s.deps.GenerateCSRFToken(r), r, recovery.Strategies{s}, flowType)
+	recoveryFlow, err := recovery.NewFlow(s.deps, expiresIn, s.deps.GenerateCSRFToken(r), r, recovery.Strategies{s}, flowType)
 	if err != nil {
 		s.deps.Writer().WriteError(w, r, err)
 		return
@@ -187,6 +187,7 @@ func (s *Strategy) createRecoveryCodeForIdentity(w http.ResponseWriter, r *http.
 	recoveryFlow.UI.Nodes.Append(node.NewInputField("code", nil, node.CodeGroup, node.InputAttributeTypeText, node.WithRequiredInputAttribute, node.WithInputAttributes(func(a *node.InputAttributes) {
 		a.Pattern = "[0-9]+"
 		a.MaxLength = CodeLength
+		a.Autocomplete = node.InputAttributeAutocompleteOneTimeCode
 	})).
 		WithMetaLabel(text.NewInfoNodeLabelRecoveryCode()),
 	)

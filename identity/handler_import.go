@@ -150,6 +150,28 @@ func (h *Handler) importPasskeyCredentials(_ context.Context, i *Identity, newCr
 		identifiers = append(identifiers, string(userHandle))
 	}
 
+	// The passkey login flow looks the credential up by joining
+	// identity_credential_identifiers on the userHandle returned by the
+	// authenticator during the WebAuthn assertion (see
+	// selfservice/strategy/passkey/passkey_login.go). The userHandle is
+	// generated at registration time and bound to the physical authenticator,
+	// so the server cannot reconstruct or default it: an import has to
+	// supply it, or inherit it from a previously persisted passkey
+	// credential. Without a userHandle the credential row would be
+	// non-functional — no assertion can ever resolve to it. Reject the
+	// import early instead of silently storing a broken credential. See
+	// https://github.com/ory/kratos/issues/4561.
+	if len(userHandle) == 0 {
+		return errors.WithStack(herodot.ErrBadRequest().WithReasonf(
+			"Passkey credential import requires a non-empty user_handle. " +
+				"It must match the WebAuthn user handle stored on the authenticator."))
+	}
+
+	if len(resultCredentials) == 0 {
+		return errors.WithStack(herodot.ErrBadRequest().WithReasonf(
+			"Passkey credential import requires at least one entry in credentials.passkey.config.credentials."))
+	}
+
 	return i.SetCredentialsWithConfig(
 		CredentialsTypePasskey,
 		Credentials{
@@ -181,7 +203,17 @@ func (h *Handler) importLookupSecretCredentials(_ context.Context, i *Identity, 
 }
 
 func (h *Handler) importTOTPCredentials(_ context.Context, i *Identity, creds *AdminIdentityImportCredentialsTOTP) error {
-	return i.SetCredentialsWithConfig(CredentialsTypeTOTP, Credentials{}, CredentialsTOTPConfig{TOTPURL: creds.Config.TOTPURL})
+	// The TOTP login flow resolves the credential by joining
+	// identity_credential_identifiers, using the identity ID as the identifier
+	// (see selfservice/strategy/totp/login.go and settings.go). On imports of
+	// new identities the identity ID is not yet known here, so we leave
+	// Identifiers empty and let the persister default it from the persisted
+	// identity ID. See https://github.com/ory/kratos/issues/4561.
+	return i.SetCredentialsWithConfig(
+		CredentialsTypeTOTP,
+		Credentials{},
+		CredentialsTOTPConfig{TOTPURL: creds.Config.TOTPURL},
+	)
 }
 
 func (h *Handler) ImportPasswordCredentials(ctx context.Context, i *Identity, creds *AdminIdentityImportCredentialsPassword) (err error) {
@@ -203,7 +235,17 @@ func (h *Handler) ImportPasswordCredentials(ctx context.Context, i *Identity, cr
 	}
 
 	if !(hash.IsValidHashFormat(hashed)) {
-		return errors.WithStack(herodot.ErrBadRequest().WithReasonf("The imported password does not match any known hash format. For more information see https://www.ory.sh/dr/2"))
+		return errors.WithStack(herodot.ErrBadRequest().WithReason("The imported password does not match any known hash format."))
+	}
+
+	if err := hash.ValidateImportedHash(hashed); err != nil {
+		if errors.Is(err, hash.ErrHashParametersOutOfBounds) {
+			return errors.WithStack(herodot.ErrBadRequest().WithWrap(err).WithReason(
+				"The imported password hash declares cost parameters that exceed the bounds enforced by Ory. " +
+					"Re-hash the password with a more conservative configuration before importing."))
+		}
+		return errors.WithStack(herodot.ErrBadRequest().WithWrap(err).WithReason(
+			"The imported password hash could not be parsed."))
 	}
 
 	return i.SetCredentialsWithConfig(CredentialsTypePassword, Credentials{}, CredentialsPassword{HashedPassword: string(hashed)})

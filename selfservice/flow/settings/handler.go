@@ -7,7 +7,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/pkg/errors"
 
@@ -26,6 +25,7 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/logrusx"
@@ -41,6 +41,13 @@ const (
 
 	RouteSubmitFlow = "/self-service/settings"
 
+	// RouteWellKnownChangePassword implements the W3C "change password URL"
+	// well-known location. Browsers and password managers use it to deep-link
+	// users to the page where they can change their password.
+	//
+	// See https://w3c.github.io/webappsec-change-password-url/.
+	RouteWellKnownChangePassword = "/.well-known/change-password"
+
 	ContinuityPrefix = "ory_kratos_settings"
 )
 
@@ -50,6 +57,7 @@ func ContinuityKey(id string) string {
 
 type (
 	handlerDependencies interface {
+		clock.Provider
 		nosurfx.CSRFProvider
 		httpx.WriterProvider
 		logrusx.Provider
@@ -114,6 +122,33 @@ func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 
 	public.POST(RouteSubmitFlow, h.d.SessionHandler().IsAuthenticated(h.updateSettingsFlow, OnUnauthenticated(h.d)))
 	public.GET(RouteSubmitFlow, h.d.SessionHandler().IsAuthenticated(h.updateSettingsFlow, OnUnauthenticated(h.d)))
+
+	public.GET(RouteWellKnownChangePassword, h.redirectToChangePassword)
+}
+
+// swagger:route GET /.well-known/change-password frontend getWellKnownChangePassword
+//
+// # Change Password URL
+//
+// This endpoint implements the W3C "change password URL" well-known location by
+// redirecting the browser to the configured settings UI. Password managers follow
+// this redirect to take users straight to the page where they can change their
+// password.
+//
+//	Schemes: http, https
+//
+//	Responses:
+//	  303: emptyResponse
+//	  default: errorGeneric
+//
+//	Extensions:
+//	  x-ory-ratelimit-bucket: kratos-public-high
+func (h *Handler) redirectToChangePassword(w http.ResponseWriter, r *http.Request) {
+	to := h.d.Config().SelfServiceFlowSettingsUI(r.Context()).String()
+	if to == "" {
+		to = h.d.Config().SelfPublicURL(r.Context()).JoinPath(RouteInitBrowserFlow).String()
+	}
+	http.Redirect(w, r, to, http.StatusSeeOther)
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
@@ -130,7 +165,7 @@ func (h *Handler) NewFlow(ctx context.Context, w http.ResponseWriter, r *http.Re
 	ctx, span := h.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.flow.settings.Handler.NewFlow")
 	defer otelx.End(span, &err)
 
-	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowSettingsFlowLifespan(r.Context()), r, i, ft)
+	f, err := NewFlow(h.d, r, i, ft)
 	if err != nil {
 		return nil, err
 	}
@@ -139,8 +174,10 @@ func (h *Handler) NewFlow(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return nil, err
 	}
 
+	filters := PrepareOrganizations(r, f, i, h.d.Config().Organizations(ctx))
+
 	cookieStore := continuity.NewCookieReferenceStore(h.d.ContinuityCookieManager(ctx))
-	for _, strategy := range h.d.SettingsStrategies(ctx) {
+	for _, strategy := range h.d.SettingsStrategies(ctx, filters...) {
 		if err := h.d.ContinuityManager().Abort(ctx, w, r, ContinuityKey(strategy.SettingsStrategyID()), cookieStore); err != nil {
 			return nil, err
 		}
@@ -187,6 +224,13 @@ type createNativeSettingsFlow struct {
 	//
 	// in: header
 	SessionToken string `json:"X-Session-Token"`
+
+	// An optional organization ID that scopes the settings flow to providers of that organization.
+	// This parameter is only effective in the Ory Network.
+	//
+	// required: false
+	// in: query
+	Organization string `json:"organization"`
 }
 
 // swagger:route GET /self-service/settings/api frontend createNativeSettingsFlow
@@ -267,6 +311,13 @@ type createBrowserSettingsFlow struct {
 	// in: header
 	// name: Cookie
 	Cookies string `json:"Cookie"`
+
+	// An optional organization ID that scopes the settings flow to providers of that organization.
+	// This parameter is only effective in the Ory Network.
+	//
+	// required: false
+	// in: query
+	Organization string `json:"organization"`
 }
 
 // swagger:route GET /self-service/settings/browser frontend createBrowserSettingsFlow
@@ -445,7 +496,7 @@ func (h *Handler) getSettingsFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pr.ExpiresAt.Before(time.Now().UTC()) {
+	if pr.ExpiresAt.Before(h.d.Clock().Now().UTC()) {
 		if pr.Type == flow.TypeBrowser {
 			redirectURL := flow.GetFlowExpiredRedirectURL(ctx, h.d.Config(), RouteInitBrowserFlow, pr.ReturnTo)
 
@@ -615,7 +666,7 @@ func (h *Handler) updateSettingsFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := f.Valid(ss); err != nil {
+	if err := f.Valid(h.d.Clock(), ss); err != nil {
 		h.d.SettingsFlowErrorHandler().WriteFlowError(ctx, w, r, node.DefaultGroup, f, ss.Identity, ss, err)
 		return
 	}

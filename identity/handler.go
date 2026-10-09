@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/ory/x/sqlcon"
 
 	"github.com/ory/kratos/hash"
+	"github.com/ory/kratos/selfservice/strategy/deviceauthn"
 	"github.com/ory/kratos/x"
 
 	"github.com/ory/kratos/cipher"
@@ -37,6 +39,7 @@ import (
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/jsonx"
 	"github.com/ory/x/openapix"
+	"github.com/ory/x/region"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 
@@ -531,6 +534,13 @@ type CreateIdentityBody struct {
 	//
 	// required: false
 	ExternalID string `json:"external_id,omitempty"`
+
+	// Region is the Ory Network region this identity will be created in.
+	// Optional; defaults to the project home region if omitted. Only effective
+	// on the Ory Network.
+	//
+	// required: false
+	Region region.Region `json:"region,omitempty"`
 }
 
 // Create Identity and Import Credentials
@@ -793,6 +803,11 @@ func (h *Handler) identityFromCreateIdentityBody(ctx context.Context, cr *Create
 		state = cr.State
 	}
 
+	// Validate at the API boundary; the persister re-checks under home_region.
+	if cr.Region != "" && !cr.Region.Valid() {
+		return nil, region.NewErrInvalid()
+	}
+
 	i := &Identity{
 		SchemaID:            cr.SchemaID,
 		Traits:              []byte(cr.Traits),
@@ -804,6 +819,7 @@ func (h *Handler) identityFromCreateIdentityBody(ctx context.Context, cr *Create
 		MetadataPublic:      []byte(cr.MetadataPublic),
 		OrganizationID:      cr.OrganizationID,
 		ExternalID:          sqlxx.NullString(cr.ExternalID),
+		Region:              cr.Region,
 	}
 	// Lowercase all emails, because the schema extension will otherwise not find them.
 	for k := range i.VerifiableAddresses {
@@ -1001,6 +1017,12 @@ type UpdateIdentityBody struct {
 	//
 	// required: false
 	ExternalID string `json:"external_id,omitempty"`
+
+	// Region is the Ory Network region this identity is homed in. Optional;
+	// omit to leave the current region unchanged.
+	//
+	// required: false
+	Region region.Region `json:"region,omitempty"`
 }
 
 // swagger:route PUT /admin/identities/{id} identity updateIdentity
@@ -1077,6 +1099,16 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 	identity.MetadataPublic = []byte(ur.MetadataPublic)
 	identity.MetadataAdmin = []byte(ur.MetadataAdmin)
 	identity.ExternalID = sqlxx.NullString(ur.ExternalID)
+
+	// Empty preserves the current region; older clients that pre-date the
+	// field must not silently wipe it.
+	if ur.Region != "" {
+		if !ur.Region.Valid() {
+			h.r.Writer().WriteError(w, r, region.NewErrInvalid())
+			return
+		}
+		identity.Region = ur.Region
+	}
 
 	// Although this is PUT and not PATCH, if the Credentials are not supplied keep the old one
 	if ur.Credentials != nil {
@@ -1160,6 +1192,53 @@ type patchIdentity struct {
 	Body openapix.JSONPatchDocument
 }
 
+// patchOp is a minimal JSON Patch op used for /region pre-processing.
+type patchOp struct {
+	Op    string          `json:"op"`
+	Path  string          `json:"path"`
+	From  string          `json:"from,omitempty"`
+	Value json.RawMessage `json:"value,omitempty"`
+}
+
+// applyRegionPatchOps applies /region ops to ident.Region and returns the
+// patch with those ops removed. Only add/replace are accepted — remove and
+// other ops on /region return 400 (callers must always set a region
+// explicitly).
+func applyRegionPatchOps(body []byte, ident *Identity) ([]byte, error) {
+	var ops []patchOp
+	if err := json.Unmarshal(body, &ops); err != nil {
+		return nil, errors.WithStack(herodot.ErrBadRequest().
+			WithReason("failed to unmarshal JSON patch").
+			WithError(err.Error()).
+			WithWrap(err))
+	}
+	rest := make([]patchOp, 0, len(ops))
+	for _, op := range ops {
+		if op.Path != "/region" {
+			rest = append(rest, op)
+			continue
+		}
+		if op.Op != "add" && op.Op != "replace" {
+			return nil, errors.WithStack(herodot.ErrBadRequest().
+				WithReasonf("operation %q is not supported on /region", op.Op))
+		}
+		var v string
+		if err := json.Unmarshal(op.Value, &v); err != nil {
+			return nil, errors.WithStack(herodot.ErrBadRequest().
+				WithReason("failed to unmarshal").WithWrap(err))
+		}
+		r := region.Region(v)
+		if !r.Valid() {
+			return nil, region.NewErrInvalid()
+		}
+		ident.Region = r
+	}
+	if len(rest) == 0 {
+		return []byte("[]"), nil
+	}
+	return json.Marshal(rest)
+}
+
 // swagger:route PATCH /admin/identities/{id} identity patchIdentity
 //
 // # Patch an Identity
@@ -1195,24 +1274,51 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := x.ParseUUID(r.PathValue("id"))
-	identity, err := h.r.PrivilegedIdentityPool().GetIdentityConfidential(r.Context(), id)
+	ident, err := h.r.PrivilegedIdentityPool().GetIdentityConfidential(r.Context(), id)
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
 		return
 	}
 
-	oldState := identity.State
+	// Apply /region ops to ident.Region and strip them from the patch.
+	// ApplyJSONPatch can't handle them directly because the field is
+	// omitempty and a "remove" on an absent key would error.
+	filteredPatch, err := applyRegionPatchOps(requestBody, ident)
+	if err != nil {
+		h.r.Writer().WriteError(w, r, err)
+		return
+	}
 
-	patchedIdentity, err := jsonx.ApplyJSONPatch(requestBody, WithCredentialsAndAdminMetadataInJSON(*identity), "/id", "/stateChangedAt", "/credentials", "/credentials/oidc/**")
+	oldState := ident.State
+
+	patchedIdentity, err := jsonx.ApplyJSONPatch(filteredPatch, WithCredentialsAndAdminMetadataInJSON(*ident), "/id", "/stateChangedAt", "/credentials", "/credentials/oidc", "/credentials/oidc/**", "/credentials/saml", "/credentials/saml/**")
 	if err != nil {
 		h.r.Writer().WriteError(w, r, errors.WithStack(
 			herodot.ErrBadRequest().
-				WithReasonf("An error occured when applying the JSON patch").
-				WithErrorf("%v", err).
+				WithReason("failed to apply JSON patch").
+				WithError(err.Error()).
 				WithWrap(err),
 		))
 		return
 	}
+
+	// Reject patches that desynchronize a credential's "type" field from
+	// its map key. The patch deny-list lets callers replace whole
+	// `/credentials/<key>` subtrees or add new keys; a value without a
+	// "type" field would otherwise either fail deep inside the persister
+	// with a misleading "code bug" 500 (new key path) or silently
+	// overwrite the existing credential's config (replace path) — for
+	// password credentials this destroys `hashed_password`.
+	// IdentityManager.ValidateIdentity also enforces this as a safeguard,
+	// but the handler-level check rejects the request before the
+	// confidential-identity reload and gives a sharper error path.
+	if err := ValidateCredentialsIntegrity(patchedIdentity.Credentials); err != nil {
+		h.r.Writer().WriteError(w, r, err)
+		return
+	}
+
+	// ApplyJSONPatch can't see omitempty-stripped fields; carry forward.
+	patchedIdentity.Region = ident.Region
 
 	if oldState != patchedIdentity.State {
 		// Check if the changed state was actually valid
@@ -1261,8 +1367,12 @@ type _ struct {
 	// in: path
 	Type CredentialsType `json:"type"`
 
-	// Identifier is the identifier of the OIDC/SAML credential to delete.
-	// Find the identifier by calling the `GET /admin/identities/{id}?include_credential={oidc,saml}` endpoint.
+	// Identifier is the identifier of the credential to delete. It is required
+	// for the `oidc`, `saml`, and `deviceauthn` credential types: for `oidc`
+	// and `saml` it selects the provider link to remove, for `deviceauthn` it
+	// is the `client_key_id` of the device key to revoke. Find the identifier
+	// by calling the `GET /admin/identities/{id}?include_credential={type}`
+	// endpoint.
 	//
 	// required: false
 	// in: query
@@ -1289,6 +1399,7 @@ type _ struct {
 //
 //	Responses:
 //	  204: emptyResponse
+//	  400: errorGeneric
 //	  404: errorGeneric
 //	  default: errorGeneric
 //
@@ -1296,6 +1407,21 @@ type _ struct {
 //	  x-ory-ratelimit-bucket: kratos-admin-low
 func (h *Handler) deleteIdentityCredentials(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// DeviceAuthn revokes a single key selected by the `identifier` query
+	// parameter (the key's client_key_id) rather than dropping the whole
+	// credential. Its read-modify-write runs under an exclusive row lock (see
+	// deleteDeviceAuthnKey), so it does not go through the shared in-memory
+	// read-then-update path below.
+	if CredentialsType(r.PathValue("type")) == CredentialsTypeDeviceAuthn {
+		if err := h.deleteDeviceAuthnKey(ctx, x.ParseUUID(r.PathValue("id")), r.URL.Query().Get("identifier")); err != nil {
+			h.r.Writer().WriteError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	identity, err := h.r.PrivilegedIdentityPool().GetIdentityConfidential(ctx, x.ParseUUID(r.PathValue("id")))
 	if err != nil {
 		h.r.Writer().WriteError(w, r, err)
@@ -1309,7 +1435,7 @@ func (h *Handler) deleteIdentityCredentials(w http.ResponseWriter, r *http.Reque
 	}
 
 	switch cred.Type {
-	case CredentialsTypeLookup, CredentialsTypeTOTP, CredentialsTypeDeviceAuthn:
+	case CredentialsTypeLookup, CredentialsTypeTOTP:
 		identity.DeleteCredentialsType(cred.Type)
 	case CredentialsTypeWebAuthn:
 		if err = identity.deleteCredentialWebAuthFromIdentity(); err != nil {
@@ -1354,4 +1480,48 @@ func (h *Handler) deleteIdentityCredentials(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteDeviceAuthnKey revokes the DeviceAuthn key whose client_key_id equals
+// identifier. The read-modify-write of the credential config runs under the
+// persister's exclusive row lock (SELECT ... FOR UPDATE), so concurrent
+// revocations serialize and none is lost; the credential's identifier rows are
+// synced to the surviving keys inside the same transaction. When the last key
+// is removed the config is left empty (the credential row is not deleted),
+// mirroring the DeviceAuthn settings flow. It returns 400 when identifier is
+// empty and 404 when the identity has no DeviceAuthn credential or no key
+// matches.
+func (h *Handler) deleteDeviceAuthnKey(ctx context.Context, id uuid.UUID, identifier string) error {
+	if identifier == "" {
+		return errors.WithStack(herodot.ErrBadRequest().WithReason("You must provide an identifier to delete this credential."))
+	}
+
+	return h.r.PrivilegedIdentityPool().UpdateCredentialsConfig(
+		ctx,
+		id,
+		CredentialsTypeDeviceAuthn,
+		UpdateConfig(func(cfg *deviceauthn.CredentialsDeviceAuthnConfig) error {
+			before := len(cfg.Credentials)
+			cfg.Credentials = slices.DeleteFunc(cfg.Credentials, func(k deviceauthn.Key) bool {
+				return k.ClientKeyID == identifier
+			})
+			if len(cfg.Credentials) == before {
+				return errors.WithStack(herodot.ErrNotFound().WithReasonf("The identifier `%s` was not found among deviceauthn credentials.", identifier))
+			}
+			return nil
+		}),
+		// The identifier rows are derived state of the config: sync them to the
+		// surviving keys' client_key_ids under the same lock.
+		WithDerivedIdentifiers(func(newConfig []byte) ([]string, error) {
+			var cfg deviceauthn.CredentialsDeviceAuthnConfig
+			if err := json.Unmarshal(newConfig, &cfg); err != nil {
+				return nil, errors.WithStack(herodot.ErrInternalServerError().WithReason("Unable to decode identity credentials.").WithDebug(err.Error()))
+			}
+			ids := make([]string, len(cfg.Credentials))
+			for i, k := range cfg.Credentials {
+				ids[i] = k.ClientKeyID
+			}
+			return ids, nil
+		}),
+	)
 }

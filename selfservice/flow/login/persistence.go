@@ -17,6 +17,7 @@ type (
 		GetLoginFlow(context.Context, uuid.UUID) (*Flow, error)
 		ForceLoginFlow(ctx context.Context, id uuid.UUID) error
 		DeleteExpiredLoginFlows(context.Context, time.Time, int) error
+		DeleteTestLoginFlow(context.Context, uuid.UUID) error
 	}
 	FlowPersistenceProvider interface {
 		LoginFlowPersister() FlowPersister

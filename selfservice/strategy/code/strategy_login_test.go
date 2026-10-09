@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,6 +39,7 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/ioutilx"
+	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
 	"github.com/ory/x/snapshotx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
@@ -136,7 +136,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 			client = testhelpers.NewClientWithCookies(t)
 		}
 
-		client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+		client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 
 		var clientInit *oryClient.LoginFlow
 		if apiType == ApiTypeNative {
@@ -341,7 +341,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 							Config:      sqlxx.JSONRawMessage(cf),
 						},
 					}
-					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i)) // We explicitly bypass identity validation to test the legacy code path
+					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i})) // We explicitly bypass identity validation to test the legacy code path
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s.identityEmail = email
 					return s
@@ -380,7 +380,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						identity.CredentialsTypePassword: {Type: identity.CredentialsTypePassword, Identifiers: []string{email}, Config: sqlxx.JSONRawMessage(`{}`)},
 					}
 
-					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i)) // We explicitly bypass identity validation to test the legacy code path
+					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i})) // We explicitly bypass identity validation to test the legacy code path
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s.identityEmail = email
 					run(t, s)
@@ -396,7 +396,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 					i.NID = x.NewUUID()
 					email := testhelpers.RandomEmail()
 					i.Traits = identity.Traits(fmt.Sprintf(`{"tos": true, "email": "%s"}`, email))
-					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i)) // We explicitly bypass identity validation to test the legacy code path
+					require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i})) // We explicitly bypass identity validation to test the legacy code path
 					s := createLoginFlowWithIdentity(ctx, t, public, tc.apiType, i)
 					s.identityEmail = email
 					// submit email
@@ -466,7 +466,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						Config:      sqlxx.JSONRawMessage(`{"address_type": "sms"}`),
 					},
 				}
-				require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, i))
+				require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(ctx, []*identity.Identity{i}))
 				t.Cleanup(func() {
 					require.NoError(t, reg.PrivilegedIdentityPool().DeleteIdentity(ctx, i.ID))
 				})
@@ -523,7 +523,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 				conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+".password.enabled", true)
 
 				client := testhelpers.NewClientWithCookies(t)
-				client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 
 				registrationFlow := testhelpers.InitializeRegistrationFlowViaBrowser(t, client, public, tc.apiType == ApiTypeNative, false, false)
 
@@ -878,7 +878,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.NoError(t, err)
 						require.Len(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 						require.Len(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-						require.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
+						require.EqualValues(t, text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 
 						s := &state{
 							flowID:        f.GetId(),
@@ -1167,7 +1167,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 					require.EqualValues(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
 					require.Len(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 					require.Len(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-					require.EqualValues(t, gjson.GetBytes(body, "ui.messages.0.id").Int(), text.InfoSelfServiceLoginCodeSent, "%s", body)
+					require.EqualValues(t, gjson.GetBytes(body, "ui.messages.0.id").Int(), text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, "%s", body)
 
 					snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptPaths("ui.nodes.5.attributes.value", "id", "created_at", "expires_at", "updated_at", "issued_at", "request_url", "ui.action"))
 				})
@@ -1217,7 +1217,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.EqualValues(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
 						require.Len(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 						require.Len(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-						require.EqualValues(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
+						require.EqualValues(t, text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 
 						snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptPaths("ui.nodes.5.attributes.value", "id", "created_at", "expires_at", "updated_at", "issued_at", "request_url", "ui.action"))
 					})
@@ -1241,7 +1241,7 @@ func TestLoginCodeStrategy(t *testing.T) {
 						require.EqualValuesf(t, flow.StateEmailSent, gjson.GetBytes(body, "state").String(), "%s", body)
 						require.Lenf(t, gjson.GetBytes(body, "ui.nodes.#(group==code)").Array(), 1, "%s", body)
 						require.Lenf(t, gjson.GetBytes(body, "ui.messages").Array(), 1, "%s", body)
-						require.EqualValuesf(t, text.InfoSelfServiceLoginCodeSent, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
+						require.EqualValuesf(t, text.InfoSelfServiceLoginCodeSentForAuthenticatedUser, gjson.GetBytes(body, "ui.messages.0.id").Int(), "%s", body)
 
 						snapshotx.SnapshotTJSON(t, body, snapshotx.ExceptPaths("ui.nodes.5.attributes.value", "id", "created_at", "expires_at", "updated_at", "issued_at", "request_url", "ui.action"))
 					})
@@ -1291,13 +1291,165 @@ func TestLoginCodeStrategy(t *testing.T) {
 			})
 		})
 	}
+
+	t.Run("case=passwordless refresh sends code via address button without method", func(t *testing.T) {
+		ctx := contextx.WithConfigValue(t.Context(), config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
+			"enabled":              true,
+			"passwordless_enabled": true,
+			"mfa_enabled":          false,
+		})
+		// The refresh address picker is gated behind a feature flag. It must be
+		// set on the shared config; contextx overrides do not reach the server's
+		// request handlers.
+		conf.MustSet(ctx, config.ViperKeyRefreshLoginChooseAddress, true)
+		t.Cleanup(func() { conf.MustSet(ctx, config.ViperKeyRefreshLoginChooseAddress, nil) })
+
+		email := "refresh-passwordless-" + testhelpers.RandomEmail()
+		user := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		user.Traits = identity.Traits(`{"email":"` + email + `"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, user))
+
+		cl := testhelpers.NewHTTPClientWithIdentitySessionCookieLocalhost(ctx, t, reg, user)
+		f := testhelpers.InitializeLoginFlowViaBrowserCtx(ctx, t, cl, public, false, false, false, false, testhelpers.InitFlowWithRefresh())
+
+		body, err := json.Marshal(f)
+		require.NoError(t, err)
+		// The refresh screen offers a "Send code to <email>" button, not an identifier input.
+		require.Len(t, gjson.GetBytes(body, `ui.nodes.#(attributes.name=="identifier")`).Array(), 0, "%s", body)
+		require.EqualValues(t, email, gjson.GetBytes(body, `ui.nodes.#(attributes.name=="address").attributes.value`).String(), "%s", body)
+
+		s := &state{
+			flowID:        f.GetId(),
+			identity:      user,
+			client:        cl,
+			testServer:    public,
+			identityEmail: email,
+		}
+
+		// Submit only the address, exactly as clicking the button does (no method).
+		s = submitLogin(ctx, t, s, ApiTypeBrowser, func(v *url.Values) {
+			v.Del("method")
+			v.Set("address", email)
+		}, false, nil)
+
+		message := testhelpers.CourierExpectMessage(ctx, t, reg, email, "Use code")
+		loginCode := testhelpers.CourierExpectCodeInMessage(t, message, 1)
+		assert.NotEmpty(t, loginCode)
+
+		submitLogin(ctx, t, s, ApiTypeBrowser, func(v *url.Values) {
+			v.Set("address", email)
+			v.Set("code", loginCode)
+		}, true, nil)
+	})
+
+	t.Run("case=passwordless refresh rejects another identity's address", func(t *testing.T) {
+		ctx := contextx.WithConfigValue(t.Context(), config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
+			"enabled":              true,
+			"passwordless_enabled": true,
+			"mfa_enabled":          false,
+		})
+		// The refresh address picker is gated behind a feature flag. It must be
+		// set on the shared config; contextx overrides do not reach the server's
+		// request handlers.
+		conf.MustSet(ctx, config.ViperKeyRefreshLoginChooseAddress, true)
+		t.Cleanup(func() { conf.MustSet(ctx, config.ViperKeyRefreshLoginChooseAddress, nil) })
+
+		ownEmail := "refresh-own-" + testhelpers.RandomEmail()
+		own := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		own.Traits = identity.Traits(`{"email":"` + ownEmail + `"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, own))
+
+		otherEmail := "refresh-other-" + testhelpers.RandomEmail()
+		other := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		other.Traits = identity.Traits(`{"email":"` + otherEmail + `"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, other))
+
+		cl := testhelpers.NewHTTPClientWithIdentitySessionCookieLocalhost(ctx, t, reg, own)
+		f := testhelpers.InitializeLoginFlowViaBrowserCtx(ctx, t, cl, public, false, false, false, false, testhelpers.InitFlowWithRefresh())
+
+		s := &state{
+			flowID:        f.GetId(),
+			identity:      own,
+			client:        cl,
+			testServer:    public,
+			identityEmail: ownEmail,
+		}
+
+		// Submitting another identity's address must be rejected during refresh.
+		s = submitLogin(ctx, t, s, ApiTypeBrowser, func(v *url.Values) {
+			v.Del("method")
+			v.Set("address", otherEmail)
+		}, false, nil)
+
+		require.Equal(t, "This account does not exist or has not setup sign in with code.", gjson.Get(s.body, "ui.messages.0.text").String(), "%s", s.body)
+	})
+
+	t.Run("case=passwordless refresh via identifier-first does not send code to foreign address", func(t *testing.T) {
+		// Enable identifier-first login and disable account-enumeration mitigation
+		// so the identifier-first fast-login path (FastLogin1FA) actually reaches
+		// loginSendCode — this is the path the guard protects. Passwordless code
+		// login is already enabled by the test registry. These settings must be
+		// set on the shared config (contextx config overrides do not reach the
+		// server's request handlers), so reset them after the subtest.
+		ctx := t.Context()
+		conf.MustSet(ctx, config.ViperKeySelfServiceLoginFlowStyle, "identifier_first")
+		conf.MustSet(ctx, config.ViperKeySecurityAccountEnumerationMitigate, false)
+		t.Cleanup(func() {
+			conf.MustSet(ctx, config.ViperKeySelfServiceLoginFlowStyle, nil)
+			conf.MustSet(ctx, config.ViperKeySecurityAccountEnumerationMitigate, nil)
+		})
+
+		// Both identities have only a code credential (created from the schema),
+		// so code is the single active first-factor credential and FastLogin1FA
+		// proceeds to send a code.
+		ownEmail := testhelpers.RandomEmail()
+		own := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		own.Traits = identity.Traits(`{"email":"` + ownEmail + `"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, own))
+
+		otherEmail := testhelpers.RandomEmail()
+		other := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		other.Traits = identity.Traits(`{"email":"` + otherEmail + `"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, other))
+
+		// Start a refresh flow as "own".
+		cl := testhelpers.NewHTTPClientWithIdentitySessionCookieLocalhost(ctx, t, reg, own)
+		f := testhelpers.InitializeLoginFlowViaBrowserCtx(ctx, t, cl, public, false, false, false, false, testhelpers.InitFlowWithRefresh())
+
+		s := &state{
+			flowID:        f.GetId(),
+			identity:      own,
+			client:        cl,
+			testServer:    public,
+			identityEmail: ownEmail,
+		}
+
+		// Submit via the identifier-first method with the foreign identity's email.
+		// FastLogin1FA must detect the identity mismatch and return ErrStrategyNotResponsible,
+		// which keeps the flow in choose_method without sending any code.
+		s = submitLogin(ctx, t, s, ApiTypeBrowser, func(v *url.Values) {
+			v.Del("address")
+			v.Set("method", "identifier_first")
+			v.Set("identifier", otherEmail)
+		}, false, nil)
+
+		// The flow must remain in choose_method; no code-sent transition.
+		require.EqualValues(t, flow.StateChooseMethod, gjson.Get(s.body, "state").String(), "%s", s.body)
+
+		// Assert no login code was dispatched to the foreign address.
+		messages, _, err := reg.CourierPersister().ListMessages(ctx, courier.ListCourierMessagesParameters{
+			Recipient: otherEmail,
+		}, []keysetpagination.Option{})
+		require.NoError(t, err)
+		assert.Empty(t, messages, "no courier message must be sent to the foreign address, got: %v", messages)
+	})
 }
 
 func TestFormHydration(t *testing.T) {
 	t.Parallel()
 
 	_, reg := pkg.NewFastRegistryWithMocks(t,
-		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]interface{}{
+		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
 			"enabled":              true,
 			"passwordless_enabled": true,
 		}),
@@ -1321,13 +1473,13 @@ func TestFormHydration(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
 		r = r.WithContext(ctx)
-		f, err := login.NewFlow(reg.Config(), time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f, err := login.NewFlow(reg, r, flow.TypeBrowser)
 		require.NoError(t, err)
 		return r, f
 	}
 
 	passwordlessEnabled := func(ctx context.Context) context.Context {
-		return contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]interface{}{
+		return contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
 			"enabled":              true,
 			"passwordless_enabled": true,
 			"mfa_enabled":          false,
@@ -1335,7 +1487,7 @@ func TestFormHydration(t *testing.T) {
 	}
 
 	mfaEnabled := func(ctx context.Context) context.Context {
-		return contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]interface{}{
+		return contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
 			"enabled":              true,
 			"passwordless_enabled": false,
 			"mfa_enabled":          true,
@@ -1367,9 +1519,14 @@ func TestFormHydration(t *testing.T) {
 
 	t.Run("method=PopulateLoginMethodFirstFactorRefresh", func(t *testing.T) {
 		t.Run("case=code is used for passwordless login and request is 1fa with refresh", func(t *testing.T) {
-			r, f := newFlow(passwordlessEnabled(t.Context()), t)
+			ctx := contextx.WithConfigValue(passwordlessEnabled(t.Context()), config.ViperKeyRefreshLoginChooseAddress, true)
+			r, f := newFlow(ctx, t)
 			f.RequestedAAL = identity.AuthenticatorAssuranceLevel1
 			f.Refresh = true
+			// A refresh login is always authenticated. Attach a session whose
+			// identity has a code address so the strategy can render the
+			// "Send code to <address>" buttons.
+			r.Header = testhelpers.NewHTTPClientWithArbitrarySessionTokenAndTraits(ctx, t, reg, []byte(`{"email":"refresh-1fa-passwordless@ory.sh"}`)).Transport.(*testhelpers.TransportWithHeader).GetHeader()
 			require.NoError(t, fhAAL1.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 			toSnapshot(t, f)
 		})
@@ -1380,6 +1537,23 @@ func TestFormHydration(t *testing.T) {
 			f.Refresh = true
 			require.NoError(t, fhAAL1.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
 			toSnapshot(t, f)
+		})
+
+		t.Run("case=address picker disabled falls back to the identifier input", func(t *testing.T) {
+			// With the refresh address picker feature flag off (the default),
+			// a 1fa refresh re-asks for the identifier instead of rendering the
+			// "Send code to <address>" buttons.
+			ctx := passwordlessEnabled(t.Context())
+			r, f := newFlow(ctx, t)
+			f.RequestedAAL = identity.AuthenticatorAssuranceLevel1
+			f.Refresh = true
+			r.Header = testhelpers.NewHTTPClientWithArbitrarySessionTokenAndTraits(ctx, t, reg, []byte(`{"email":"refresh-1fa-fallback@ory.sh"}`)).Transport.(*testhelpers.TransportWithHeader).GetHeader()
+			require.NoError(t, fhAAL1.PopulateLoginMethodFirstFactorRefresh(r, f, nil))
+
+			body, err := json.Marshal(f.UI)
+			require.NoError(t, err)
+			assert.Len(t, gjson.GetBytes(body, `nodes.#(attributes.name=="identifier")`).Array(), 1, "%s", body)
+			assert.Len(t, gjson.GetBytes(body, `nodes.#(attributes.name=="address")#`).Array(), 0, "%s", body)
 		})
 	})
 
@@ -1564,7 +1738,7 @@ func TestCodeLoginWithLoginChallenge(t *testing.T) {
 	t.Parallel()
 
 	_, reg := pkg.NewFastRegistryWithMocks(t,
-		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]interface{}{
+		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
 			"enabled":              true,
 			"passwordless_enabled": true,
 		}),
@@ -1580,7 +1754,7 @@ func TestCodeLoginWithLoginChallenge(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
 		r = r.WithContext(ctx)
-		f, err := login.NewFlow(reg.Config(), time.Minute, nosurfx.FakeCSRFToken, r, flow.TypeBrowser)
+		f, err := login.NewFlow(reg, r, flow.TypeBrowser)
 		require.NoError(t, err)
 		require.NoError(t, reg.LoginFlowPersister().CreateLoginFlow(ctx, f))
 		return r, f
@@ -1603,6 +1777,14 @@ func TestCodeLoginWithLoginChallenge(t *testing.T) {
 		_, err := s.Login(httptest.NewRecorder(), r, f, nil)
 		require.ErrorIs(t, err, flow.ErrCompletedByStrategy)
 		require.NotNil(t, f.HydraLoginRequest)
+
+		messages, err := reg.CourierPersister().NextMessages(t.Context(), 10)
+		require.NoError(t, err)
+		require.Len(t, messages, 1)
+		assert.Equal(t, loginChallenge, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.challenge").String())
+		assert.Equal(t, hydra.FakeClientID, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.client.client_id").String())
+		assert.Equal(t, hydra.FakeClientName, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.client.client_name").String())
+		assert.Equal(t, hydra.FakeClientLogoURI, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.client.logo_uri").String())
 	})
 
 	t.Run("case=returns error if login challenge is invalid", func(t *testing.T) {
@@ -1622,5 +1804,9 @@ func TestCodeLoginWithLoginChallenge(t *testing.T) {
 		_, err := s.Login(httptest.NewRecorder(), r, f, nil)
 		require.ErrorIs(t, err, herodot.ErrBadRequest())
 		require.Nil(t, f.HydraLoginRequest)
+
+		// Pin that the invalid login challenge aborts before any one-time code is queued.
+		_, err = reg.CourierPersister().NextMessages(t.Context(), 1)
+		require.ErrorIs(t, err, courier.ErrQueueEmpty)
 	})
 }

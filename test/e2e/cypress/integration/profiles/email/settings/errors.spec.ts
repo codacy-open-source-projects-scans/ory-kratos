@@ -59,6 +59,7 @@ context("Settings failures with email profile", () => {
           cy.visit(route)
         })
 
+        // playwright:migrated
         it("fails with validation errors", () => {
           cy.get('input[name="traits.website"]').clear().type("http://s")
           cy.get('[name="method"][value="profile"]').click()
@@ -157,6 +158,7 @@ context("Settings failures with email profile", () => {
           cy.longPrivilegedSessionTime()
         })
 
+        // playwright:migrated
         it("fails if password policy is violated", () => {
           cy.get('input[name="password"]').clear().type("12345678")
           cy.get('button[value="password"]').click()

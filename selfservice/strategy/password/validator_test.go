@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,6 +153,18 @@ func TestDefaultPasswordValidationStrategy(t *testing.T) {
 			ctx := contextx.WithConfigValue(t.Context(), config.ViperKeyIgnoreNetworkErrors, true)
 			fakeClient.RespondWith(http.StatusInternalServerError, "")
 			require.NoError(t, s.Validate(ctx, "", "jenuzuhjoj"))
+		})
+
+		t.Run("case=should fail with a network error if reading the response body fails and ignoreNetworkErrors is not set", func(t *testing.T) {
+			ctx := contextx.WithConfigValue(t.Context(), config.ViperKeyIgnoreNetworkErrors, false)
+			fakeClient.RespondWithBodyError("003D68EB55068C33ACE09247EE4C639306B:3\n", errBodyRead)
+			require.ErrorIs(t, s.Validate(ctx, "", "vebjihwoct"), password.ErrNetworkFailure)
+		})
+
+		t.Run("case=should not fail if reading the response body fails and ignoreNetworkErrors is set", func(t *testing.T) {
+			ctx := contextx.WithConfigValue(t.Context(), config.ViperKeyIgnoreNetworkErrors, true)
+			fakeClient.RespondWithBodyError("003D68EB55068C33ACE09247EE4C639306B:3\n", errBodyRead)
+			require.NoError(t, s.Validate(ctx, "", "hufzeqmalt"))
 		})
 	})
 
@@ -345,6 +358,33 @@ func TestChangeIdentifierSimilarityCheckEnabled(t *testing.T) {
 	})
 }
 
+// TestIdentifierSimilarityCheckMaxLength guards against an algorithmic-complexity
+// DoS (H1 #3866310): the O(n·m) identifier-similarity check must skip oversized
+// operands, which a short identifier can never be similar to anyway.
+func TestIdentifierSimilarityCheckMaxLength(t *testing.T) {
+	t.Parallel()
+
+	// Disable HaveIBeenPwned so validation is deterministic and offline.
+	_, reg := pkg.NewFastRegistryWithMocks(t, configx.WithValue(config.ViperKeyPasswordHaveIBeenPwnedEnabled, false))
+	s, err := password.NewDefaultPasswordValidatorStrategy(reg)
+	require.NoError(t, err)
+
+	ctx := contextx.WithConfigValue(t.Context(), config.ViperKeyPasswordIdentifierSimilarityCheckEnabled, true)
+
+	t.Run("case=skips the similarity check for oversized operands", func(t *testing.T) {
+		// Two identical strings one char past the 256-char cap would trip the
+		// too-similar check if it ran, so a nil result proves the length guard
+		// skipped it. Staying just over the cap keeps the test cheap even if the
+		// guard regresses (the check allocates an O(n·m) matrix).
+		large := strings.Repeat("a", 257)
+		require.NoError(t, s.Validate(ctx, large, large))
+	})
+
+	t.Run("case=still detects similarity for short operands", func(t *testing.T) {
+		require.ErrorIs(t, s.Validate(ctx, "bosqwfaxee", "bosqwfaxee"), text.NewErrorValidationPasswordIdentifierTooSimilar())
+	})
+}
+
 type fakeHttpClient struct {
 	http.Client
 
@@ -383,6 +423,19 @@ func (c *fakeHttpClient) RespondWithError(err string) {
 	}
 }
 
+// RespondWithBodyError responds with a status 200 whose body yields prefix and
+// then fails, mimicking a connection reset or a client timeout that only hits
+// once the response is already being read.
+func (c *fakeHttpClient) RespondWithBodyError(prefix string, err error) {
+	c.responder = func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(io.MultiReader(strings.NewReader(prefix), errorReader{err})),
+			Request:    request,
+		}, nil
+	}
+}
+
 func (c *fakeHttpClient) Reset() {
 	c.requestedURLs = nil
 }
@@ -406,3 +459,11 @@ type fakeRoundTripper struct {
 func (rt *fakeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	return rt.client.handle(request)
 }
+
+// errBodyRead is the error net/http returns from a response body read when the
+// client's timeout fires after the response headers have been received.
+var errBodyRead = errors.New("net/http: request canceled (Client.Timeout or context cancellation while reading body)")
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }

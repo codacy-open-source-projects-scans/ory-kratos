@@ -91,8 +91,8 @@ func TestCompleteLogin(t *testing.T) {
 			"phone":     "file://./stub/phone.schema.json",
 		})),
 	)
-	router := httprouterx.NewTestRouterPublic(t)
-	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, httprouterx.NewTestRouterAdminWithPrefix(t))
+	router := httprouterx.NewRouterPublic()
+	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, httprouterx.NewRouterAdminWithPrefix())
 
 	errTS := testhelpers.NewErrorTestServer(t, reg)
 	uiTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
@@ -191,10 +191,19 @@ func TestCompleteLogin(t *testing.T) {
 	})
 
 	t.Run("case=should return an error because the request is expired", func(t *testing.T) {
-		conf.MustSet(t.Context(), config.ViperKeySelfServiceLoginRequestLifespan, 100*time.Millisecond)
-		t.Cleanup(func() {
-			conf.MustSet(t.Context(), config.ViperKeySelfServiceLoginRequestLifespan, 10*time.Minute)
-		})
+		// Force expiry via the persister so the test is not racy on slow CI runners.
+		// The previous approach set lifespan to 100ms and slept 101ms, but the setup
+		// helper itself takes longer than 100ms under load, expiring the flow before
+		// the GetLoginFlow call inside the helper could fetch it.
+		expireFlow := func(t *testing.T, id string) {
+			flowID, err := uuid.FromString(id)
+			require.NoError(t, err)
+			fl, err := reg.LoginFlowPersister().GetLoginFlow(t.Context(), flowID)
+			require.NoError(t, err)
+			fl.ExpiresAt = time.Now().Add(-time.Second)
+			require.NoError(t, reg.LoginFlowPersister().UpdateLoginFlow(t.Context(), fl))
+		}
+
 		values := url.Values{
 			"csrf_token": {nosurfx.FakeCSRFToken},
 			"identifier": {"identifier"},
@@ -203,8 +212,7 @@ func TestCompleteLogin(t *testing.T) {
 
 		t.Run("type=api", func(t *testing.T) {
 			f := testhelpers.InitializeLoginFlowViaAPICtx(t.Context(), t, apiClient, publicTS, false)
-
-			time.Sleep(101 * time.Millisecond)
+			expireFlow(t, f.Id)
 
 			actual, res := testhelpers.LoginMakeRequest(t, true, false, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
 			assert.Contains(t, res.Request.URL.String(), publicTS.URL+login.RouteSubmitFlow)
@@ -216,8 +224,7 @@ func TestCompleteLogin(t *testing.T) {
 		t.Run("type=browser", func(t *testing.T) {
 			browserClient := testhelpers.NewClientWithCookies(t)
 			f := testhelpers.InitializeLoginFlowViaBrowser(t, browserClient, publicTS, false, false, false, false)
-
-			time.Sleep(101 * time.Millisecond)
+			expireFlow(t, f.Id)
 
 			actual, res := testhelpers.LoginMakeRequest(t, false, false, f, browserClient, values.Encode())
 			assert.Contains(t, res.Request.URL.String(), uiTS.URL+"/login-ts")
@@ -228,8 +235,8 @@ func TestCompleteLogin(t *testing.T) {
 		t.Run("type=SPA", func(t *testing.T) {
 			browserClient := testhelpers.NewClientWithCookies(t)
 			f := testhelpers.InitializeLoginFlowViaBrowser(t, browserClient, publicTS, false, true, false, false)
+			expireFlow(t, f.Id)
 
-			time.Sleep(101 * time.Millisecond)
 			actual, res := testhelpers.LoginMakeRequest(t, false, true, f, apiClient, testhelpers.EncodeFormAsJSON(t, true, values))
 			assert.Contains(t, res.Request.URL.String(), publicTS.URL+login.RouteSubmitFlow)
 			assert.NotEqual(t, "00000000-0000-0000-0000-000000000000", gjson.Get(actual, "use_flow_id").String())
@@ -695,9 +702,10 @@ func TestCompleteLogin(t *testing.T) {
 		}
 		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(t.Context(), id))
 
-		// CreateIdentity normalizes the credential identifier to E.164 format and
-		// sets credential version to the latest. To simulate a legacy database record
-		// created before normalization was introduced, revert both via raw SQL.
+		// CreateIdentity normalizes the credential identifier to E.164 format,
+		// rewrites the matching trait value, and sets credential version to
+		// the latest. To simulate a legacy database record created before
+		// normalization was introduced, revert all three via raw SQL.
 		require.NoError(t, reg.Persister().GetConnection(t.Context()).RawQuery(
 			"UPDATE identity_credential_identifiers SET identifier = ? WHERE identity_id = ? AND identifier = ?",
 			nonNormalizedPhone, iId, normalizedPhone,
@@ -705,6 +713,10 @@ func TestCompleteLogin(t *testing.T) {
 		require.NoError(t, reg.Persister().GetConnection(t.Context()).RawQuery(
 			"UPDATE identity_credentials SET version = 0 WHERE identity_id = ?",
 			iId,
+		).Exec())
+		require.NoError(t, reg.Persister().GetConnection(t.Context()).RawQuery(
+			"UPDATE identities SET traits = ? WHERE id = ?",
+			fmt.Sprintf(`{"phone_number":"%s"}`, nonNormalizedPhone), iId,
 		).Exec())
 
 		t.Run("type=browser/login with non-normalized phone", func(t *testing.T) {
@@ -946,13 +958,33 @@ func TestCompleteLogin(t *testing.T) {
 	})
 
 	t.Run("should fail as email is not yet verified", func(t *testing.T) {
-		conf.MustSet(t.Context(), config.ViperKeySelfServiceLoginAfter+".password.hooks", []map[string]interface{}{
-			{"hook": "require_verified_address"},
-		})
-		conf.MustSet(t.Context(), config.ViperKeyUseLegacyRequireVerifiedLoginError, true)
-		t.Cleanup(func() {
-			conf.MustSet(t.Context(), config.ViperKeyUseLegacyRequireVerifiedLoginError, false)
-		})
+		// This subtest mutates config (the require_verified_address login hook
+		// and the legacy-error flag) and registers a cleanup that mutates it
+		// again. Sharing the parent's registry would let that mutation race
+		// in-flight requests of sibling subtests reading the same config (e.g.
+		// IsInsecureDevMode via the password hasher). It therefore owns its own
+		// registry, config, and server stack. See .claude/rules/go.md:
+		// "subtests that need parallelization must own their resources".
+		conf, reg := pkg.NewFastRegistryWithMocks(t,
+			configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword)+".enabled", true),
+			configx.WithValues(testhelpers.IdentitySchemasConfig(map[string]string{
+				"default": "file://./stub/login.schema.json",
+			})),
+			configx.WithValue(config.ViperKeySelfServiceLoginAfter+".password.hooks", []map[string]interface{}{
+				{"hook": "require_verified_address"},
+			}),
+			configx.WithValue(config.ViperKeyUseLegacyRequireVerifiedLoginError, true),
+		)
+		publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, httprouterx.NewRouterPublic(), httprouterx.NewRouterAdminWithPrefix())
+		_ = testhelpers.NewLoginUIFlowEchoServer(t, reg)
+		_ = testhelpers.NewErrorTestServer(t, reg)
+
+		expectValidationError := func(t *testing.T, isAPI, refresh, isSPA bool, values func(url.Values)) string {
+			return testhelpers.SubmitLoginForm(t, isAPI, nil, publicTS, values,
+				isSPA, refresh,
+				testhelpers.ExpectStatusCode(isAPI || isSPA, http.StatusBadRequest, http.StatusOK),
+				testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+login.RouteSubmitFlow, conf.SelfServiceFlowLoginUI(t.Context()).String()))
+		}
 
 		identifier, pwd := x.NewUUID().String(), "password"
 		createIdentity(t.Context(), reg, t, identifier, pwd)
@@ -1370,7 +1402,7 @@ func TestCompleteLogin(t *testing.T) {
 }
 
 func TestFormHydration(t *testing.T) {
-	conf, reg := pkg.NewFastRegistryWithMocks(t,
+	_, reg := pkg.NewFastRegistryWithMocks(t,
 		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword)+".enabled", true),
 		configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://stub/login.schema.json")),
 	)
@@ -1390,7 +1422,7 @@ func TestFormHydration(t *testing.T) {
 		r := httptest.NewRequest("GET", "/self-service/login/browser", nil)
 		r = r.WithContext(ctx)
 		t.Helper()
-		f, err := login.NewFlow(conf, time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f, err := login.NewFlow(reg, r, flow.TypeBrowser)
 		require.NoError(t, err)
 		return r, f
 	}

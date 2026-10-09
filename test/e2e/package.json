@@ -35,5 +35,11 @@
     "typescript": "5.9.3",
     "wait-on": "9.0.3",
     "yamljs": "0.3.0"
+  },
+  "overrides": {
+    "uuid": "14.0.0",
+    "qs": "6.15.2",
+    "axios": "1.18.1",
+    "brace-expansion": "1.1.16"
   }
 }

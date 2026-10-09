@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
+	"github.com/ory/x/clock"
 	"github.com/ory/x/configx"
 	keysetpagination "github.com/ory/x/pagination/keysetpagination_v2"
 
@@ -93,7 +93,7 @@ func TestVerification(t *testing.T) {
 			hc = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				hc = testhelpers.NewClientWithCookies(t)
-				hc.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				hc.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -408,15 +408,19 @@ func TestVerification(t *testing.T) {
 	})
 
 	t.Run("description=should not be able to submit email in expired flow", func(t *testing.T) {
-		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, 100*time.Millisecond)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
-		})
+		// Drive expiry with a deterministic clock instead of a real sleep, so the
+		// "expired N minutes ago" message no longer depends on wall-clock timing.
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+
+		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
 
 		c := testhelpers.NewClientWithCookies(t)
 		rs := testhelpers.GetVerificationFlow(t, c, public)
 
-		time.Sleep(101 * time.Millisecond)
+		// 1-minute lifespan + 2 minutes => deterministically "expired 2.00 minutes ago".
+		mockClock.Add(3 * time.Minute)
 
 		res, err := c.PostForm(rs.Ui.Action, url.Values{"method": {"code"}, "email": {verificationEmail}})
 		require.NoError(t, err)
@@ -424,14 +428,17 @@ func TestVerification(t *testing.T) {
 		assert.NotContains(t, res.Request.URL.String(), "flow="+rs.Id)
 		assert.Contains(t, res.Request.URL.String(), conf.SelfServiceFlowVerificationUI(ctx).String())
 		body := ioutilx.MustReadAll(res.Body)
-		assert.Regexpf(t, regexp.MustCompile(`The verification flow expired 0\.0\d minutes ago, please try again\.`), gjson.GetBytes(body, "ui.messages.0.text").Str, "%s", body)
+		assert.Equalf(t, "The verification flow expired 2.00 minutes ago, please try again.", gjson.GetBytes(body, "ui.messages.0.text").Str, "%s", body)
 	})
 
 	t.Run("description=should not be able to submit code in expired flow", func(t *testing.T) {
-		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, 100*time.Millisecond)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
-		})
+		// Deterministic clock: the courier still runs on the real clock, only flow
+		// expiry is driven by the mock, so the assertion no longer races the load.
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+
+		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationRequestLifespan, time.Minute)
 
 		c := testhelpers.NewClientWithCookies(t)
 		body := expectSuccess(t, c, false, false, func(v url.Values) {
@@ -443,11 +450,12 @@ func TestVerification(t *testing.T) {
 
 		code := testhelpers.CourierExpectCodeInMessage(t, message, 1)
 
-		time.Sleep(101 * time.Millisecond)
+		// 1-minute lifespan + 2 minutes => deterministically "expired 2.00 minutes ago".
+		mockClock.Add(3 * time.Minute)
 
 		f, _ := submitVerificationCode(t, body, c, code)
 
-		assert.Regexpf(t, regexp.MustCompile(`The verification flow expired 0\.0\d minutes ago, please try again\.`), gjson.Get(f, "ui.messages.0.text").Str, "%s", body)
+		assert.Equalf(t, "The verification flow expired 2.00 minutes ago, please try again.", gjson.Get(f, "ui.messages.0.text").Str, "%s", body)
 	})
 
 	t.Run("description=should verify an email address", func(t *testing.T) {
@@ -543,7 +551,7 @@ func TestVerification(t *testing.T) {
 	})
 
 	newValidFlow := func(t *testing.T, fType flow.Type, requestURL string) (*verification.Flow, *code.VerificationCode, string) {
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", requestURL, nil), verification.Strategies{code.NewStrategy(reg)}, fType)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", requestURL, nil), verification.Strategies{code.NewStrategy(reg)}, fType)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		u, err := url.Parse(f.RequestURL)
@@ -574,7 +582,7 @@ func TestVerification(t *testing.T) {
 	t.Run("case=contains link to return_to", func(t *testing.T) {
 		returnToURL := public.URL + "/after-verification"
 		conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{returnToURL})
-		client := &http.Client{}
+		client := testhelpers.NewTestClient(t)
 
 		f, _, rawCode := newValidBrowserFlow(t, public.URL+verification.RouteInitBrowserFlow+"?"+url.Values{"return_to": {returnToURL}}.Encode())
 
@@ -858,7 +866,7 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
 		// Create a verification flow in StateEmailSent.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -980,8 +988,9 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
 		// Create verification flow + PTC linked to the session.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken,
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
 			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -1074,8 +1083,9 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken,
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
 			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -1161,7 +1171,7 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.IdentityManager().Update(ctx, concurrentID, identity.ManagerAllowWriteProtectedTraits))
 
 		// Create a verification flow in StateEmailSent.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -1242,8 +1252,9 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken,
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
 			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -1303,5 +1314,147 @@ func TestVerification(t *testing.T) {
 		unchanged, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, ident.ID)
 		require.NoError(t, err)
 		assert.EqualValues(t, "revoke-original@ory.sh", gjson.GetBytes([]byte(unchanged.Traits), "email").String())
+	})
+
+	t.Run("description=should show duplicate credentials error when two identities race to claim the same address", func(t *testing.T) {
+		// Both identities race past the pre-check (which is a non-atomic read) and both receive OTP codes.
+		// When the second one tries to apply the change, it hits a unique constraint violation.
+		identA := &identity.Identity{
+			ID:       x.NewUUID(),
+			State:    identity.StateActive,
+			Traits:   identity.Traits(`{"email":"race-a@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, identA, identity.ManagerAllowWriteProtectedTraits))
+
+		identB := &identity.Identity{
+			ID:       x.NewUUID(),
+			State:    identity.StateActive,
+			Traits:   identity.Traits(`{"email":"race-b@ory.sh"}`),
+			SchemaID: config.DefaultIdentityTraitsSchemaID,
+		}
+		require.NoError(t, reg.IdentityManager().Create(ctx, identB, identity.ManagerAllowWriteProtectedTraits))
+
+		sessA, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, identA,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sessA))
+
+		sessB, err := testhelpers.NewActiveSession(httptest.NewRequest("GET", "/", nil), reg, identB,
+			time.Now().UTC(), identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
+		require.NoError(t, err)
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sessB))
+
+		newAddr := "race-claimed@ory.sh"
+
+		// Two separate verification flows — one per identity.
+		fA, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		fA.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, fA))
+
+		fB, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
+			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
+		require.NoError(t, err)
+		fB.State = flow.StateEmailSent
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, fB))
+
+		sfA := &settings.Flow{
+			ID: x.NewUUID(), ExpiresAt: time.Now().UTC().Add(time.Hour), IssuedAt: time.Now().UTC(),
+			RequestURL: public.URL + "/settings", IdentityID: identA.ID, Identity: identA,
+			Type: flow.TypeBrowser, State: flow.StateShowForm, InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfA))
+
+		sfB := &settings.Flow{
+			ID: x.NewUUID(), ExpiresAt: time.Now().UTC().Add(time.Hour), IssuedAt: time.Now().UTC(),
+			RequestURL: public.URL + "/settings", IdentityID: identB.ID, Identity: identB,
+			Type: flow.TypeBrowser, State: flow.StateShowForm, InternalContext: []byte("{}"),
+		}
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, sfB))
+
+		ptcA := &identity.PendingTraitsChange{
+			ID: x.NewUUID(), IdentityID: identA.ID,
+			SessionID:            uuid.NullUUID{UUID: sessA.ID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: sfA.ID, Valid: true},
+			NewAddressValue:      newAddr, NewAddressVia: string(identity.AddressTypeEmail),
+			OriginalTraitsHash: identity.HashTraits(json.RawMessage(identA.Traits)),
+			ProposedTraits:     json.RawMessage(`{"email":"` + newAddr + `"}`),
+			VerificationFlowID: fA.ID, Status: identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptcA))
+
+		ptcB := &identity.PendingTraitsChange{
+			ID: x.NewUUID(), IdentityID: identB.ID,
+			SessionID:            uuid.NullUUID{UUID: sessB.ID, Valid: true},
+			OriginSettingsFlowID: uuid.NullUUID{UUID: sfB.ID, Valid: true},
+			NewAddressValue:      newAddr, NewAddressVia: string(identity.AddressTypeEmail),
+			OriginalTraitsHash: identity.HashTraits(json.RawMessage(identB.Traits)),
+			ProposedTraits:     json.RawMessage(`{"email":"` + newAddr + `"}`),
+			VerificationFlowID: fB.ID, Status: identity.PendingTraitsChangeStatusPending,
+		}
+		require.NoError(t, reg.PendingTraitsChangePersister().CreatePendingTraitsChange(ctx, ptcB))
+
+		rawCodeA := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode: rawCodeA, ExpiresIn: time.Hour, VerifiableAddress: ptcA, FlowID: fA.ID,
+		})
+		require.NoError(t, err)
+
+		rawCodeB := code.GenerateCode()
+		_, err = reg.VerificationCodePersister().CreateVerificationCode(ctx, &code.CreateVerificationCodeParams{
+			RawCode: rawCodeB, ExpiresIn: time.Hour, VerifiableAddress: ptcB, FlowID: fB.ID,
+		})
+		require.NoError(t, err)
+
+		// Identity A verifies first — succeeds, address is now owned by A.
+		clA := testhelpers.NewClientWithCookies(t)
+		resA, err := clA.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+fA.ID.String(),
+			url.Values{"code": {rawCodeA}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		bodyA := string(ioutilx.MustReadAll(resA.Body))
+		require.NoError(t, resA.Body.Close())
+		require.Equal(t, http.StatusOK, resA.StatusCode)
+		assert.EqualValues(t, "passed_challenge", gjson.Get(bodyA, "state").String(), "identity A should pass: %s", bodyA)
+
+		// Identity B verifies second — address already claimed, should get duplicate credentials error.
+		clB := testhelpers.NewClientWithCookies(t)
+		resB, err := clB.PostForm(public.URL+verification.RouteSubmitFlow+"?flow="+fB.ID.String(),
+			url.Values{"code": {rawCodeB}, "csrf_token": {nosurfx.FakeCSRFToken}})
+		require.NoError(t, err)
+		bodyB := string(ioutilx.MustReadAll(resB.Body))
+		require.NoError(t, resB.Body.Close())
+
+		require.Equal(t, http.StatusOK, resB.StatusCode)
+		assert.EqualValues(t, "sent_email", gjson.Get(bodyB, "state").String(), "identity B should stay on verification: %s", bodyB)
+		assert.Contains(t, bodyB, "An account with the same identifier (email, phone, username, ...) exists already.", "identity B should see duplicate credentials error: %s", bodyB)
+
+		// Identity B tries to resend — the resend path re-checks uniqueness and shows the same error again.
+		// Pre-seed the CSRF cookie so EnsureCSRF passes for the resend path.
+		csrfURL, csrfCookies := nosurfx.WithFakeCSRFCookie(t, reg, public.URL)
+		clB.Jar.SetCookies(csrfURL, csrfCookies)
+		resendBody := url.Values{"email": {newAddr}, "csrf_token": {nosurfx.FakeCSRFToken}, "method": {"code"}}.Encode()
+		resendReq, err := http.NewRequest(http.MethodPost,
+			public.URL+verification.RouteSubmitFlow+"?flow="+fB.ID.String(),
+			strings.NewReader(resendBody))
+		require.NoError(t, err)
+		resendReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resendReq.Header.Set("Accept", "application/json")
+		resResend, err := clB.Do(resendReq)
+		require.NoError(t, err)
+		bodyResend := string(ioutilx.MustReadAll(resResend.Body))
+		require.NoError(t, resResend.Body.Close())
+
+		require.Equal(t, http.StatusBadRequest, resResend.StatusCode, "resend should return 400 duplicate credentials: %s", bodyResend)
+		assert.EqualValues(t, fB.ID.String(), gjson.Get(bodyResend, "id").String(), "resend should stay on the same flow: %s", bodyResend)
+		assert.Contains(t, bodyResend, "An account with the same identifier (email, phone, username, ...) exists already.", "resend should repeat the duplicate credentials error: %s", bodyResend)
+
+		// Identity B's traits must be unchanged.
+		unchangedB, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(ctx, identB.ID)
+		require.NoError(t, err)
+		assert.EqualValues(t, "race-b@ory.sh", gjson.GetBytes([]byte(unchangedB.Traits), "email").String())
 	})
 }

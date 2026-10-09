@@ -13,6 +13,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 
 	hydraclientgo "github.com/ory/hydra-client-go/v2"
 	"github.com/ory/kratos/driver/config"
@@ -21,8 +22,10 @@ import (
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/pop/v6"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -135,8 +138,19 @@ type Flow struct {
 
 var _ flow.Flow = new(Flow)
 
-func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, ft flow.Type) (*Flow, error) {
-	now := time.Now().UTC()
+// flowDependencies are the dependencies NewFlow needs to construct a
+// registration flow: the configuration (for the lifespan and return-to
+// validation), the clock, and the CSRF token generator.
+type flowDependencies interface {
+	config.Provider
+	clock.Provider
+	nosurfx.CSRFTokenGeneratorProvider
+}
+
+func NewFlow(reg flowDependencies, r *http.Request, ft flow.Type) (*Flow, error) {
+	conf := reg.Config()
+	now := reg.Clock().Now().UTC()
+	exp := conf.SelfServiceFlowRegistrationRequestLifespan(r.Context())
 	id := x.NewUUID()
 
 	// Pre-validate the return to URL which is contained in the HTTP request.
@@ -164,7 +178,7 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 		}
 	}
 
-	return &Flow{
+	f := &Flow{
 		ID:                   id,
 		OAuth2LoginChallenge: hlc,
 		ExpiresAt:            now.Add(exp),
@@ -174,32 +188,37 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 			Method: "POST",
 			Action: flow.AppendFlowTo(urlx.AppendPaths(conf.SelfPublicURL(r.Context()), RouteSubmitFlow), id).String(),
 		},
-		CSRFToken:       csrf,
+		CSRFToken:       reg.GenerateCSRFToken(r),
 		Type:            ft,
 		InternalContext: []byte("{}"),
 		State:           flow.StateChooseMethod,
 		IdentitySchema:  flow.IdentitySchema(identitySchema),
-	}, nil
+	}
+	if err := flow.SetRequestBaseURL(f, x.BaseURLStringFromContext(r.Context())); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
-func (Flow) TableName() string                                { return "selfservice_registration_flows" }
-func (f Flow) GetID() uuid.UUID                               { return f.ID }
-func (f *Flow) AppendTo(src *url.URL) *url.URL                { return flow.AppendFlowTo(src, f.ID) }
-func (f *Flow) GetType() flow.Type                            { return f.Type }
-func (f *Flow) GetRequestURL() string                         { return f.RequestURL }
-func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage      { return f.InternalContext }
-func (f *Flow) SetInternalContext(bytes sqlxx.JSONRawMessage) { f.InternalContext = bytes }
-func (f *Flow) GetUI() *container.Container                   { return f.UI }
-func (f *Flow) GetState() State                               { return f.State }
-func (Flow) GetFlowName() flow.FlowName                       { return flow.RegistrationFlow }
-func (f *Flow) SetState(state State)                          { f.State = state }
-func (f *Flow) GetTransientPayload() json.RawMessage          { return f.TransientPayload }
-func (f *Flow) SetReturnToVerification(to string)             { f.ReturnToVerification = to }
-func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString     { return f.OAuth2LoginChallenge }
+func (Flow) TableName() string                                          { return "selfservice_registration_flows" }
+func (f Flow) GetID() uuid.UUID                                         { return f.ID }
+func (f *Flow) AppendTo(src *url.URL) *url.URL                          { return flow.AppendFlowTo(src, f.ID) }
+func (f *Flow) GetType() flow.Type                                      { return f.Type }
+func (f *Flow) GetRequestURL() string                                   { return f.RequestURL }
+func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage                { return f.InternalContext }
+func (f *Flow) SetInternalContext(bytes sqlxx.JSONRawMessage)           { f.InternalContext = bytes }
+func (f *Flow) GetUI() *container.Container                             { return f.UI }
+func (f *Flow) GetState() State                                         { return f.State }
+func (Flow) GetFlowName() flow.FlowName                                 { return flow.RegistrationFlow }
+func (f *Flow) SetState(state State)                                    { f.State = state }
+func (f *Flow) GetTransientPayload() json.RawMessage                    { return f.TransientPayload }
+func (f *Flow) SetReturnToVerification(to string)                       { f.ReturnToVerification = to }
+func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString               { return f.OAuth2LoginChallenge }
+func (f *Flow) GetHydraLoginRequest() *hydraclientgo.OAuth2LoginRequest { return f.HydraLoginRequest }
 
-func (f *Flow) Valid() error {
-	if f.ExpiresAt.Before(time.Now()) {
-		return errors.WithStack(flow.NewFlowExpiredError(f.ExpiresAt))
+func (f *Flow) Valid(c clock.Clock) error {
+	if f.ExpiresAt.Before(c.Now()) {
+		return errors.WithStack(flow.NewFlowExpiredError(c, f.ExpiresAt))
 	}
 	return nil
 }
@@ -208,6 +227,27 @@ func (f *Flow) EnsureInternalContext() {
 	if !gjson.ParseBytes(f.InternalContext).IsObject() {
 		f.InternalContext = []byte("{}")
 	}
+}
+
+const internalContextAccountLinkingPath = "converted_for_account_linking"
+
+// MarkAsAccountLinking records in the flow's internal context that this
+// registration flow was created internally by converting a login flow to
+// perform account linking. Such flows may exist while registration is
+// disabled, but must never create a new identity in that case.
+func (f *Flow) MarkAsAccountLinking() {
+	f.EnsureInternalContext()
+	// The path is a constant and the internal context is guaranteed to be a
+	// JSON object at this point, so this cannot fail.
+	if bytes, err := sjson.SetBytes(f.InternalContext, internalContextAccountLinkingPath, true); err == nil {
+		f.InternalContext = bytes
+	}
+}
+
+// IsAccountLinking returns true if this registration flow was created
+// internally by converting a login flow to perform account linking.
+func (f *Flow) IsAccountLinking() bool {
+	return gjson.GetBytes(f.InternalContext, internalContextAccountLinkingPath).Bool()
 }
 
 func (f Flow) MarshalJSON() ([]byte, error) {

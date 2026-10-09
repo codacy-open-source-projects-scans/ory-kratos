@@ -12,11 +12,10 @@ import (
 
 	"github.com/dghubble/oauth1"
 	"github.com/pkg/errors"
-
-	"github.com/ory/herodot"
-
 	"golang.org/x/oauth2"
 
+	"github.com/ory/herodot"
+	"github.com/ory/kratos/selfservice/strategy/oidc/oidcerr"
 	"github.com/ory/kratos/x"
 )
 
@@ -118,10 +117,10 @@ func (l *Locale) UnmarshalJSON(data []byte) error {
 // Validate checks if the claims are valid.
 func (c *Claims) Validate() error {
 	if c.Subject == "" {
-		return errors.WithStack(herodot.ErrUpstreamError().WithReasonf("provider did not return a subject"))
+		return oidcerr.Wrap(oidcerr.StepClaimsDecode, errors.WithStack(herodot.ErrUpstreamError().WithReasonf("provider did not return a subject")))
 	}
 	if c.Issuer == "" {
-		return errors.WithStack(herodot.ErrUpstreamError().WithReasonf("issuer not set in claims"))
+		return oidcerr.Wrap(oidcerr.StepClaimsDecode, errors.WithStack(herodot.ErrUpstreamError().WithReasonf("issuer not set in claims")))
 	}
 	return nil
 }
@@ -133,17 +132,21 @@ func (c *Claims) Validate() error {
 // this function also validates the parameters to prevent any potential security issues.
 //
 // Allowed parameters are:
-// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
 // - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
 // - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
 // - `auth_type` (string): The `auth_type` parameter specifies the requested authentication features (as a comma-separated list), e.g. `reauthenticate`.
+// - `acr_values` (string): The `acr_values` specifies the Authentication Context Class Reference values for the authorization request.
+//
+// `login_hint` is intentionally not forwarded. A caller-supplied value cannot be
+// trusted, and on IdPs that act on it (Google, Microsoft, Auth0, …) it can steer
+// account, tenant, or OAuth client selection and enable a client-swap attack
+// (HackerOne #3239672, ory-corp/cloud#8955).
 func UpstreamParameters(upstreamParameters map[string]string) []oauth2.AuthCodeOption {
 	// validation of upstream parameters are already handled in the `oidc/.schema/link.schema.json` and `oidc/.schema/settings.schema.json` file.
 	// `upstreamParameters` will always only contain allowed parameters based on the configuration.
 
 	// we double-check the parameters here to prevent any potential security issues.
 	allowedParameters := map[string]struct{}{
-		"login_hint": {},
 		"hd":         {},
 		"prompt":     {},
 		"auth_type":  {},
@@ -152,9 +155,10 @@ func UpstreamParameters(upstreamParameters map[string]string) []oauth2.AuthCodeO
 
 	var params []oauth2.AuthCodeOption
 	for up, v := range upstreamParameters {
-		if _, ok := allowedParameters[up]; ok {
-			params = append(params, oauth2.SetAuthURLParam(up, v))
+		if _, ok := allowedParameters[up]; !ok {
+			continue
 		}
+		params = append(params, oauth2.SetAuthURLParam(up, v))
 	}
 
 	return params

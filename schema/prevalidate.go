@@ -11,49 +11,19 @@ import (
 	"strings"
 )
 
-// Limits applied to identity schemas before they reach the upstream
-// jsonschema compiler. These bound the worst-case CPU and memory cost of
-// compiling a customer-supplied schema, regardless of upstream behavior.
-//
-// The thresholds are intentionally conservative compared to realistic
-// identity schemas (which rarely exceed 5-10 levels of nesting and 50
-// properties). Operators with legitimate schemas above these limits should
-// raise the bug rather than chase the cap.
-const (
-	// MaxSchemaBodyBytes caps the raw byte size of an identity schema fetched
-	// from any source. Documents above this size cannot be cached or
-	// compiled.
-	MaxSchemaBodyBytes = 1 << 20 // 1 MiB
-
-	// MaxSchemaNestingDepth caps the depth of nested objects/arrays inside
-	// the parsed schema document. The upstream compiler has no depth cap;
-	// Go stdlib's json.Decoder caps at 10000, but that is far above any
-	// realistic identity schema.
-	MaxSchemaNestingDepth = 32
-
-	// MaxSchemaObjectKeys caps the number of keys in any single object in
-	// the schema document, including `properties`, `patternProperties`,
-	// `$defs`, and `definitions`. Each property compiles to a *Schema node.
-	MaxSchemaObjectKeys = 1024
-
-	// MaxSchemaArrayElements caps the length of any array in the schema
-	// document, including `allOf`, `anyOf`, `oneOf`, and tuple `items`.
-	MaxSchemaArrayElements = 128
-
-	// MaxSchemaTotalNodes caps the total number of map+array nodes in the
-	// document. Acts as a final backstop against schemas that stay within
-	// per-level limits but compose them to produce a huge tree.
-	MaxSchemaTotalNodes = 8192
-)
+// MaxSchemaBodyBytes caps the raw byte size of an identity schema fetched
+// from any source. Documents above this size cannot be cached or compiled.
+// The cap protects against memory exhaustion from a customer-controlled URL
+// returning an arbitrarily large body. It is independent of the schema's
+// internal structure: realistic identity schemas are well under this limit.
+const MaxSchemaBodyBytes = 1 << 20 // 1 MiB.
 
 // preValidateSchema walks a parsed identity schema document and rejects
-// patterns that would let a customer-supplied schema crash kratos or pin
-// pathological resources at compile or validate time.
+// patterns that would let a customer-supplied schema crash kratos at
+// compile or validate time.
 //
 // Specifically, this function rejects:
 //
-//   - A schema body whose decoded structure exceeds MaxSchemaNestingDepth,
-//     MaxSchemaObjectKeys, MaxSchemaArrayElements, or MaxSchemaTotalNodes.
 //   - Any cycle in the document's `$ref` chain graph: a sequence of `$ref`
 //     nodes P₀ → P₁ → … → Pₙ → P₀ in which every step is a `$ref`. The
 //     upstream compiler memoizes ref resolution to terminate compilation,
@@ -72,20 +42,20 @@ const (
 // recursion is bounded by JSON parser depth. Detecting the dangerous
 // pure-ref subgraph is the goal.
 //
-// The function is generic over schema dialects and structural keywords:
-// limits are applied to every map and array in the parsed tree, regardless
-// of whether the surrounding keyword is `properties`, `default`, or
-// anything else. This is intentional defense-in-depth.
+// This function does not bound the schema's structural size (nesting
+// depth, key count, array arity). Realistic identity schemas vary widely,
+// and bounding them at the loader layer rejected legitimate documents.
+// The body size cap (MaxSchemaBodyBytes) plus Go stdlib's JSON nesting
+// limit (10000) provide the structural backstop.
 func preValidateSchema(doc any) error {
 	v := &preValidator{refs: map[string]string{}}
-	if err := v.walk(doc, 0, ""); err != nil {
+	if err := v.walk(doc, ""); err != nil {
 		return err
 	}
 	return v.detectRefCycles()
 }
 
 type preValidator struct {
-	nodes int
 	// refs maps each `$ref` location's JSON-pointer path to its target
 	// JSON-pointer path. Targets that cannot be resolved as in-document
 	// fragments (external URLs, malformed refs) are excluded — those go
@@ -93,21 +63,9 @@ type preValidator struct {
 	refs map[string]string
 }
 
-func (p *preValidator) walk(v any, depth int, path string) error {
-	if depth > MaxSchemaNestingDepth {
-		return fmt.Errorf("identity schema rejected: nesting depth exceeds %d", MaxSchemaNestingDepth)
-	}
-
+func (p *preValidator) walk(v any, path string) error {
 	switch v := v.(type) {
 	case map[string]any:
-		p.nodes++
-		if p.nodes > MaxSchemaTotalNodes {
-			return fmt.Errorf("identity schema rejected: total node count exceeds %d", MaxSchemaTotalNodes)
-		}
-		if len(v) > MaxSchemaObjectKeys {
-			return fmt.Errorf("identity schema rejected: object key count %d exceeds %d", len(v), MaxSchemaObjectKeys)
-		}
-
 		// Record `$ref` for cycle detection in detectRefCycles. Root
 		// pointers (`#`, `#/`, empty) map to the empty path. Anything
 		// without a `#/` prefix is external — out of scope here;
@@ -140,21 +98,14 @@ func (p *preValidator) walk(v any, depth int, path string) error {
 		}
 
 		for k, sub := range v {
-			if err := p.walk(sub, depth+1, path+"/"+escapeJSONPointer(k)); err != nil {
+			if err := p.walk(sub, path+"/"+escapeJSONPointer(k)); err != nil {
 				return err
 			}
 		}
 
 	case []any:
-		p.nodes++
-		if p.nodes > MaxSchemaTotalNodes {
-			return fmt.Errorf("identity schema rejected: total node count exceeds %d", MaxSchemaTotalNodes)
-		}
-		if len(v) > MaxSchemaArrayElements {
-			return fmt.Errorf("identity schema rejected: array element count %d exceeds %d", len(v), MaxSchemaArrayElements)
-		}
 		for i, sub := range v {
-			if err := p.walk(sub, depth+1, path+"/"+strconv.Itoa(i)); err != nil {
+			if err := p.walk(sub, path+"/"+strconv.Itoa(i)); err != nil {
 				return err
 			}
 		}
@@ -181,7 +132,7 @@ func (p *preValidator) detectRefCycles() error {
 		for {
 			if _, ok := visited[cur]; ok {
 				idx := slices.Index(chain, cur)
-				cycle := append(slices.Clone(chain[idx:]), cur)
+				cycle := append(chain[idx:], cur)
 				return fmt.Errorf("identity schema rejected: self-referential $ref cycle: %s",
 					formatRefCycle(cycle))
 			}

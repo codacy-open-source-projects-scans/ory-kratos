@@ -6,9 +6,13 @@ package identity
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"maps"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -18,7 +22,6 @@ import (
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3"
@@ -209,7 +212,8 @@ LIMIT ?`,
 	result := PreferExactMatch(res, identifier, func(r struct {
 		IdentityID uuid.UUID `db:"identity_id"`
 		Identifier string    `db:"identifier"`
-	}) string {
+	},
+	) string {
 		return r.Identifier
 	})
 	if len(res) > 1 {
@@ -285,7 +289,8 @@ func (p *IdentityPersister) FindByCredentialsIdentifier(ctx context.Context, ct 
 	result := PreferExactMatch(res, match, func(r struct {
 		IdentityID uuid.UUID `db:"identity_id"`
 		Identifier string    `db:"identifier"`
-	}) string {
+	},
+	) string {
 		return r.Identifier
 	})
 	if len(res) > 1 {
@@ -359,28 +364,42 @@ LIMIT 1`, columns,
 	return &id, nil
 }
 
-func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, identities ...*identity.Identity) (err error) {
+func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, extraColumns []identity.ExtraColumn, identities ...*identity.Identity) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.createIdentityCredentials",
 		trace.WithAttributes(
 			attribute.Int("num_identities", len(identities)),
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
 
+	type credentialSlot struct {
+		ident *identity.Identity
+		key   identity.CredentialsType
+	}
+
 	var (
 		nid         = p.NetworkID(ctx)
 		traceConn   = &batch.TracerConnection{Tracer: p.r.Tracer(ctx), Connection: p.GetConnection(ctx)}
 		credentials []*identity.Credentials
+		slots       = map[*identity.Credentials]credentialSlot{}
 		identifiers []*identity.CredentialIdentifier
 	)
 
 	var opts []batch.CreateOpts
+	if len(extraColumns) > 0 {
+		// Extra columns are values the caller already knows for columns that are
+		// not part of the OSS model (e.g. crdb_region on CockroachDB
+		// multi-region). Writing them with the insert avoids the server-side
+		// fallback (a column default or a lookup derived from a foreign key),
+		// which for region columns costs a cross-region round trip per statement.
+		opts = append(opts, batch.WithExtraColumns(extraColumns))
+	}
 	if len(identities) > 1 {
 		opts = append(opts, batch.WithPartialInserts)
 	}
 
 	for _, ident := range identities {
 		for k := range ident.Credentials {
-			cred := ident.Credentials[k]
+			cred := new(ident.Credentials[k])
 
 			if len(cred.Config) == 0 {
 				cred.Config = sqlxx.JSONRawMessage("{}")
@@ -391,19 +410,39 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, ident
 				return err
 			}
 
-			cred.ID, err = uuid.NewV4()
-			if err != nil {
-				return err
-			}
 			cred.IdentityID = ident.ID
 			cred.NID = nid
 			cred.IdentityCredentialTypeID = ct
-			credentials = append(credentials, &cred)
 
-			ident.Credentials[k] = cred
+			// TOTP and lookup-secret AAL2 logins resolve the credential by
+			// joining identity_credential_identifiers, using the identity ID
+			// as the identifier (see selfservice/strategy/{totp,lookup}/
+			// login.go and settings.go). The admin import path does not
+			// provide an identifier, and at import time the identity ID may
+			// still be the zero value (CockroachDB assigns it via
+			// gen_random_uuid() during the identity insert). At this point
+			// ident.ID is the persisted identity ID, so default the
+			// identifier here to keep AAL2 login working for imported
+			// credentials. See https://github.com/ory/kratos/issues/4561.
+			if len(cred.Identifiers) == 0 &&
+				(cred.Type == identity.CredentialsTypeTOTP ||
+					cred.Type == identity.CredentialsTypeLookup) {
+				cred.Identifiers = []string{ident.ID.String()}
+			}
+
+			credentials = append(credentials, cred)
+			slots[cred] = credentialSlot{ident: ident, key: k}
 		}
 	}
-	if err = batch.Create(ctx, traceConn, credentials, opts...); err != nil {
+
+	err = batch.Create(ctx, traceConn, credentials, opts...)
+
+	for _, cred := range credentials {
+		slot := slots[cred]
+		slot.ident.Credentials[slot.key] = *cred
+	}
+
+	if err != nil {
 		return err
 	}
 
@@ -439,7 +478,7 @@ func (p *IdentityPersister) createIdentityCredentials(ctx context.Context, ident
 	return nil
 }
 
-func (p *IdentityPersister) createVerifiableAddresses(ctx context.Context, conn *pop.Connection, identities ...*identity.Identity) (err error) {
+func (p *IdentityPersister) createVerifiableAddresses(ctx context.Context, conn *pop.Connection, extraColumns []identity.ExtraColumn, identities ...*identity.Identity) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.createVerifiableAddresses",
 		trace.WithAttributes(
 			attribute.Int("num_identities", len(identities)),
@@ -453,6 +492,14 @@ func (p *IdentityPersister) createVerifiableAddresses(ctx context.Context, conn 
 		}
 	}
 	var opts []batch.CreateOpts
+	if len(extraColumns) > 0 {
+		// Extra columns are values the caller already knows for columns that are
+		// not part of the OSS model (e.g. crdb_region on CockroachDB
+		// multi-region). Writing them with the insert avoids the server-side
+		// fallback (a column default or a lookup derived from a foreign key),
+		// which for region columns costs a cross-region round trip per statement.
+		opts = append(opts, batch.WithExtraColumns(extraColumns))
+	}
 	if len(identities) > 1 {
 		opts = append(opts, batch.WithPartialInserts)
 	}
@@ -465,7 +512,7 @@ type differ interface {
 	GetID() uuid.UUID
 }
 
-func updateAssociationWith[T differ](ctx context.Context, p *IdentityPersister, fromDatabase, updateTo []T,
+func updateAssociationWith[T differ](ctx context.Context, p *IdentityPersister, extraColumns []identity.ExtraColumn, fromDatabase, updateTo []T,
 ) (result []T, err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.updateAssociationWith",
 		trace.WithAttributes(
@@ -484,12 +531,22 @@ func updateAssociationWith[T differ](ctx context.Context, p *IdentityPersister, 
 	}
 
 	if len(toCreate) > 0 {
+		var opts []batch.CreateOpts
+		if len(extraColumns) > 0 {
+			// Extra columns are values the caller already knows for columns that are
+			// not part of the OSS model (e.g. crdb_region on CockroachDB
+			// multi-region). Writing them with the insert avoids the server-side
+			// fallback (a column default or a lookup derived from a foreign key),
+			// which for region columns costs a cross-region round trip per statement.
+			opts = append(opts, batch.WithExtraColumns(extraColumns))
+		}
 		if err := batch.Create(ctx,
 			&batch.TracerConnection{
 				Tracer:     p.r.Tracer(ctx),
 				Connection: p.GetConnection(ctx),
 			},
 			toCreate,
+			opts...,
 		); err != nil {
 			return nil, err
 		}
@@ -506,7 +563,7 @@ func updateAssociationWith[T differ](ctx context.Context, p *IdentityPersister, 
 	return result, nil
 }
 
-func updateAssociation[T differ](ctx context.Context, p *IdentityPersister, i *identity.Identity, inID []T,
+func updateAssociation[T differ](ctx context.Context, p *IdentityPersister, extraColumns []identity.ExtraColumn, i *identity.Identity, inID []T,
 ) (result []T, err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.updateAssociation",
 		trace.WithAttributes(
@@ -521,10 +578,10 @@ func updateAssociation[T differ](ctx context.Context, p *IdentityPersister, i *i
 		return nil, sqlcon.HandleError(err)
 	}
 
-	return updateAssociationWith(ctx, p, inDB, inID)
+	return updateAssociationWith(ctx, p, extraColumns, inDB, inID)
 }
 
-func (p *IdentityPersister) updateCredentialsAssociation(ctx context.Context, identityID uuid.UUID, fromDatabase []identity.Credentials, updateTo []identity.Credentials) (result map[identity.CredentialsType]identity.Credentials, err error) {
+func (p *IdentityPersister) updateCredentialsAssociation(ctx context.Context, extraColumns []identity.ExtraColumn, identityID uuid.UUID, fromDatabase []identity.Credentials, updateTo []identity.Credentials) (result map[identity.CredentialsType]identity.Credentials, err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.updateCredentialsAssociation",
 		trace.WithAttributes(
 			attribute.Stringer("identity.id", identityID),
@@ -551,6 +608,8 @@ func (p *IdentityPersister) updateCredentialsAssociation(ctx context.Context, id
 		// Delete the credential and its identifiers.
 		conn := p.GetConnection(ctx)
 		q := "DELETE FROM identity_credentials WHERE nid = ? AND id IN (?)"
+		// This @index hint is CockroachDB-only; PostgreSQL and YugabyteDB use
+		// the unadorned table name.
 		if conn.Dialect.Name() == "cockroach" {
 			q = "DELETE FROM identity_credentials@primary WHERE nid = ? AND id IN (?)"
 		}
@@ -566,7 +625,7 @@ func (p *IdentityPersister) updateCredentialsAssociation(ctx context.Context, id
 	}
 
 	if len(credsToCreate) > 0 {
-		if err := p.createIdentityCredentials(ctx, &identity.Identity{
+		if err := p.createIdentityCredentials(ctx, extraColumns, &identity.Identity{
 			ID:          identityID,
 			Credentials: credsToCreate,
 		}); err != nil {
@@ -657,7 +716,7 @@ func (p *IdentityPersister) normalizeRecoveryAddresses(ctx context.Context, id *
 	}
 }
 
-func (p *IdentityPersister) createRecoveryAddresses(ctx context.Context, conn *pop.Connection, identities ...*identity.Identity) (err error) {
+func (p *IdentityPersister) createRecoveryAddresses(ctx context.Context, conn *pop.Connection, extraColumns []identity.ExtraColumn, identities ...*identity.Identity) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.createRecoveryAddresses",
 		trace.WithAttributes(
 			attribute.Int("num_identities", len(identities)),
@@ -673,6 +732,14 @@ func (p *IdentityPersister) createRecoveryAddresses(ctx context.Context, conn *p
 	}
 
 	var opts []batch.CreateOpts
+	if len(extraColumns) > 0 {
+		// Extra columns are values the caller already knows for columns that are
+		// not part of the OSS model (e.g. crdb_region on CockroachDB
+		// multi-region). Writing them with the insert avoids the server-side
+		// fallback (a column default or a lookup derived from a foreign key),
+		// which for region columns costs a cross-region round trip per statement.
+		opts = append(opts, batch.WithExtraColumns(extraColumns))
+	}
 	if len(identities) > 1 {
 		opts = append(opts, batch.WithPartialInserts)
 	}
@@ -700,15 +767,39 @@ func (p *IdentityPersister) CreateIdentity(ctx context.Context, ident *identity.
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
 
-	return p.CreateIdentities(ctx, ident)
+	return p.CreateIdentities(ctx, []*identity.Identity{ident})
 }
 
-func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...*identity.Identity) (err error) {
+// identitiesNeedPartialInserts reports whether a batch identity insert must use
+// partial inserts. Partial inserts pre-assign the ids so a conflicting row can
+// be correlated back to its input, which keeps the id client-generated instead
+// of database-generated.
+//
+// The only unique constraint on the identities table is on external_id (and it
+// is partial: it applies only when external_id is set). An identity insert can
+// therefore only conflict when an external_id is present, so partial inserts
+// are only needed when the batch has more than one row and at least one carries
+// an external_id. Otherwise a plain insert is enough; the downstream credential
+// and address inserts still use partial inserts to report their own conflicts.
+//
+// On a transaction retry, the ids generated during the first attempt (by the
+// database or by Go) remain on the in-memory structs, so the retried insert
+// reuses them instead of generating new ones. The identity pool contract test
+// covers this ("transaction retry" cases).
+func identitiesNeedPartialInserts(identities []*identity.Identity) bool {
+	return len(identities) > 1 && slices.ContainsFunc(identities, func(i *identity.Identity) bool {
+		return i.ExternalID != ""
+	})
+}
+
+func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities []*identity.Identity, opts ...identity.CreateIdentitiesModifier) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.CreateIdentities",
 		trace.WithAttributes(
 			attribute.Int("identities.count", len(identities)),
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
+
+	options := identity.NewCreateIdentitiesOptions(opts)
 
 	for _, ident := range identities {
 		ident.NID = p.NetworkID(ctx)
@@ -749,11 +840,14 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 		partialErr = nil
 		createdIdentities := make([]*identity.Identity, 0, len(identities))
 
-		var opts []batch.CreateOpts
-		if len(identities) > 1 {
-			opts = append(opts, batch.WithPartialInserts)
+		var batchOpts []batch.CreateOpts
+		if extras := options.ExtraColumns; len(extras) > 0 {
+			batchOpts = append(batchOpts, batch.WithExtraColumns(extras))
 		}
-		if err := batch.Create(ctx, conn, identities, opts...); err != nil {
+		if identitiesNeedPartialInserts(identities) {
+			batchOpts = append(batchOpts, batch.WithPartialInserts)
+		}
+		if err := batch.Create(ctx, conn, identities, batchOpts...); err != nil {
 			if partialErr := new(batch.PartialConflictError[identity.Identity]); errors.As(err, &partialErr) {
 				for _, k := range partialErr.Failed {
 					failedIdentityIDs[k.ID] = struct{ created bool }{false}
@@ -775,7 +869,7 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 
 		p.normalizeAllAddresses(ctx, createdIdentities...)
 
-		if err = p.createVerifiableAddresses(ctx, tx, createdIdentities...); err != nil {
+		if err = p.createVerifiableAddresses(ctx, tx, options.ExtraColumns, createdIdentities...); err != nil {
 			if partialErr := new(batch.PartialConflictError[identity.VerifiableAddress]); errors.As(err, &partialErr) {
 				for _, k := range partialErr.Failed {
 					failedIdentityIDs[k.IdentityID] = struct{ created bool }{true}
@@ -784,7 +878,7 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 				return sqlcon.HandleError(err)
 			}
 		}
-		if err = p.createRecoveryAddresses(ctx, tx, createdIdentities...); err != nil {
+		if err = p.createRecoveryAddresses(ctx, tx, options.ExtraColumns, createdIdentities...); err != nil {
 			if partialErr := new(batch.PartialConflictError[identity.RecoveryAddress]); errors.As(err, &partialErr) {
 				for _, k := range partialErr.Failed {
 					failedIdentityIDs[k.IdentityID] = struct{ created bool }{true}
@@ -793,20 +887,18 @@ func (p *IdentityPersister) CreateIdentities(ctx context.Context, identities ...
 				return sqlcon.HandleError(err)
 			}
 		}
-		if err = p.createIdentityCredentials(ctx, createdIdentities...); err != nil {
+		if err = p.createIdentityCredentials(ctx, options.ExtraColumns, createdIdentities...); err != nil {
 			if partialErr := new(batch.PartialConflictError[identity.Credentials]); errors.As(err, &partialErr) {
 				for _, k := range partialErr.Failed {
 					failedIdentityIDs[k.IdentityID] = struct{ created bool }{true}
 				}
 			} else if partialErr := new(batch.PartialConflictError[identity.CredentialIdentifier]); errors.As(err, &partialErr) {
 				for _, k := range partialErr.Failed {
-					credID := k.IdentityCredentialsID
-					for _, ident := range identities {
-						for _, cred := range ident.Credentials {
-							if cred.ID == credID {
-								failedIdentityIDs[ident.ID] = struct{ created bool }{true}
-							}
-						}
+					// The failed identifier carries the owning identity ID
+					// directly, so map it back without scanning every
+					// identity's credentials by ID.
+					if k.IdentityID != nil {
+						failedIdentityIDs[*k.IdentityID] = struct{ created bool }{true}
 					}
 				}
 			} else {
@@ -866,58 +958,32 @@ func (p *IdentityPersister) HydrateIdentityAssociations(ctx context.Context, i *
 
 	nid := p.NetworkID(ctx)
 
-	eg, ctx := errgroup.WithContext(ctx)
 	if expand.Has(identity.ExpandFieldRecoveryAddresses) {
-		eg.Go(func() error {
-			// We use WithContext to get a copy of the connection struct, which solves the race detector
-			// from complaining incorrectly.
-			//
-			// https://github.com/ory/pop/issues/723
-			if err := p.GetConnection(ctx).WithContext(ctx).
-				Where("identity_id = ? AND nid = ?", i.ID, nid).
-				Order("id ASC").
-				All(&i.RecoveryAddresses); err != nil {
-				return sqlcon.HandleError(err)
-			}
-			return nil
-		})
+		if err := p.GetConnection(ctx).
+			Where("identity_id = ? AND nid = ?", i.ID, nid).
+			Order("id ASC").
+			All(&i.RecoveryAddresses); err != nil {
+			return sqlcon.HandleError(err)
+		}
 	}
 
 	if expand.Has(identity.ExpandFieldVerifiableAddresses) {
-		eg.Go(func() error {
-			// We use WithContext to get a copy of the connection struct, which solves the race detector
-			// from complaining incorrectly.
-			//
-			// https://github.com/ory/pop/issues/723
-			if err := p.GetConnection(ctx).WithContext(ctx).
-				Order("id ASC").
-				Where("identity_id = ? AND nid = ?", i.ID, nid).
-				All(&i.VerifiableAddresses); err != nil {
-				return sqlcon.HandleError(err)
-			}
-			return nil
-		})
+		if err := p.GetConnection(ctx).
+			Order("id ASC").
+			Where("identity_id = ? AND nid = ?", i.ID, nid).
+			All(&i.VerifiableAddresses); err != nil {
+			return sqlcon.HandleError(err)
+		}
 	}
 
 	if expand.Has(identity.ExpandFieldCredentials) {
-		eg.Go(func() (err error) {
-			// We use WithContext to get a copy of the connection struct, which solves the race detector
-			// from complaining incorrectly.
-			//
-			// https://github.com/ory/pop/issues/723
-			creds, err := QueryForCredentials(p.GetConnection(ctx).WithContext(ctx),
-				Where{"identity_credentials.identity_id = ?", []interface{}{i.ID}},
-				Where{"identity_credentials.nid = ?", []interface{}{nid}})
-			if err != nil {
-				return err
-			}
-			i.Credentials = creds[i.ID]
-			return
-		})
-	}
-
-	if err := eg.Wait(); err != nil {
-		return err
+		creds, err := QueryForCredentials(p.GetConnection(ctx),
+			Where{"identity_credentials.identity_id = ?", []interface{}{i.ID}},
+			Where{"identity_credentials.nid = ?", []interface{}{nid}})
+		if err != nil {
+			return err
+		}
+		i.Credentials = creds[i.ID]
 	}
 
 	if err := i.Validate(); err != nil {
@@ -1016,7 +1082,8 @@ func identifiersTableNameWithIndexHint(con *pop.Connection) string {
 	case "mysql":
 		ici += " USE INDEX(identity_credential_identifiers_ici_nid_i_idx)"
 	default:
-		// good luck 🤷‍♂️
+		// PostgreSQL and YugabyteDB do not accept these dialect-specific index
+		// hint syntaxes.
 	}
 	return ici
 }
@@ -1057,6 +1124,10 @@ func (p *IdentityPersister) getCredentialTypeIDs(ctx context.Context, credential
 }
 
 func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.ListIdentityParameters) (_ []identity.Identity, nextPage *keysetpagination.Paginator, err error) {
+	if (params.ColumnsTransformer == nil) != (params.RowScanner == nil) {
+		return nil, nil, errors.New("ListIdentityParameters: ColumnsTransformer and RowScanner must be set together")
+	}
+
 	paginator := keysetpagination.GetPaginator(append(
 		params.KeySetPagination,
 		keysetpagination.WithDefaultToken(identity.DefaultPageToken()),
@@ -1080,6 +1151,16 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 		nextPage = nil
 
 		if err := crdbx.SetTransactionReadOnly(con); err != nil {
+			return err
+		}
+
+		// This transaction runs up to five statements (credential-type lookup,
+		// page query, expansion queries over the page's identities). At
+		// SERIALIZABLE, a concurrent write to any of those identities between
+		// statements forces a read-refresh over the whole page and retries the
+		// transaction when it fails; READ COMMITTED absorbs those conflicts
+		// per-statement on the server.
+		if err := crdbx.SetTransactionReadCommitted(con); err != nil {
 			return err
 		}
 
@@ -1152,19 +1233,37 @@ func (p *IdentityPersister) ListIdentities(ctx context.Context, params identity.
 		}
 
 		columns := popx.DBColumns[identity.Identity](&popx.AliasQuoter{Alias: "identities", Quoter: con.Dialect})
+		if params.ColumnsTransformer != nil {
+			columns = params.ColumnsTransformer(columns)
+		}
+
+		// DISTINCT is only needed when the credentials-identifier filter adds the
+		// INNER JOINs below: a single identity can match multiple identifier rows,
+		// which would otherwise produce duplicates. Without the joins, identities.id
+		// is the primary key, so every row is already unique and DISTINCT is pure
+		// overhead (a distinct processor over the wide traits/metadata columns).
+		distinct := ""
+		if joins != "" {
+			distinct = "DISTINCT "
+		}
 
 		query := fmt.Sprintf(`
-		SELECT DISTINCT %s
+		SELECT %s%s
 		FROM identities AS identities
 		%s
 		WHERE
 		%s
 		ORDER BY identities.id ASC
 		%s`,
-			columns,
+			distinct, columns,
 			joins, wheres, limit)
 
-		if err := con.RawQuery(query, args...).All(&is); err != nil {
+		if params.RowScanner != nil {
+			is, err = params.RowScanner(con, query, args)
+			if err != nil {
+				return sqlcon.HandleError(err)
+			}
+		} else if err := con.RawQuery(query, args...).All(&is); err != nil {
 			return sqlcon.HandleError(err)
 		}
 
@@ -1264,6 +1363,308 @@ func (p *IdentityPersister) UpdateIdentityColumns(ctx context.Context, i *identi
 	return nil
 }
 
+// credentialsConfigLockTimeout bounds how long UpdateCredentialsConfig waits
+// for the credential-row lock, so a flood of requests against one row cannot
+// park waiters on pooled connections until the pool is exhausted. Enforced
+// via context cancellation, which aborts a blocked statement and rolls back
+// the transaction. It does not apply to SQLite (see UpdateCredentialsConfig).
+const credentialsConfigLockTimeout = 5 * time.Second
+
+// UpdateCredentialsConfig atomically read-modify-writes a single
+// identity_credentials row's config under READ COMMITTED, holding an exclusive
+// row lock (SELECT ... FOR UPDATE) across the whole read-mutate-write cycle:
+// concurrent updates to the same row serialize and mutate always observes the
+// latest committed config.
+//
+// The isolation level is deliberate. Under CockroachDB SERIALIZABLE,
+// SELECT ... FOR UPDATE is only best-effort — a waiter may not queue behind the
+// holder — whereas under READ COMMITTED it is a durable, replicated lock that
+// behaves like the textbook Postgres/MySQL row lock. So here the lock, not the
+// isolation level, is the correctness mechanism: it is the sole defense against
+// a lost update, and any change that weakens it (reintroducing a join, an index
+// hint that changes the plan, dropping FOR UPDATE) is a silent correctness bug
+// rather than a throughput regression. This is safe because the operation is a
+// single-row read-modify-write with no cross-row invariant, so the other READ
+// COMMITTED anomalies (read skew, phantoms, write skew) cannot arise. On a
+// cluster without READ COMMITTED the request is upgraded back to SERIALIZABLE,
+// which is fail-safe here; on SQLite pop serializes whole transactions on an
+// in-process mutex, which subsumes the row lock, and the isolation option is
+// ignored.
+//
+// mutate maps the current config JSON to the new one; a structurally equal
+// result skips the write. It must be pure: it may run more than once if the
+// database retries the transaction. Calls inside a surrounding transaction
+// are rejected — the lock and its timeout must be scoped to the transaction
+// opened here.
+//
+// opts may narrow the row set with ExtraColumns, applied as equality
+// predicates to both statements. WithDerivedIdentifiers additionally syncs
+// the credential's identifier rows to the set derived from the post-mutation
+// config, inside the same transaction and lock; like mutate, derive may run
+// more than once on database retries.
+func (p *IdentityPersister) UpdateCredentialsConfig(ctx context.Context, identityID uuid.UUID, ct identity.CredentialsType, mutate func(config []byte) ([]byte, error), opts ...identity.UpdateCredentialsConfigModifier) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.UpdateCredentialsConfig",
+		trace.WithAttributes(
+			attribute.Stringer("identity.id", identityID),
+			attribute.Stringer("network.id", p.NetworkID(ctx)),
+			attribute.String("credentials.type", string(ct))))
+	defer otelx.End(span, &err)
+
+	// An ambient transaction would be reused by popx, extending the lock to
+	// its lifetime — fail loudly instead.
+	if popx.InTransaction(ctx) {
+		return errors.WithStack(herodot.ErrInternalServerError().WithReason("UpdateCredentialsConfig must not be called inside a surrounding transaction: its row lock and lock timeout are scoped to the transaction it opens itself"))
+	}
+
+	// The lock-wait budget does not apply to SQLite: pop serializes whole
+	// SQLite transactions on an in-process per-connection mutex, so the row
+	// lock the budget bounds on the cluster databases does not exist — and a
+	// mutation queued on that mutex behind unrelated transactions on a loaded
+	// machine (parallel test runs) would burn the budget waiting without
+	// holding any pooled connection. The caller's context still cancels.
+	if p.c.Dialect.Name() != "sqlite3" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, credentialsConfigLockTimeout)
+		defer cancel()
+	}
+
+	nid := p.NetworkID(ctx)
+
+	o := identity.NewUpdateCredentialsConfigOptions(opts)
+	var extraSQLBuilder strings.Builder
+	var extraArgs []any
+	for _, col := range o.ExtraColumns {
+		_, _ = fmt.Fprintf(&extraSQLBuilder, " AND %s = ?", col.K)
+		extraArgs = append(extraArgs, col.V)
+	}
+	extraSQL := extraSQLBuilder.String()
+
+	// READ COMMITTED so SELECT ... FOR UPDATE takes a real, durable row lock on
+	// CockroachDB (see the method doc). popx applies the isolation for
+	// Postgres/MySQL/CockroachDB and ignores it for SQLite.
+	txOpts := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	// Resolve the type id before the transaction (cached after the first
+	// load) so the locking SELECT touches only identity_credentials: a join
+	// under FOR UPDATE would lock the shared type row and serialize all
+	// updates of that type globally. Outside the transaction, because on
+	// SQLite a cache miss would take pop's statement mutex inside it (see
+	// the lock-order note below).
+	typeID, err := FindIdentityCredentialsTypeByName(p.c.WithContext(ctx), ct)
+	if err != nil {
+		return err
+	}
+
+	var wrote bool
+	if err := popx.TransactionWithOptions(ctx, p.c.WithContext(ctx), txOpts, func(ctx context.Context, tx *pop.Connection) error {
+		wrote = false
+
+		// No index hint: the locking SELECT matches
+		// identity_credentials_identity_id_idx. Forcing @primary would make
+		// it a full-scan locking read that locks every scanned row.
+		selectQuery := `
+		SELECT ic.id, ic.config
+		FROM identity_credentials ic
+		WHERE ic.identity_id = ?
+		  AND ic.nid = ?
+		  AND ic.identity_credential_type_id = ?` + extraSQL + `
+		FOR UPDATE`
+		selectArgs := append([]any{identityID, nid, typeID}, extraArgs...)
+
+		var row struct {
+			ID     uuid.UUID            `db:"id"`
+			Config sqlxx.JSONRawMessage `db:"config"`
+		}
+		if tx.Dialect.Name() == "sqlite3" {
+			// SQLite has no FOR UPDATE; pop serializes whole SQLite
+			// transactions on an in-process mutex instead. That mutex does
+			// not cover plain single-statement writes (e.g. flow updates
+			// during a login burst), which commit freely while this
+			// transaction is open, and this read-then-write transaction is
+			// unsound against them in WAL mode: a deferred transaction takes
+			// its read snapshot at the first SELECT and upgrades to writer at
+			// the UPDATE, and if anything committed in between the upgrade
+			// fails immediately with SQLITE_BUSY_SNAPSHOT — busy_timeout
+			// cannot help a stale snapshot, and enough write traffic exhausts
+			// the retry budget in TransactionWithOptions. A no-op write as
+			// the transaction's first statement acquires the write lock up
+			// front (the in-transaction equivalent of BEGIN IMMEDIATE), so
+			// the snapshot is taken with the lock already held and concurrent
+			// writers wait on busy_timeout instead.
+			if err := tx.RawQuery("UPDATE identity_credentials SET id = id WHERE 1 = 0").Exec(); err != nil {
+				return sqlcon.HandleError(err)
+			}
+
+			// Read via the underlying sqlx transaction, not pop's finders:
+			// pop wraps SQLite reads in a process-wide statement mutex, which
+			// a concurrent model write may hold while it busy-waits on the
+			// very write lock the barrier above just took. Taking that mutex
+			// here, with the write lock held, would invert the lock order and
+			// park both sides until the busy timeout expires.
+			if err := tx.TX.GetContext(ctx, &row, `
+			SELECT ic.id, ic.config
+			FROM identity_credentials ic
+			WHERE ic.identity_id = ?
+			  AND ic.nid = ?
+			  AND ic.identity_credential_type_id = ?`+extraSQL, selectArgs...); err != nil {
+				return sqlcon.HandleError(err)
+			}
+		} else if err := tx.RawQuery(selectQuery, selectArgs...).First(&row); err != nil {
+			return sqlcon.HandleError(err)
+		}
+
+		newConfig, err := mutate(row.Config)
+		if err != nil {
+			return err
+		}
+
+		// A no-op mutation needs no write; the lock still linearizes it with
+		// concurrent writers.
+		if !jsonContentEqual(row.Config, newConfig) {
+			updateQuery := `
+			UPDATE identity_credentials
+			SET config = ?
+			WHERE id = ? AND nid = ?` + extraSQL
+
+			updateArgs := append([]any{sqlxx.JSONRawMessage(newConfig), row.ID, nid}, extraArgs...)
+			if err := tx.RawQuery(updateQuery, updateArgs...).Exec(); err != nil {
+				return sqlcon.HandleError(err)
+			}
+			wrote = true
+		}
+
+		// The identifier rows are derived state of the config; sync them under
+		// the same lock even when the config write was skipped as a no-op, so
+		// a previously diverged set converges.
+		if o.DeriveIdentifiers != nil {
+			derived, err := o.DeriveIdentifiers(newConfig)
+			if err != nil {
+				return err
+			}
+			conn := &batch.TracerConnection{Tracer: p.r.Tracer(ctx), Connection: tx}
+			proto := identity.CredentialIdentifier{
+				IdentityID:                new(identityID),
+				IdentityCredentialsID:     row.ID,
+				IdentityCredentialsTypeID: typeID,
+				NID:                       nid,
+			}
+			changed, err := syncDerivedIdentifiers(ctx, conn, ct, proto, derived, o.ExtraColumns)
+			if err != nil {
+				return err
+			}
+			// An identifier-only change still updates the identity.
+			wrote = wrote || changed
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Only a real write is an identity update; the no-op path changed nothing.
+	if wrote {
+		span.AddEvent(events.NewIdentityUpdated(ctx, identityID))
+	}
+	return nil
+}
+
+// jsonContentEqual reports whether a and b encode structurally equal JSON
+// documents. Byte equality is not enough: databases normalize stored JSON
+// (jsonb key order on PostgreSQL/CockroachDB, binary JSON on MySQL), so a
+// re-marshaled but semantically unchanged config rarely matches byte-for-byte.
+func jsonContentEqual(a, b []byte) bool {
+	var av, bv any
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
+}
+
+// syncDerivedIdentifiers reconciles a credential row's identifier rows with
+// the derived set, inside the caller's locked transaction, and reports
+// whether any row changed. proto is the template for inserted rows: the
+// credential/type/identity/network references are already set, and each
+// insert copies it and fills in ID and Identifier. Identifiers are
+// normalized like createIdentityCredentials does; an unchanged set writes
+// nothing, a changed set is replaced wholesale. extra narrows the read and
+// the delete like the caller's config statements and is written explicitly
+// on the inserts (the cloud multi-region persister pins crdb_region; the
+// explicit write spares the infer_rbr_region_col_using_constraint lookup,
+// mirroring UpdateIdentity).
+func syncDerivedIdentifiers(ctx context.Context, conn *batch.TracerConnection, ct identity.CredentialsType, proto identity.CredentialIdentifier, derived []string, extra []identity.ExtraColumn) (changed bool, err error) {
+	tx := conn.Connection
+
+	var extraSQLBuilder strings.Builder
+	extraArgs := make([]any, 0, len(extra))
+	for _, col := range extra {
+		_, _ = fmt.Fprintf(&extraSQLBuilder, " AND %s = ?", col.K)
+		extraArgs = append(extraArgs, col.V)
+	}
+	extraSQL := extraSQLBuilder.String()
+
+	target := make([]string, 0, len(derived))
+	for _, identifier := range derived {
+		identifier = NormalizeIdentifier(ct, identifier)
+		if identifier == "" {
+			return false, errors.WithStack(herodot.ErrMisconfiguration().WithReason("Unable to sync identity credential identifiers with missing or empty identifier."))
+		}
+		target = append(target, identifier)
+	}
+	slices.Sort(target)
+	target = slices.Compact(target)
+
+	var rows []struct {
+		Identifier string `db:"identifier"`
+	}
+	readQuery := `SELECT identifier FROM identity_credential_identifiers WHERE identity_credential_id = ? AND nid = ?` + extraSQL
+	readArgs := append([]any{proto.IdentityCredentialsID, proto.NID}, extraArgs...)
+	if tx.Dialect.Name() == "sqlite3" {
+		// Read via the underlying sqlx transaction, not pop's finders: this
+		// transaction already holds SQLite's write lock (the caller wrote the
+		// config, or took it up front via the write barrier), and pop's
+		// SQLite finders serialize on a process-wide statement mutex that a
+		// concurrent model write may hold while busy-waiting on that write
+		// lock — a lock-order inversion that parks both sides until the busy
+		// timeout expires.
+		if err := tx.TX.SelectContext(ctx, &rows, readQuery, readArgs...); err != nil {
+			return false, sqlcon.HandleError(err)
+		}
+	} else if err := tx.RawQuery(readQuery, readArgs...).All(&rows); err != nil {
+		return false, sqlcon.HandleError(err)
+	}
+	current := make([]string, len(rows))
+	for i, r := range rows {
+		current[i] = r.Identifier
+	}
+	slices.Sort(current)
+
+	if slices.Equal(current, target) {
+		return false, nil
+	}
+
+	// Replace wholesale, deleting first so values kept across the change do
+	// not trip the (nid, type, identifier) unique index on insert.
+	if err := tx.RawQuery(
+		`DELETE FROM identity_credential_identifiers WHERE identity_credential_id = ? AND nid = ?`+extraSQL,
+		append([]any{proto.IdentityCredentialsID, proto.NID}, extraArgs...)...).Exec(); err != nil {
+		return false, sqlcon.HandleError(err)
+	}
+	identifiers := make([]*identity.CredentialIdentifier, len(target))
+	for i, identifier := range target {
+		ci := proto
+		// The ID stays Nil so batch.Create generates it: gen_random_uuid()
+		// in the statement on CockroachDB, a client-side UUID elsewhere.
+		ci.Identifier = identifier
+		identifiers[i] = &ci
+	}
+	// One batched INSERT keeps the lock hold time flat in the identifier
+	// count. A duplicate identifier owned by another identity surfaces here
+	// as sqlcon.ErrUniqueViolation (batch.Create normalizes driver errors
+	// via sqlcon.HandleError) and rolls back the whole transaction.
+	if err := batch.Create(ctx, conn, identifiers, batch.WithExtraColumns(extra)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Identity, mods ...identity.UpdateIdentityModifier) (err error) {
 	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.UpdateIdentity",
 		trace.WithAttributes(
@@ -1281,9 +1682,22 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 
 	i.NID = p.NetworkID(ctx)
 	i.UpdatedAt = time.Now().UTC().Truncate(time.Microsecond)
+	// external_id backs a unique index, so including it in the UPDATE ... SET
+	// list makes the database plan a uniqueness check for that index even when
+	// the value is unchanged. external_id almost never changes on an update, so
+	// when we have the previous row to compare against and it is unchanged, we
+	// leave it out of the SET list and the database skips the check. When we
+	// have no snapshot to compare against, or external_id did change, we write
+	// it and accept the check.
+	externalIDUnchanged := o.FromDatabase() != nil && o.FromDatabase().ExternalID == i.ExternalID
 	if err := sqlcon.HandleError(p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
 		// This returns "ErrNoRows" if the identity does not exist
-		if err := update.Generic(WithTransaction(ctx, tx), tx, p.r.Tracer(ctx).Tracer(), i); err != nil {
+		if externalIDUnchanged {
+			err = update.GenericExcept(WithTransaction(ctx, tx), tx, p.r.Tracer(ctx).Tracer(), i, "external_id")
+		} else {
+			err = update.Generic(WithTransaction(ctx, tx), tx, p.r.Tracer(ctx).Tracer(), i)
+		}
+		if err != nil {
 			return err
 		}
 
@@ -1294,21 +1708,21 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 				return errors.New("mismatched identity ID: this is a bug")
 			}
 			var err error
-			i.RecoveryAddresses, err = updateAssociationWith(ctx, p, o.FromDatabase().RecoveryAddresses, i.RecoveryAddresses)
+			i.RecoveryAddresses, err = updateAssociationWith(ctx, p, o.ExtraColumns(), o.FromDatabase().RecoveryAddresses, i.RecoveryAddresses)
 			if err != nil {
 				return err
 			}
-			i.VerifiableAddresses, err = updateAssociationWith(ctx, p, o.FromDatabase().VerifiableAddresses, i.VerifiableAddresses)
+			i.VerifiableAddresses, err = updateAssociationWith(ctx, p, o.ExtraColumns(), o.FromDatabase().VerifiableAddresses, i.VerifiableAddresses)
 			if err != nil {
 				return err
 			}
 			identityCreds = o.FromDatabase().Credentials
 		} else {
-			i.RecoveryAddresses, err = updateAssociation(ctx, p, i, i.RecoveryAddresses)
+			i.RecoveryAddresses, err = updateAssociation(ctx, p, o.ExtraColumns(), i, i.RecoveryAddresses)
 			if err != nil {
 				return err
 			}
-			i.VerifiableAddresses, err = updateAssociation(ctx, p, i, i.VerifiableAddresses)
+			i.VerifiableAddresses, err = updateAssociation(ctx, p, o.ExtraColumns(), i, i.VerifiableAddresses)
 			if err != nil {
 				return err
 			}
@@ -1336,8 +1750,18 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 			}
 		}
 
+		// Excluded credential types are invisible to the diff: their rows are
+		// neither deleted, recreated, nor updated. Their database entries are
+		// kept aside and merged back into the returned identity below.
+		excludedTypes := o.ExcludedCredentialTypes()
+		excludedCreds := make(map[identity.CredentialsType]identity.Credentials, len(excludedTypes))
+
 		oldCredentials := make([]identity.Credentials, 0, len(identityCreds))
-		for _, cred := range identityCreds {
+		for ct, cred := range identityCreds {
+			if slices.Contains(excludedTypes, ct) {
+				excludedCreds[ct] = cred
+				continue
+			}
 			oldCredentials = append(oldCredentials, cred)
 		}
 
@@ -1348,12 +1772,22 @@ func (p *IdentityPersister) UpdateIdentity(ctx context.Context, i *identity.Iden
 
 		// Convert new credentials map to slice
 		newCredentials := make([]identity.Credentials, 0, len(i.Credentials))
-		for _, cred := range i.Credentials {
+		for ct, cred := range i.Credentials {
+			if slices.Contains(excludedTypes, ct) {
+				continue
+			}
 			newCredentials = append(newCredentials, cred)
 		}
 
-		i.Credentials, err = p.updateCredentialsAssociation(ctx, i.ID, oldCredentials, newCredentials)
-		return err
+		updatedCreds, err := p.updateCredentialsAssociation(ctx, o.ExtraColumns(), i.ID, oldCredentials, newCredentials)
+		if err != nil {
+			return err
+		}
+		// The excluded types' rows were left untouched; surface their database
+		// state on the returned identity instead of the in-memory copy.
+		maps.Copy(updatedCreds, excludedCreds)
+		i.Credentials = updatedCreds
+		return nil
 	})); err != nil {
 		return err
 	}
@@ -1370,6 +1804,8 @@ func (p *IdentityPersister) DeleteIdentity(ctx context.Context, id uuid.UUID) (e
 	defer otelx.End(span, &err)
 
 	tableName := new(identity.Identity).TableName(ctx)
+	// This @index hint is CockroachDB-only; PostgreSQL and YugabyteDB use the
+	// unadorned table name.
 	if p.c.Dialect.Name() == "cockroach" {
 		tableName += "@primary"
 	}
@@ -1415,6 +1851,8 @@ func (p *IdentityPersister) DeleteIdentities(ctx context.Context, ids []uuid.UUI
 	args = append(args, p.NetworkID(ctx))
 
 	tableName := new(identity.Identity).TableName(ctx)
+	// This @index hint is CockroachDB-only; PostgreSQL and YugabyteDB use the
+	// unadorned table name.
 	if p.c.Dialect.Name() == "cockroach" {
 		tableName += "@primary"
 	}
@@ -1534,11 +1972,11 @@ func (p *IdentityPersister) FindRecoveryAddressByValue(ctx context.Context, via,
 	return &addr, nil
 }
 
-// FindAllRecoveryAddressesForIdentityByRecoveryAddressValue returns all
-// recovery addresses for an identity if at least one of those addresses matches
-// the provided value.
-func (p *IdentityPersister) FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx context.Context, anyRecoveryAddress string) (recoveryAddresses []identity.RecoveryAddress, err error) {
-	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue",
+// FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue returns the
+// values of all recovery addresses for an identity if at least one of those
+// addresses matches the provided value.
+func (p *IdentityPersister) FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx context.Context, anyRecoveryAddress string) (recoveryAddresses []string, err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue",
 		trace.WithAttributes(
 			attribute.Stringer("network.id", p.NetworkID(ctx))))
 	defer otelx.End(span, &err)
@@ -1553,19 +1991,28 @@ func (p *IdentityPersister) FindAllRecoveryAddressesForIdentityByRecoveryAddress
 	//
 	// This is all done in one query with a self-join.
 	// We also bound the results for safety.
+	via := identity.AddressTypeSMS
+	if strings.ContainsRune(anyRecoveryAddress, '@') {
+		via = identity.AddressTypeEmail
+	}
+
+	nid := p.NetworkID(ctx)
 	err = p.GetConnection(ctx).RawQuery(`
-SELECT A.id, A.via, A.value, A.identity_id, A.created_at, A.updated_at, A.nid, A.break_glass_for_organization
+SELECT A.value
 FROM identity_recovery_addresses A
 JOIN identity_recovery_addresses B
-ON A.identity_id = B.identity_id
-AND A.nid = B.nid
-WHERE B.value IN (?,?)
-AND A.nid = ?
+  ON A.identity_id = B.identity_id
+  AND A.nid = B.nid
+WHERE A.nid = ?
+  AND B.via = ?
+  AND B.value IN (?, ?)
+ORDER BY A.value
 LIMIT 10
 		`,
+		nid,
+		via,
 		x.GracefulNormalization(anyRecoveryAddress),
 		anyRecoveryAddress,
-		p.NetworkID(ctx),
 	).
 		All(&recoveryAddresses)
 	if err != nil {

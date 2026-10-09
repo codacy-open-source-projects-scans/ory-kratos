@@ -55,8 +55,10 @@ func TestPersister(ctx context.Context, p persistence.Persister) func(t *testing
 			_, err = p.ReadErrorContainer(ctx, actualID)
 			require.NoError(t, err)
 
-			// We need to wait for at least one second or MySQL will randomly fail as it does not support
-			// millisecond resolution on timestamp columns.
+			// The row must age past the one-second cutoff before ClearErrorContainers
+			// removes it, and ReadErrorContainer refreshes seen_at on every read, so
+			// polling would keep resetting the age. Wait once instead. The extra 0.5s
+			// covers MySQL's one-second timestamp resolution.
 			time.Sleep(time.Second + time.Millisecond*500)
 			require.NoError(t, p.ClearErrorContainers(ctx, time.Second, false))
 			got, err := p.ReadErrorContainer(ctx, actualID)
@@ -67,8 +69,6 @@ func TestPersister(ctx context.Context, p persistence.Persister) func(t *testing
 			t.Run("can not read error from another network", func(t *testing.T) {
 				created, err := p.CreateErrorContainer(ctx, "nosurf", herodot.ErrNotFound().WithReason("foobar"))
 				require.NoError(t, err)
-
-				time.Sleep(time.Second + time.Millisecond*500)
 
 				_, other := testhelpers.NewNetwork(t, ctx, p)
 				_, err = other.ReadErrorContainer(ctx, created)

@@ -28,6 +28,15 @@ import (
 
 const hashCacheItemTTL = time.Hour
 
+// maxIdentifierSimilarityCheckLength bounds the operands of the O(n·m)
+// identifier-similarity check to keep its worst-case cost constant. Real
+// identifiers (emails, usernames) and passwords are far shorter than this, so
+// legitimate flows are unaffected, while oversized operands are skipped to keep
+// the check's cost bounded. The bound is checked on the raw byte length as a
+// cheap pre-filter and again on the case-folded operands, since lowercasing can
+// expand an operand (e.g. Turkish dotted I).
+const maxIdentifierSimilarityCheckLength = 256
+
 // Validator implements a validation strategy for passwords. One example is that the password
 // has to have at least 6 characters and at least one lower and one uppercase password.
 type Validator interface {
@@ -155,8 +164,12 @@ func (s *DefaultPasswordValidator) fetch(ctx context.Context, hpw []byte, apiDNS
 		}
 	}
 
+	// A read that fails after the response headers arrived (connection reset,
+	// client timeout, truncated body) is as much a network failure as a failed
+	// request, so it has to be classified as one to stay subject to
+	// ignore_network_errors.
 	if err := sc.Err(); err != nil {
-		return 0, errors.WithStack(herodot.ErrInternalServerError().WithReasonf("Unable to initialize string scanner: %s", err))
+		return 0, errors.Wrapf(ErrNetworkFailure, "unable to read the response body: %s", err)
 	}
 
 	s.hashes.SetWithTTL(b20(hpw), thisCount, 1, hashCacheItemTTL)
@@ -178,12 +191,19 @@ func (s *DefaultPasswordValidator) validate(ctx context.Context, identifier, pas
 		return text.NewErrorValidationPasswordMinLength(int(passwordPolicyConfig.MinPasswordLength), len(password))
 	}
 
-	if passwordPolicyConfig.IdentifierSimilarityCheckEnabled && len(identifier) > 0 {
+	if passwordPolicyConfig.IdentifierSimilarityCheckEnabled && len(identifier) > 0 &&
+		len(identifier) <= maxIdentifierSimilarityCheckLength &&
+		len(password) <= maxIdentifierSimilarityCheckLength {
 		compIdentifier, compPassword := strings.ToLower(identifier), strings.ToLower(password)
-		dist := levenshtein.Distance(compIdentifier, compPassword)
-		lcs := float32(lcsLength(compIdentifier, compPassword)) / float32(len(compPassword))
-		if dist < s.minIdentifierPasswordDist || lcs > s.maxIdentifierPasswordSubstrThreshold {
-			return text.NewErrorValidationPasswordIdentifierTooSimilar()
+		// Case-folding can expand an operand, so re-check the folded lengths
+		// before running the O(n·m) comparison.
+		if len(compIdentifier) <= maxIdentifierSimilarityCheckLength &&
+			len(compPassword) <= maxIdentifierSimilarityCheckLength {
+			dist := levenshtein.Distance(compIdentifier, compPassword)
+			lcs := float32(lcsLength(compIdentifier, compPassword)) / float32(len(compPassword))
+			if dist < s.minIdentifierPasswordDist || lcs > s.maxIdentifierPasswordSubstrThreshold {
+				return text.NewErrorValidationPasswordIdentifierTooSimilar()
+			}
 		}
 	}
 

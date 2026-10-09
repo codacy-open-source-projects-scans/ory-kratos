@@ -17,6 +17,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/continuity"
@@ -37,9 +38,12 @@ import (
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/transaction"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/otelx/semconv"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/urlx"
 )
@@ -60,12 +64,13 @@ type (
 	}
 
 	dependencies interface {
+		clock.Provider
 		nosurfx.CSRFProvider
 		nosurfx.CSRFTokenGeneratorProvider
 		httpx.WriterProvider
 		logrusx.Provider
 		otelx.Provider
-		x.TransactionPersistenceProvider
+		transaction.PersistenceProvider
 
 		config.Provider
 
@@ -282,7 +287,9 @@ func (s *Strategy) populateChooseMethodFlow(r *http.Request, f flow.Flow) error 
 		if f.RequestedAAL == identity.AuthenticatorAssuranceLevel2 {
 			via := r.URL.Query().Get("via")
 
-			sess, err := s.deps.SessionManager().FetchFromRequest(r.Context(), r)
+			// The full expansion is required: finding the code addresses reads the identity's
+			// credentials.
+			sess, err := s.deps.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 			if err != nil {
 				return err
 			}
@@ -302,7 +309,44 @@ func (s *Strategy) populateChooseMethodFlow(r *http.Request, f flow.Flow) error 
 				f.GetUI().Nodes.Append(node.NewInputField("address", address.To, node.CodeGroup, node.InputAttributeTypeSubmit).
 					WithMetaLabel(text.NewInfoSelfServiceLoginAAL2CodeAddress(string(address.Via), address.To)))
 			}
+		} else if f.Refresh && s.deps.Config().RefreshLoginChooseAddress(ctx) {
+			// On a refresh login the identity is already known from the active
+			// session. Asking for the identifier again makes the privileged
+			// login look like a fresh unified login (ory/kratos#4194). Instead,
+			// render one "Send code to <address>" button per available code address,
+			// exactly like the second-factor flow above.
+			// The full expansion is required: finding the code addresses reads the identity's
+			// credentials.
+			sess, err := s.deps.SessionManager().FetchFromRequest(ctx, r, session.ExpandEverything, identity.ExpandEverything)
+			if err != nil {
+				return err
+			}
+
+			if len(sess.Identity.Credentials) == 0 {
+				if err := s.deps.PrivilegedIdentityPool().HydrateIdentityAssociations(ctx, sess.Identity, identity.ExpandCredentials); err != nil {
+					return err
+				}
+			}
+
+			addresses, err := s.FindCodeAddresses(ctx, sess, "")
+			if err != nil {
+				return err
+			}
+
+			// If the identity has no code address, append nothing so another
+			// first-factor strategy (e.g. password) can fulfil the refresh.
+			for _, address := range addresses {
+				f.GetUI().Nodes.Append(node.NewInputField("address", address.To, node.CodeGroup, node.InputAttributeTypeSubmit).
+					WithMetaLabel(text.NewInfoSelfServiceLoginAAL2CodeAddress(string(address.Via), address.To)))
+			}
 		} else {
+			if f.Refresh {
+				// The refresh address picker is disabled, so we fall back to
+				// re-asking for the identifier. This is deprecated: the identity
+				// is already fixed by the active session (ory/kratos#4194).
+				trace.SpanFromContext(ctx).AddEvent(semconv.NewDeprecatedFeatureUsedEvent(ctx, "refresh_login_identifier_input"))
+			}
+
 			identifierLabel, err := login.GetIdentifierLabelFromSchema(ctx, ds.String(), s.deps.Config().SecurityDisallowRefInIdentitySchemas(ctx))
 			if err != nil {
 				return err
@@ -346,7 +390,15 @@ func (s *Strategy) populateEmailSentFlow(ctx context.Context, f flow.Flow) error
 	case flow.LoginFlow:
 		route = login.RouteSubmitFlow
 		codeMetaLabel = text.NewInfoNodeLabelLoginCode()
-		message = text.NewLoginCodeSent()
+		// On refresh and second factor flows the recipient address is bound to
+		// the authenticated identity, not typed by the user. Use a message that
+		// reflects that — the standard "address you provided" / "check the
+		// spelling" wording is inaccurate in those cases.
+		if lf, ok := f.(*login.Flow); ok && (lf.Refresh || lf.RequestedAAL == identity.AuthenticatorAssuranceLevel2) {
+			message = text.NewLoginCodeSentForAuthenticatedUser()
+		} else {
+			message = text.NewLoginCodeSent()
+		}
 
 		// preserve the login identifier that was submitted
 		// so we can retry the code flow with the same data

@@ -19,7 +19,6 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/lestrrat-go/jwx/jwk"
 	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/negroni"
 
 	"github.com/ory/herodot"
@@ -55,9 +54,11 @@ import (
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/kratos/x/transaction"
 	"github.com/ory/kratos/x/webauthnx"
 	"github.com/ory/nosurf"
 	"github.com/ory/pop/v6"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/healthx"
@@ -78,9 +79,13 @@ type RegistryDefault struct {
 	l *logrusx.Logger
 	c *config.Config
 
+	// clock is the time source for time-dependent behavior such as flow expiry.
+	// It is set eagerly in initCheapMembers and replaced in tests via SetClock.
+	clock clock.Clock
+
 	ctxer contextx.Contextualizer
 
-	injectedSelfserviceHooks map[string]func(config.SelfServiceHook) interface{}
+	injectedSelfserviceHooks map[string]NewHookFn
 	extraHandlerFactories    []NewHandler
 	extraHandlers            []x.Handler
 	slOptions                *servicelocatorx.Options
@@ -116,6 +121,7 @@ type RegistryDefault struct {
 	sessionTokenizer initOnce[*session.Tokenizer]
 
 	passwordHasher    initOnce[hash.Hasher]
+	extraHashers      map[string]NewHasherFn
 	passwordValidator initOnce[password.Validator]
 
 	crypter initOnce[cipher.Cipher]
@@ -221,7 +227,7 @@ func (m *RegistryDefault) RegisterAdminRoutes(ctx context.Context, router *httpr
 
 	m.HealthHandler(ctx).SetHealthRoutes(router, true)
 	m.HealthHandler(ctx).SetVersionRoutes(router)
-	router.GET(prometheusx.MetricsPrometheusPath, promhttp.Handler().ServeHTTP)
+	router.GET(prometheusx.MetricsPrometheusPath, prometheusx.Handler().ServeHTTP)
 	config.RegisterConfigHashRoute(m, router)
 
 	for _, s := range m.selfServiceStrategies() {
@@ -248,6 +254,18 @@ func NewRegistryDefault() *RegistryDefault {
 
 func (m *RegistryDefault) SetLogger(l *logrusx.Logger) {
 	m.l = l
+}
+
+// Clock returns the registry's time source. It is eagerly initialized in
+// initCheapMembers, so this getter never lazily initializes.
+func (m *RegistryDefault) Clock() clock.Clock {
+	return m.clock
+}
+
+// SetClock replaces the registry's time source. Intended for tests that need
+// deterministic control over time-dependent behavior such as flow expiry.
+func (m *RegistryDefault) SetClock(c clock.Clock) {
+	m.clock = c
 }
 
 func (m *RegistryDefault) SetJSONNetVMProvider(p jsonnetsecure.VMProvider) {
@@ -397,6 +415,35 @@ nextStrategy:
 	return
 }
 
+// TestStrategy returns the OIDC strategy as a login.TestStrategy for
+// admin-created test login flows. Only the OIDC strategy implements the
+// test-mode single-provider UI. Returns nil if the OIDC strategy is not
+// registered or disabled in config; callers must handle that case as a
+// misconfiguration rather than crashing the process.
+//
+// The strategy list may contain several strategies that implement the test
+// interface: derivatives of the OIDC strategy registered under a different
+// credentials type (e.g. SAML or organization sign-in) inherit it through
+// embedding, but they resolve providers from their own method's config
+// section. Only the strategy with the OIDC credentials type reads
+// selfservice.methods.oidc.config.providers, so select by credentials type
+// rather than returning the first match.
+func (m *RegistryDefault) TestStrategy(ctx context.Context) login.TestStrategy {
+	type testStrategy interface {
+		login.TestStrategy
+		login.Strategy
+	}
+	for _, strategy := range m.selfServiceStrategies() {
+		if s, ok := strategy.(testStrategy); ok {
+			if s.ID() == identity.CredentialsTypeOIDC && m.strategyLoginEnabled(ctx, s.ID().String()) {
+				return s
+			}
+		}
+	}
+
+	return nil
+}
+
 // supportsOrganizations checks if a strategy implements organization-based authentication.
 // Organization strategies manage their own enablement via provider configuration,
 // not via the strategy-enabled config flag, so they bypass the strategyLoginEnabled /
@@ -500,9 +547,19 @@ func (m *RegistryDefault) Cipher(ctx context.Context) cipher.Cipher {
 	})
 }
 
+// WithHashers registers additional password hashers, keyed by the
+// hashers.algorithm value that selects them. See WithExtraHashers.
+func (m *RegistryDefault) WithHashers(hashers map[string]NewHasherFn) {
+	m.extraHashers = hashers
+}
+
 func (m *RegistryDefault) Hasher(ctx context.Context) hash.Hasher {
 	return m.passwordHasher.Get(func() hash.Hasher {
-		if m.c.HasherPasswordHashingAlgorithm(ctx) == "bcrypt" {
+		alg := m.c.HasherPasswordHashingAlgorithm(ctx)
+		if newHasher, ok := m.extraHashers[alg]; ok {
+			return newHasher(m)
+		}
+		if alg == "bcrypt" {
 			return hash.NewHasherBcrypt(m)
 		}
 		return hash.NewHasherArgon2(m)
@@ -527,14 +584,21 @@ func (m *RegistryDefault) SelfServiceErrorHandler() *errorx.Handler {
 	return m.errorHandler
 }
 
-func (m *RegistryDefault) CookieManager(ctx context.Context) sessions.StoreExact {
-	var keys [][]byte
-	for _, k := range m.Config().SecretsSession(ctx) {
+// cookieStoreKeyPairs derives the (hashKey, blockKey) pairs securecookie
+// expects: each secret signs, and its SHA-256 digest encrypts. This way a
+// single configured secret yields both signing and encryption, and rotation
+// rotates both.
+func cookieStoreKeyPairs(secrets [][]byte) [][]byte {
+	keys := make([][]byte, 0, 2*len(secrets))
+	for _, k := range secrets {
 		encrypt := sha256.Sum256(k)
 		keys = append(keys, k, encrypt[:])
 	}
+	return keys
+}
 
-	cs := sessions.NewCookieStore(keys...)
+func (m *RegistryDefault) CookieManager(ctx context.Context) sessions.StoreExact {
+	cs := sessions.NewCookieStore(cookieStoreKeyPairs(m.Config().SecretsSession(ctx))...)
 	cs.Options.Secure = m.Config().SessionCookieSecure(ctx)
 	cs.Options.HttpOnly = true
 
@@ -560,7 +624,13 @@ func (m *RegistryDefault) CookieManager(ctx context.Context) sessions.StoreExact
 
 func (m *RegistryDefault) ContinuityCookieManager(ctx context.Context) sessions.StoreExact {
 	// To support hot reloading, this can not be instantiated only once.
-	cs := sessions.NewCookieStore(m.Config().SecretsSession(ctx)...)
+	secrets := m.Config().SecretsSession(ctx)
+	// Cookies issued before the derived-block-key fix used the raw secrets as
+	// (hashKey, blockKey) pairs. Appending the raw secrets after the derived
+	// pairs keeps those cookies readable as a decode fallback (encoding always
+	// uses the first pair). Remove once cookies issued by pre-fix versions
+	// have expired.
+	cs := sessions.NewCookieStore(append(cookieStoreKeyPairs(secrets), secrets...)...)
 	cs.Options.Secure = m.Config().CookieSecure(ctx)
 	cs.Options.HttpOnly = true
 	cs.Options.SameSite = http.SameSiteLaxMode
@@ -616,6 +686,9 @@ func (m *RegistryDefault) Init(ctx context.Context, ctxer contextx.Contextualize
 
 	if o.extraHooks != nil {
 		m.WithHooks(o.extraHooks)
+	}
+	if o.extraHashers != nil {
+		m.WithHashers(o.extraHashers)
 	}
 	if o.extraHandlers != nil {
 		m.WithExtraHandlers(o.extraHandlers)
@@ -740,6 +813,7 @@ func (m *RegistryDefault) PrivilegedIdentityPool() identity.PrivilegedPool { ret
 func (m *RegistryDefault) FlowForTokenExchange() session.FlowForTokenExchange {
 	return m
 }
+
 func (m *RegistryDefault) GetFlowForTokenExchange(ctx context.Context, flowID uuid.UUID) (any, error) {
 	rf, err := m.RegistrationFlowPersister().GetRegistrationFlow(ctx, flowID)
 	if err == nil {
@@ -772,9 +846,11 @@ func (m *RegistryDefault) LoginCodePersister() code.LoginCodePersister          
 func (m *RegistryDefault) VerificationTokenPersister() link.VerificationTokenPersister {
 	return m.persister
 }
+
 func (m *RegistryDefault) VerificationCodePersister() code.VerificationCodePersister {
 	return m.persister
 }
+
 func (m *RegistryDefault) RegistrationCodePersister() code.RegistrationCodePersister {
 	return m.persister
 }
@@ -782,7 +858,7 @@ func (m *RegistryDefault) PendingTraitsChangePersister() identity.PendingTraitsC
 	return m.Persister()
 }
 
-func (m *RegistryDefault) TransactionalPersisterProvider() x.TransactionalPersister {
+func (m *RegistryDefault) TransactionalPersisterProvider() transaction.Persister {
 	return m.persister
 }
 
@@ -871,7 +947,9 @@ func (m *RegistryDefault) ExtraHandlers() []x.Handler {
 
 // initCheapMembers initializes members that are cheap to initialize.
 func (m *RegistryDefault) initCheapMembers() {
+	m.clock = clock.New()
 	m.identityValidator = identity.NewValidator(m)
+	m.identitySchemaProvider = schema.NewDefaultIdentityTraitsProvider(m)
 	m.identityManager = identity.NewManager(m)
 	m.sessionManager = session.NewManagerHTTP(m)
 	m.errorManager = errorx.NewManager(m)

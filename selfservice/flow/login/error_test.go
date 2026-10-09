@@ -25,6 +25,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/x/assertx"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 
@@ -83,8 +84,9 @@ func TestHandleError(t *testing.T) {
 
 	newFlow := func(t *testing.T, ttl time.Duration, ft flow.Type, options ...func(*opts)) *login.Flow {
 		req := &http.Request{URL: urlx.ParseOrPanic("/")}
-		f, err := login.NewFlow(conf, ttl, "csrf_token", req, ft)
+		f, err := login.NewFlow(reg, req, ft)
 		require.NoError(t, err)
+		f.ExpiresAt = f.IssuedAt.Add(ttl)
 
 		optsD := &opts{}
 		for _, o := range options {
@@ -172,7 +174,7 @@ func TestHandleError(t *testing.T) {
 				t.Cleanup(reset)
 
 				loginFlow = newFlow(t, time.Minute, tc.t)
-				flowError = flow.NewFlowExpiredError(anHourAgo)
+				flowError = flow.NewFlowExpiredError(clock.New(), anHourAgo)
 				group = node.PasswordGroup
 
 				res, err := ts.Client().Do(testhelpers.NewHTTPGetJSONRequest(t, ts.URL+"/error"))
@@ -184,7 +186,11 @@ func TestHandleError(t *testing.T) {
 				require.Equal(t, http.StatusGone, res.StatusCode, "%+v\n\t%s", res.Request, body)
 
 				assert.NotEqual(t, "00000000-0000-0000-0000-000000000000", gjson.GetBytes(body, "use_flow_id").String())
-				assertx.EqualAsJSONExcept(t, flow.NewFlowExpiredError(anHourAgo), json.RawMessage(body), []string{"since", "redirect_browser_to", "use_flow_id"})
+				// "since" and "error.reason" both derive from time.Since(at), recomputed when the expected error is
+				// built here — after the response was generated. Across a rounding boundary the two timings disagree,
+				// so exclude both from the exact comparison and verify the reason template separately.
+				assertx.EqualAsJSONExcept(t, flow.NewFlowExpiredError(clock.New(), anHourAgo), json.RawMessage(body), []string{"since", "error.reason", "redirect_browser_to", "use_flow_id"})
+				assert.Regexp(t, `^The self-service flow expired \d+\.\d{2} minutes ago, initialize a new one\.$`, gjson.GetBytes(body, "error.reason").String())
 			})
 
 			t.Run("case=validation error", func(t *testing.T) {
@@ -265,7 +271,7 @@ func TestHandleError(t *testing.T) {
 
 	t.Run("flow=browser", func(t *testing.T) {
 		expectLoginUI := func(t *testing.T) (*login.Flow, *http.Response) {
-			res, err := http.DefaultClient.Get(ts.URL + "/error")
+			res, err := testhelpers.NewTestClient(t).Get(ts.URL + "/error")
 			require.NoError(t, err)
 			defer func() { _ = res.Body.Close() }()
 			assert.Contains(t, res.Request.URL.String(), conf.SelfServiceFlowLoginUI(ctx).String()+"?flow=")
@@ -279,7 +285,7 @@ func TestHandleError(t *testing.T) {
 			t.Cleanup(reset)
 
 			loginFlow = &login.Flow{Type: flow.TypeBrowser}
-			flowError = flow.NewFlowExpiredError(anHourAgo)
+			flowError = flow.NewFlowExpiredError(clock.New(), anHourAgo)
 			group = node.PasswordGroup
 
 			lf, _ := expectLoginUI(t)

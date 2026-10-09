@@ -31,6 +31,8 @@ type CreateIdentityBody struct {
 	OrganizationId NullableString `json:"organization_id,omitempty"`
 	// RecoveryAddresses contains all the addresses that can be used to recover an identity.  Use this structure to import recovery addresses for an identity. Please keep in mind that the address needs to be represented in the Identity Schema or this field will be overwritten on the next identity update.
 	RecoveryAddresses []RecoveryIdentityAddress `json:"recovery_addresses,omitempty"`
+	// Region is the Ory Network region this identity will be created in. Optional; defaults to the project home region if omitted. Only effective on the Ory Network. eu-central EUCentral asia-northeast AsiaNorthEast us-east USEast us-west USWest eu EU asia Asia us US global Global
+	Region *string `json:"region,omitempty"`
 	// SchemaID is the ID of the JSON Schema to be used for validating the identity's traits.
 	SchemaId string `json:"schema_id"`
 	// State is the identity's state. active StateActive inactive StateInactive
@@ -268,6 +270,38 @@ func (o *CreateIdentityBody) SetRecoveryAddresses(v []RecoveryIdentityAddress) {
 	o.RecoveryAddresses = v
 }
 
+// GetRegion returns the Region field value if set, zero value otherwise.
+func (o *CreateIdentityBody) GetRegion() string {
+	if o == nil || IsNil(o.Region) {
+		var ret string
+		return ret
+	}
+	return *o.Region
+}
+
+// GetRegionOk returns a tuple with the Region field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateIdentityBody) GetRegionOk() (*string, bool) {
+	if o == nil || IsNil(o.Region) {
+		return nil, false
+	}
+	return o.Region, true
+}
+
+// HasRegion returns a boolean if a field has been set.
+func (o *CreateIdentityBody) HasRegion() bool {
+	if o != nil && !IsNil(o.Region) {
+		return true
+	}
+
+	return false
+}
+
+// SetRegion gets a reference to the given string and assigns it to the Region field.
+func (o *CreateIdentityBody) SetRegion(v string) {
+	o.Region = &v
+}
+
 // GetSchemaId returns the SchemaId field value
 func (o *CreateIdentityBody) GetSchemaId() string {
 	if o == nil {
@@ -408,6 +442,9 @@ func (o CreateIdentityBody) ToMap() (map[string]interface{}, error) {
 	if !IsNil(o.RecoveryAddresses) {
 		toSerialize["recovery_addresses"] = o.RecoveryAddresses
 	}
+	if !IsNil(o.Region) {
+		toSerialize["region"] = o.Region
+	}
 	toSerialize["schema_id"] = o.SchemaId
 	if !IsNil(o.State) {
 		toSerialize["state"] = o.State
@@ -466,6 +503,7 @@ func (o *CreateIdentityBody) UnmarshalJSON(data []byte) (err error) {
 		delete(additionalProperties, "metadata_public")
 		delete(additionalProperties, "organization_id")
 		delete(additionalProperties, "recovery_addresses")
+		delete(additionalProperties, "region")
 		delete(additionalProperties, "schema_id")
 		delete(additionalProperties, "state")
 		delete(additionalProperties, "traits")

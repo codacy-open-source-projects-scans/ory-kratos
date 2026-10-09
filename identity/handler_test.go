@@ -28,15 +28,15 @@ import (
 	"github.com/tidwall/gjson"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/ory/x/configx"
-
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/hash"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/selfservice/strategy/deviceauthn"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/configx"
 	"github.com/ory/x/ioutilx"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/snapshotx"
@@ -45,6 +45,18 @@ import (
 )
 
 var ignoreDefault = []string{"id", "schema_url", "state_changed_at", "created_at", "updated_at"}
+
+// sharedBcryptTestHash is a single bcrypt hash precomputed at MinCost and
+// reused by every fixture identity in batch-import tests. The tests assert
+// on storage/identity-creation behavior, not password verification, so the
+// concrete hash value is irrelevant — only the format matters.
+var sharedBcryptTestHash = func() string {
+	g, err := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.MinCost)
+	if err != nil {
+		panic(err)
+	}
+	return string(g)
+}()
 
 func TestHandler(t *testing.T) {
 	t.Parallel()
@@ -91,22 +103,22 @@ func TestHandler(t *testing.T) {
 		require.NoError(t, err)
 		defer func() { _ = res.Body.Close() }()
 
-		require.EqualValues(t, expectCode, res.StatusCode, "%s", ioutilx.MustReadAll(res.Body))
+		require.EqualValuesf(t, expectCode, res.StatusCode, "%s", ioutilx.MustReadAll(res.Body))
 	}
 
-	send := func(t *testing.T, base *httptest.Server, method, href string, expectCode int, send interface{}) gjson.Result {
+	send := func(t *testing.T, base *httptest.Server, method, href string, expectCode int, send any) gjson.Result {
 		t.Helper()
-		var b bytes.Buffer
-		switch raw := send.(type) {
-		case json.RawMessage:
-			b = *bytes.NewBuffer(raw)
-		default:
-			if send != nil {
-				require.NoError(t, json.NewEncoder(&b).Encode(send))
-			}
+
+		var payloadReader io.Reader
+		if r, ok := send.(io.Reader); ok {
+			payloadReader = r
+		} else if send != nil {
+			b, err := json.Marshal(send)
+			require.NoError(t, err)
+			payloadReader = bytes.NewReader(b)
 		}
 
-		req, err := http.NewRequest(method, base.URL+href, &b)
+		req, err := http.NewRequest(method, base.URL+href, payloadReader)
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 		res, err := base.Client().Do(req)
@@ -115,11 +127,11 @@ func TestHandler(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, res.Body.Close())
 
-		require.EqualValues(t, expectCode, res.StatusCode, "%s", body)
+		require.EqualValuesf(t, expectCode, res.StatusCode, "%s", body)
 		return gjson.ParseBytes(body)
 	}
 
-	type patch map[string]interface{}
+	type patch map[string]any
 
 	t.Run("case=should return an empty list", func(t *testing.T) {
 		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
@@ -249,7 +261,7 @@ func TestHandler(t *testing.T) {
 		})
 
 		t.Run("with malformed traits", func(t *testing.T) {
-			send(t, adminTS, "POST", "/identities", http.StatusBadRequest, json.RawMessage(`{"traits": not valid JSON}`))
+			send(t, adminTS, "POST", "/identities", http.StatusBadRequest, strings.NewReader(`{"traits": not valid JSON}`))
 		})
 
 		t.Run("with cleartext password and oidc credentials", func(t *testing.T) {
@@ -989,8 +1001,16 @@ func TestHandler(t *testing.T) {
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual),
 				snapshotx.ExceptPaths("id", "schema_url", "state_changed_at", "created_at", "updated_at",
 					"credentials.lookup_secret.config.codes", "credentials.lookup_secret.created_at",
-					"credentials.lookup_secret.updated_at", "credentials.password.created_at",
+					"credentials.lookup_secret.updated_at",
+					"credentials.lookup_secret.identifiers",
+					"credentials.password.created_at",
 					"credentials.password.updated_at"))
+
+			// AAL2 lookup-secret login resolves the credential through
+			// identity_credential_identifiers, so the import must persist
+			// exactly one identifier (the identity ID). See
+			// https://github.com/ory/kratos/issues/4561.
+			require.Equal(t, []string{actual.ID.String()}, actual.Credentials[identity.CredentialsTypeLookup].Identifiers)
 		})
 
 		t.Run("case=should update an identity with totp credentials", func(t *testing.T) {
@@ -1043,7 +1063,13 @@ func TestHandler(t *testing.T) {
 			snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*actual),
 				snapshotx.ExceptPaths("id", "schema_url", "state_changed_at", "created_at", "updated_at",
 					"credentials.totp.created_at", "credentials.totp.updated_at",
+					"credentials.totp.identifiers",
 					"credentials.password.created_at", "credentials.password.updated_at"))
+
+			// AAL2 TOTP login resolves the credential through identity_credential_identifiers,
+			// so the TOTP import must persist exactly one identifier (the identity ID). See
+			// https://github.com/ory/kratos/issues/4561.
+			require.Equal(t, []string{actual.ID.String()}, actual.Credentials[identity.CredentialsTypeTOTP].Identifiers)
 		})
 
 		t.Run("case=should update an identity with passkey credentials", func(t *testing.T) {
@@ -1762,6 +1788,35 @@ func TestHandler(t *testing.T) {
 				})
 			}
 		})
+
+		t.Run("case=region per entry is accepted and identities are created", func(t *testing.T) {
+			// Each entry in the batch payload carries a distinct region value. The
+			// endpoint must accept the region field without error and create all
+			// identities successfully. Region is db:"-" in OSS so it is not stored in
+			// the database, but the JSON parser must recognise the field (strict mode
+			// would return 400 for unknown fields).
+			patches := []*identity.BatchIdentityPatch{
+				{Create: &identity.CreateIdentityBody{
+					SchemaID: "default",
+					Traits:   json.RawMessage(`{"bar":"region-eu"}`),
+					Region:   "eu-central",
+				}},
+				{Create: &identity.CreateIdentityBody{
+					SchemaID: "default",
+					Traits:   json.RawMessage(`{"bar":"region-us"}`),
+					Region:   "us-west",
+				}},
+			}
+			req := &identity.BatchPatchIdentitiesBody{Identities: patches}
+			res := send(t, adminTS, "PATCH", "/identities", http.StatusOK, req)
+			require.Len(t, res.Get("identities").Array(), 2, "%s", res.Raw)
+
+			// Both entries must be created successfully, not rejected as errors.
+			assert.Equal(t, "create", res.Get("identities.0.action").String(), "%s", res.Raw)
+			assert.Equal(t, "create", res.Get("identities.1.action").String(), "%s", res.Raw)
+			assert.NotEmpty(t, res.Get("identities.0.identity").String(), "%s", res.Raw)
+			assert.NotEmpty(t, res.Get("identities.1.identity").String(), "%s", res.Raw)
+		})
 	})
 
 	t.Run("case=PATCH update of state should update state changed at timestamp", func(t *testing.T) {
@@ -2050,7 +2105,7 @@ func TestHandler(t *testing.T) {
 		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
 			t.Run("endpoint="+name, func(t *testing.T) {
 				res := send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusBadRequest, nil)
-				assert.Equal(t, res.Get("error.message").Str, "invalid state detected", res.Raw)
+				assert.Equal(t, "unexpected end of JSON input", res.Get("error.message").Str, res.Raw)
 			})
 		}
 	})
@@ -2096,6 +2151,82 @@ func TestHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("case=PATCH should fail if oidc credential node is replaced", func(t *testing.T) {
+		email := x.NewUUID().String() + "@ory.sh"
+		i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
+		i.SetCredentials(identity.CredentialsTypeOIDC, identity.Credentials{
+			Type:        identity.CredentialsTypeOIDC,
+			Identifiers: []string{"some-provider:" + email},
+			Config:      sqlxx.JSONRawMessage(`{"providers": [{"provider": "some-provider", "subject": "` + email + `"}]}`),
+		})
+		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+
+		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+			t.Run("endpoint="+name, func(t *testing.T) {
+				patch := []patch{
+					{"op": "replace", "path": "/credentials/oidc", "value": map[string]any{
+						"type":        "oidc",
+						"identifiers": []string{"evil-provider:attacker"},
+						"config":      map[string]any{"providers": []any{map[string]any{"provider": "evil-provider", "subject": "attacker"}}},
+					}},
+				}
+
+				res := send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusBadRequest, &patch)
+				assert.EqualValues(t, "patch includes denied path: /credentials/oidc", res.Get("error.message").String(), "%s", res.Raw)
+
+				// The rejected patch must not mutate the stored credential.
+				after, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+				require.NoError(t, err)
+				assert.Equal(t, "some-provider",
+					gjson.GetBytes(after.Credentials[identity.CredentialsTypeOIDC].Config, "providers.0.provider").String())
+			})
+		}
+	})
+
+	t.Run("case=PATCH should fail if saml credential is patched", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			path  string
+			value any
+		}{
+			{
+				name: "node replace",
+				path: "/credentials/saml",
+				value: map[string]any{
+					"type":        "saml",
+					"identifiers": []string{"saml-provider:attacker"},
+					"config":      map[string]any{"providers": []any{map[string]any{"provider": "saml-provider", "subject": "attacker"}}},
+				},
+			},
+			{
+				name:  "sub-path replace",
+				path:  "/credentials/saml/config/providers/0/subject",
+				value: "attacker",
+			},
+		} {
+			t.Run("case="+tc.name, func(t *testing.T) {
+				email := uuid.NewV5(uuid.Nil, t.Name()).String() + "@ory.sh"
+				i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
+				i.SetCredentials(identity.CredentialsTypeSAML, identity.Credentials{
+					Type:        identity.CredentialsTypeSAML,
+					Identifiers: []string{"saml-provider:" + email},
+					Config:      sqlxx.JSONRawMessage(`{"providers": [{"provider": "saml-provider", "subject": "` + email + `"}]}`),
+				})
+				require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(context.Background(), i))
+
+				for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+					t.Run("endpoint="+name, func(t *testing.T) {
+						patch := []patch{
+							{"op": "replace", "path": tc.path, "value": tc.value},
+						}
+						res := send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusBadRequest, &patch)
+						assert.EqualValues(t, "patch includes denied path: "+tc.path, res.Get("error.message").String(), "%s", res.Raw)
+					})
+				}
+			})
+		}
+	})
+
 	t.Run("case=PATCH should allow to update credential password", func(t *testing.T) {
 		email := uuid.NewV5(uuid.Nil, t.Name()).String() + "@ory.sh"
 		i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
@@ -2120,6 +2251,120 @@ func TestHandler(t *testing.T) {
 				assert.Equal(t, "foo",
 					gjson.GetBytes(updated.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())
 				snapshotx.SnapshotT(t, identity.WithCredentialsAndAdminMetadataInJSON(*updated), snapshotx.ExceptNestedKeys(ignoreDefault...))
+			})
+		}
+	})
+
+	t.Run("case=PATCH should reject credentials whose type does not match the map key", func(t *testing.T) {
+		email := uuid.NewV5(uuid.Nil, t.Name()).String() + "@ory.sh"
+		i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
+		i.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+			Type:        identity.CredentialsTypePassword,
+			Identifiers: []string{email},
+			Config:      sqlxx.JSONRawMessage(`{"hashed_password": "secret"}`),
+		})
+		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(t.Context(), i))
+
+		// Snapshot the on-disk credential bytes so we can prove the transaction
+		// rolled back fully on every rejected patch.
+		before, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+		require.NoError(t, err)
+		passwordBefore := before.Credentials[identity.CredentialsTypePassword]
+
+		for _, tc := range []struct {
+			name           string
+			patch          []patch
+			expectedReason string
+		}{
+			{
+				name: "add new credential key without type",
+				patch: []patch{
+					{"op": "add", "path": "/credentials/foo", "value": map[string]any{"config": map[string]any{}}},
+				},
+				expectedReason: `credentials.foo.type must equal "foo", got ""`,
+			},
+			{
+				name: "replace existing credential without type",
+				patch: []patch{
+					{"op": "replace", "path": "/credentials/password", "value": map[string]any{"config": map[string]any{}}},
+				},
+				expectedReason: `credentials.password.type must equal "password", got ""`,
+			},
+			{
+				name: "replace the type field of an existing credential with an empty string",
+				patch: []patch{
+					{"op": "replace", "path": "/credentials/password/type", "value": ""},
+				},
+				expectedReason: `credentials.password.type must equal "password", got ""`,
+			},
+		} {
+			t.Run("case="+tc.name, func(t *testing.T) {
+				for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+					t.Run("endpoint="+name, func(t *testing.T) {
+						// Use a direct HTTP request rather than the local send()
+						// helper: send() uses require.EqualValues for the status
+						// check, which calls FailNow and short-circuits the
+						// downstream post-condition assertions that prove the DB
+						// is left untouched.
+						body, err := json.Marshal(&tc.patch)
+						require.NoError(t, err)
+						req, err := http.NewRequestWithContext(t.Context(), "PATCH", ts.URL+"/identities/"+i.ID.String(), bytes.NewReader(body))
+						require.NoError(t, err)
+						req.Header.Set("Content-Type", "application/json")
+						resp, err := ts.Client().Do(req)
+						require.NoError(t, err)
+						respBody, err := io.ReadAll(resp.Body)
+						require.NoError(t, err)
+						require.NoError(t, resp.Body.Close())
+						assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", respBody)
+						assert.Equal(t, tc.expectedReason, gjson.GetBytes(respBody, "error.reason").String(), "body=%s", respBody)
+
+						after, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+						require.NoError(t, err)
+						passwordAfter := after.Credentials[identity.CredentialsTypePassword]
+						assert.Equal(t, identity.CredentialsTypePassword, passwordAfter.Type)
+						assert.Equal(t, passwordBefore.Identifiers, passwordAfter.Identifiers)
+						assert.JSONEq(t, string(passwordBefore.Config), string(passwordAfter.Config), "DB credential config was overwritten")
+						assert.Len(t, after.Credentials, 1)
+						assert.NotContains(t, after.Credentials, identity.CredentialsType("foo"))
+					})
+				}
+			})
+		}
+	})
+
+	t.Run("case=PATCH should allow whole-credential replace when type matches the map key", func(t *testing.T) {
+		// Lock in the contract that the new validation does not block a
+		// well-formed full-credential replace — only the
+		// type/map-key-mismatched variants caught above.
+		email := uuid.NewV5(uuid.Nil, t.Name()).String() + "@ory.sh"
+		i := &identity.Identity{Traits: identity.Traits(`{"email":"` + email + `"}`)}
+		i.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+			Type:        identity.CredentialsTypePassword,
+			Identifiers: []string{email},
+			Config:      sqlxx.JSONRawMessage(`{"hashed_password": "old"}`),
+		})
+		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentity(t.Context(), i))
+
+		for name, ts := range map[string]*httptest.Server{"public": publicTS, "admin": adminTS} {
+			t.Run("endpoint="+name, func(t *testing.T) {
+				patch := []patch{
+					{
+						"op":   "replace",
+						"path": "/credentials/password",
+						"value": map[string]any{
+							"type":        "password",
+							"identifiers": []string{email},
+							"config":      map[string]any{"hashed_password": "new"},
+						},
+					},
+				}
+				send(t, ts, "PATCH", "/identities/"+i.ID.String(), http.StatusOK, &patch)
+
+				updated, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+				require.NoError(t, err)
+				assert.Equal(t, "new",
+					gjson.GetBytes(updated.Credentials[identity.CredentialsTypePassword].Config, "hashed_password").String())
 			})
 		}
 	})
@@ -2268,7 +2513,7 @@ func TestHandler(t *testing.T) {
 				assert.JSONEq(t, string(cr.Traits), res.Get("traits").Raw, "%s", res.Raw)
 				assert.EqualValues(t, "employee", res.Get("schema_id").String(), "%s", res.Raw)
 				assert.EqualValues(t, identity.StateActive, res.Get("state").String(), "%s", res.Raw)
-				assert.EqualValues(t, mockServerURL.String()+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
+				assert.EqualValues(t, publicTS.URL+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
 			})
 		}
 	})
@@ -2285,7 +2530,7 @@ func TestHandler(t *testing.T) {
 				assert.JSONEq(t, string(cr.Traits), res.Get("traits").Raw, "%s", res.Raw)
 				assert.EqualValues(t, "employee", res.Get("schema_id").String(), "%s", res.Raw)
 				assert.EqualValues(t, identity.StateActive, res.Get("state").String(), "%s", res.Raw)
-				assert.EqualValues(t, mockServerURL.String()+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
+				assert.EqualValues(t, publicTS.URL+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
 			})
 		}
 	})
@@ -2302,7 +2547,7 @@ func TestHandler(t *testing.T) {
 				assert.JSONEq(t, string(cr.Traits), res.Get("traits").Raw, "%s", res.Raw)
 				assert.EqualValues(t, "employee", res.Get("schema_id").String(), "%s", res.Raw)
 				assert.EqualValues(t, identity.StateInactive, res.Get("state").String(), "%s", res.Raw)
-				assert.EqualValues(t, mockServerURL.String()+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
+				assert.EqualValues(t, publicTS.URL+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
 			})
 		}
 	})
@@ -2325,7 +2570,7 @@ func TestHandler(t *testing.T) {
 				})
 
 				assert.EqualValues(t, "employee", res.Get("schema_id").String(), "%s", res.Raw)
-				assert.EqualValues(t, mockServerURL.String()+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
+				assert.EqualValues(t, publicTS.URL+"/schemas/ZW1wbG95ZWU", res.Get("schema_url").String(), "%s", res.Raw)
 				assert.EqualValues(t, updatedEmail, res.Get("traits.email").String(), "%s", res.Raw)
 				assert.EqualValues(t, "ory", res.Get("traits.department").String(), "%s", res.Raw)
 				assert.EqualValues(t, updatedEmail, res.Get("recovery_addresses.0.value").String(), "%s", res.Raw)
@@ -2491,7 +2736,7 @@ func TestHandler(t *testing.T) {
 				}
 				if id.Get("credentials.saml.identifiers.0").Str == "bar:foo.saml@bar.com" {
 					foundSAML = true
-					assert.False(t, id.Get("credentials.saml.config").Exists(), "SAML config is not included")
+					assert.Falsef(t, id.Get("credentials.saml.config").Exists(), "SAML config is not included: %s", id.Raw)
 				}
 			}
 			assert.True(t, foundOIDC, "OIDC credential included")
@@ -2515,7 +2760,7 @@ func TestHandler(t *testing.T) {
 		for name, ts := range map[string]*httptest.Server{"admin": adminTS} {
 			t.Run("endpoint="+name, func(t *testing.T) {
 				res := get(t, ts, "/identities?include_credential=XYZ", http.StatusBadRequest)
-				assert.Contains(t, res.Get("error.message").String(), "The request was malformed or contained invalid parameters", "%s", res.Raw)
+				assert.Containsf(t, res.Get("error.message").String(), "The request was malformed or contained invalid parameters", "%s", res.Raw)
 			})
 		}
 	})
@@ -2745,6 +2990,95 @@ func TestHandler(t *testing.T) {
 				assert.EqualValues(t, oidConfig.Get("providers.1.provider").String(), "okta", "%s", res.Raw)
 				assert.EqualValues(t, oidConfig.Get("providers.1.subject").String(), oktaSubject, "%s", res.Raw)
 			})
+			t.Run("type=remove deviceauthn by identifier/"+name, func(t *testing.T) {
+				newDeviceAuthnFixture := func(t *testing.T) (i *identity.Identity, iPhone1, iPhone2, pixel string) {
+					t.Helper()
+					iPhone1 = x.NewUUID().String()
+					iPhone2 = x.NewUUID().String()
+					pixel = x.NewUUID().String()
+					keys := []deviceauthn.Key{
+						{ClientKeyID: iPhone1, DeviceName: "iPhone", Version: 1},
+						{ClientKeyID: iPhone2, DeviceName: "iPhone", Version: 1},
+						{ClientKeyID: pixel, DeviceName: "Pixel", Version: 1},
+					}
+					raw, err := json.Marshal(deviceauthn.CredentialsDeviceAuthnConfig{Credentials: keys})
+					require.NoError(t, err)
+					i = createIdentity(M{
+						identity.CredentialsTypeDeviceAuthn: {
+							Identifiers: []string{iPhone1, iPhone2, pixel},
+							Config:      raw,
+						},
+					})(t)
+					return i, iPhone1, iPhone2, pixel
+				}
+
+				t.Run("removes only the key matching the identifier", func(t *testing.T) {
+					i, iPhone1, iPhone2, pixel := newDeviceAuthnFixture(t)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn?identifier="+iPhone1, http.StatusNoContent)
+
+					after, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+					require.NoError(t, err)
+					cred, ok := after.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+					require.True(t, ok)
+					// The identifier rows are synced as a set, so order is not
+					// significant; the config preserves the surviving keys' order.
+					assert.ElementsMatch(t, []string{iPhone2, pixel}, []string(cred.Identifiers))
+					var cfg deviceauthn.CredentialsDeviceAuthnConfig
+					require.NoError(t, json.Unmarshal(cred.Config, &cfg))
+					require.Len(t, cfg.Credentials, 2)
+					assert.Equal(t, iPhone2, cfg.Credentials[0].ClientKeyID)
+					assert.Equal(t, pixel, cfg.Credentials[1].ClientKeyID)
+				})
+
+				t.Run("leaves the credential empty when no key remains", func(t *testing.T) {
+					i, iPhone1, iPhone2, pixel := newDeviceAuthnFixture(t)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn?identifier="+iPhone1, http.StatusNoContent)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn?identifier="+iPhone2, http.StatusNoContent)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn?identifier="+pixel, http.StatusNoContent)
+
+					// The row lock rewrites the config in place, so removing the
+					// last key leaves an empty credential rather than deleting it.
+					after, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+					require.NoError(t, err)
+					cred, ok := after.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+					require.True(t, ok)
+					assert.Empty(t, cred.Identifiers)
+					var cfg deviceauthn.CredentialsDeviceAuthnConfig
+					require.NoError(t, json.Unmarshal(cred.Config, &cfg))
+					assert.Empty(t, cfg.Credentials)
+				})
+
+				t.Run("unknown identifier returns 404 and removes nothing", func(t *testing.T) {
+					i, _, _, _ := newDeviceAuthnFixture(t)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn?identifier="+x.NewUUID().String(), http.StatusNotFound)
+
+					after, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+					require.NoError(t, err)
+					cred, ok := after.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+					require.True(t, ok)
+					assert.Len(t, cred.Identifiers, 3, "an unknown identifier must leave every key intact")
+				})
+
+				t.Run("returns 404 when the identity has no deviceauthn credential", func(t *testing.T) {
+					i := createIdentity(M{
+						identity.CredentialsTypePassword: {
+							Config:      []byte(`{"hashed_password":"some_valid_hash"}`),
+							Identifiers: []string{x.NewUUID().String()},
+						},
+					})(t)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn?identifier="+x.NewUUID().String(), http.StatusNotFound)
+				})
+
+				t.Run("missing identifier returns 400", func(t *testing.T) {
+					i, _, _, _ := newDeviceAuthnFixture(t)
+					remove(t, ts, "/identities/"+i.ID.String()+"/credentials/deviceauthn", http.StatusBadRequest)
+
+					after, err := reg.PrivilegedIdentityPool().GetIdentityConfidential(t.Context(), i.ID)
+					require.NoError(t, err)
+					_, ok := after.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+					assert.True(t, ok, "credential must be unchanged when the request is rejected")
+				})
+			})
 			t.Run("type=remove webauthn passwordless type/"+name, func(t *testing.T) {
 				expected := `{"credentials":[{"id":"THTndqZP5Mjvae1BFvJMaMfEMm7O7HE1ju+7PBaYA7Y=","added_at":"2022-12-16T14:11:55Z","public_key":"pQECAyYgASFYIMJLQhJxQRzhnKPTcPCUODOmxYDYo2obrm9bhp5lvSZ3IlggXjhZvJaPUqF9PXqZqTdWYPR7R+b2n/Wi+IxKKXsS4rU=","display_name":"test","authenticator":{"aaguid":"rc4AAjW8xgpkiwsl8fBVAw==","sign_count":0,"clone_warning":false},"is_passwordless":true,"attestation_type":"none"}],"user_handle":"Ef5JiMpMRwuzauWs/9J0gQ=="}`
 				i := createIdentity(M{identity.CredentialsTypeWebAuthn: {Config: []byte(expected)}})(t)
@@ -2919,7 +3253,7 @@ func TestHandler(t *testing.T) {
 			toCreate = append(toCreate, i)
 		}
 
-		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(context.Background(), toCreate...))
+		require.NoError(t, reg.PrivilegedIdentityPool().CreateIdentities(context.Background(), toCreate))
 
 		for _, perPage := range []int{10, 50, 100, 500} {
 			t.Run(fmt.Sprintf("perPage=%d", perPage), func(t *testing.T) {
@@ -3027,9 +3361,7 @@ func validCreateIdentityBody(t *testing.T, prefix string, i int, plainPassword b
 		Password: fmt.Sprintf("password-%d", i),
 	}
 	if !plainPassword {
-		g, err := bcrypt.GenerateFromPassword([]byte(fmt.Sprintf("password-%d", i)), 6)
-		require.NoError(t, err)
-		conf.Password = string(g)
+		conf.Password = sharedBcryptTestHash
 	}
 	externalID := ""
 	if i%2 == 0 {
@@ -3075,4 +3407,189 @@ func getCodeValues(codes []identity.RecoveryCode) []string {
 		values = append(values, code.Code)
 	}
 	return values
+}
+
+func TestHandler_Region(t *testing.T) {
+	t.Parallel()
+
+	_, reg := pkg.NewFastRegistryWithMocks(t,
+		configx.WithValues(testhelpers.IdentitySchemasConfig(map[string]string{
+			"default": "file://./stub/identity.schema.json",
+		})),
+	)
+
+	_, adminTS := testhelpers.NewKratosServerWithCSRF(t, reg)
+
+	send := func(t *testing.T, method, href string, expectCode int, body interface{}) gjson.Result {
+		t.Helper()
+		var b bytes.Buffer
+		switch raw := body.(type) {
+		case json.RawMessage:
+			b = *bytes.NewBuffer(raw)
+		default:
+			if body != nil {
+				require.NoError(t, json.NewEncoder(&b).Encode(body))
+			}
+		}
+		req, err := http.NewRequest(method, adminTS.URL+href, &b)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		res, err := adminTS.Client().Do(req)
+		require.NoError(t, err)
+		respBody, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+		require.NoError(t, res.Body.Close())
+		require.EqualValues(t, expectCode, res.StatusCode, "%s", respBody)
+		return gjson.ParseBytes(respBody)
+	}
+
+	t.Run("case=POST /admin/identities binds region field", func(t *testing.T) {
+		res := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"eu-central"}`),
+		)
+		assert.Equal(t, "eu-central", res.Get("region").String(), "%s", res.Raw)
+	})
+
+	t.Run("case=POST /admin/identities returns region in create response", func(t *testing.T) {
+		// The create handler binds Region from the request body and returns it in
+		// the 201 response. OSS persists Region in-memory only (db:"-"), so the
+		// field is present in the create response even though a subsequent GET
+		// will not include it (no backing column in OSS SQLite).
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"us-west"}`),
+		)
+		assert.Equal(t, "us-west", created.Get("region").String(), "%s", created.Raw)
+		assert.NotEmpty(t, created.Get("id").String(), "%s", created.Raw)
+	})
+
+	t.Run("case=PATCH /admin/identities/{id} replace /region", func(t *testing.T) {
+		// Create an identity with a region.
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"eu-central"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		res := send(t, "PATCH", "/identities/"+id, http.StatusOK,
+			json.RawMessage(`[{"op":"replace","path":"/region","value":"us-west"}]`),
+		)
+		// PATCH response includes the updated region in the body.
+		assert.Equal(t, "us-west", res.Get("region").String(), "%s", res.Raw)
+	})
+
+	t.Run("case=PATCH /admin/identities/{id} add /region", func(t *testing.T) {
+		// Create an identity without a region.
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"}}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		res := send(t, "PATCH", "/identities/"+id, http.StatusOK,
+			json.RawMessage(`[{"op":"add","path":"/region","value":"us-east"}]`),
+		)
+		assert.Equal(t, "us-east", res.Get("region").String(), "%s", res.Raw)
+	})
+
+	t.Run("case=PATCH /admin/identities/{id} rejects remove on /region", func(t *testing.T) {
+		// Create an identity with a region.
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"eu-central"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		// remove is not allowed on /region: callers must always set the region
+		// explicitly via add/replace.
+		send(t, "PATCH", "/identities/"+id, http.StatusBadRequest,
+			json.RawMessage(`[{"op":"remove","path":"/region"}]`),
+		)
+	})
+
+	t.Run("case=PATCH /admin/identities/{id} rejects move on /region", func(t *testing.T) {
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"eu-central"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		// move is not in the op-allowlist; expect a 400.
+		send(t, "PATCH", "/identities/"+id, http.StatusBadRequest,
+			json.RawMessage(`[{"op":"move","from":"/region","path":"/traits/x"}]`),
+		)
+	})
+
+	t.Run("case=PATCH /admin/identities/{id} rejects invalid region value", func(t *testing.T) {
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"eu-central"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		send(t, "PATCH", "/identities/"+id, http.StatusBadRequest,
+			json.RawMessage(`[{"op":"replace","path":"/region","value":"mars"}]`),
+		)
+	})
+
+	t.Run("case=PUT /admin/identities/{id} updates region", func(t *testing.T) {
+		// Create with region us-east, then PUT with region eu-central.
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"us-east"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		res := send(t, "PUT", "/identities/"+id, http.StatusOK,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"qux"},"state":"active","region":"eu-central"}`),
+		)
+		assert.Equal(t, "eu-central", res.Get("region").String(), "%s", res.Raw)
+	})
+
+	t.Run("case=PUT /admin/identities/{id} rejects invalid region value", func(t *testing.T) {
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"us-east"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		send(t, "PUT", "/identities/"+id, http.StatusBadRequest,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"qux"},"state":"active","region":"mars"}`),
+		)
+	})
+
+	t.Run("case=PATCH /admin/identities/{id} mixed /region and /traits ops", func(t *testing.T) {
+		// applyRegionPatchOps must extract /region ops and forward the
+		// remaining ops to ApplyJSONPatch unchanged. Both updates must apply.
+		created := send(t, "POST", "/identities", http.StatusCreated,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"eu-central"}`),
+		)
+		id := created.Get("id").String()
+		require.NotEmpty(t, id)
+
+		res := send(t, "PATCH", "/identities/"+id, http.StatusOK,
+			json.RawMessage(`[
+				{"op":"replace","path":"/region","value":"us-west"},
+				{"op":"replace","path":"/traits/bar","value":"qux"}
+			]`),
+		)
+		assert.Equal(t, "us-west", res.Get("region").String(), "%s", res.Raw)
+		assert.Equal(t, "qux", res.Get("traits.bar").String(), "%s", res.Raw)
+	})
+
+	t.Run("case=POST /admin/identities rejects invalid region value", func(t *testing.T) {
+		// The handler must validate region.Region.Valid() at the API boundary so
+		// callers get a 400 even when no project context is available downstream.
+		send(t, "POST", "/identities", http.StatusBadRequest,
+			json.RawMessage(`{"schema_id":"default","traits":{"bar":"baz"},"region":"mars"}`),
+		)
+	})
+
+	t.Run("case=PATCH /admin/identities batch rejects invalid region value", func(t *testing.T) {
+		// Batch import shares identityFromCreateIdentityBody, so a bogus region
+		// in any patch entry must short-circuit the whole request as 400.
+		send(t, "PATCH", "/identities", http.StatusBadRequest,
+			json.RawMessage(`{"identities":[{"create":{"schema_id":"default","traits":{"bar":"baz"},"region":"mars"}}]}`),
+		)
+	})
+
 }

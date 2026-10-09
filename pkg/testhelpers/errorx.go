@@ -7,7 +7,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -19,6 +18,7 @@ import (
 	"github.com/ory/herodot"
 
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/errorx"
 	"github.com/ory/kratos/session"
 	"github.com/ory/kratos/x"
@@ -34,11 +34,10 @@ func NewErrorTestServer(t *testing.T, reg interface {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e, err := reg.SelfServiceErrorPersister().ReadErrorContainer(r.Context(), x.ParseUUID(r.URL.Query().Get("id")))
 		require.NoError(t, err)
-		t.Logf("Found error in NewErrorTestServer: %s", e.Errors)
+		t.Logf("landed on error UI with: %s", e.Errors)
 		writer.Write(w, r, e.Errors)
 	}))
 	t.Cleanup(ts.Close)
-	ts.URL = strings.ReplaceAll(ts.URL, "127.0.0.1", "localhost")
 	reg.Config().MustSet(t.Context(), config.ViperKeySelfServiceErrorUI, ts.URL)
 	return ts
 }
@@ -64,7 +63,7 @@ func NewRedirSessionEchoTS(t *testing.T, reg interface {
 ) *httptest.Server {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// verify that the client has a session, and echo it back
-		sess, err := reg.SessionManager().FetchFromRequest(r.Context(), r)
+		sess, err := reg.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 		require.NoError(t, err, "Headers: %+v", r.Header)
 		reg.Writer().Write(w, r, sess)
 	}))
@@ -81,7 +80,7 @@ func NewRedirNoSessionTS(t *testing.T, reg interface {
 ) *httptest.Server {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// verify that the client DOES NOT have a session
-		_, err := reg.SessionManager().FetchFromRequest(r.Context(), r)
+		_, err := reg.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 		require.Error(t, err, "Headers: %+v", r.Header)
 		reg.Writer().Write(w, r, nil)
 	}))

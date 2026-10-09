@@ -13,9 +13,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 
 	"github.com/ory/kratos/courier"
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/pkg/testhelpers"
@@ -25,6 +27,7 @@ import (
 	"github.com/ory/kratos/selfservice/strategy/link"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/contextx"
+	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
 
@@ -72,7 +75,7 @@ func TestManager(t *testing.T) {
 			t.Run("method=SendRecoveryLink", func(t *testing.T) {
 				s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("link")
 				require.NoError(t, err)
-				f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
+				f, err := recovery.NewFlow(reg, time.Hour, "", u.WithContext(ctx), s, flow.TypeBrowser)
 				require.NoError(t, err)
 
 				require.NoError(t, reg.RecoveryFlowPersister().CreateRecoveryFlow(ctx, f))
@@ -120,7 +123,7 @@ func TestManager(t *testing.T) {
 
 				s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("link")
 				require.NoError(t, err)
-				f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
+				f, err := recovery.NewFlow(reg, time.Hour, "", u.WithContext(ctx), s, flow.TypeBrowser)
 				require.NoError(t, err)
 
 				require.NoError(t, reg.RecoveryFlowPersister().CreateRecoveryFlow(ctx, f))
@@ -151,7 +154,7 @@ func TestManager(t *testing.T) {
 				strategies, _, err := reg.GetActiveVerificationStrategies(ctx)
 				require.NoError(t, err)
 
-				f, err := verification.NewFlow(conf, time.Hour, "", u, strategies, flow.TypeBrowser)
+				f, err := verification.NewFlow(reg, time.Hour, "", u.WithContext(ctx), strategies, flow.TypeBrowser)
 				require.NoError(t, err)
 
 				require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -178,6 +181,26 @@ func TestManager(t *testing.T) {
 		})
 	}
 
+	t.Run("method=SendVerificationLink with OAuth2 login challenge", func(t *testing.T) {
+		reg.SetHydra(hydra.NewFake())
+		strategies, _, err := reg.GetActiveVerificationStrategies(ctx)
+		require.NoError(t, err)
+
+		f, err := verification.NewFlow(reg, time.Hour, "", u.WithContext(ctx), strategies, flow.TypeBrowser)
+		require.NoError(t, err)
+		f.OAuth2LoginChallenge = sqlxx.NullString(hydra.FakeValidLoginChallenge)
+		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
+
+		require.NoError(t, reg.LinkSender().SendVerificationLink(ctx, f, "email", "tracked@ory.sh"))
+
+		messages, err := reg.CourierPersister().NextMessages(ctx, 12)
+		require.NoError(t, err)
+		require.Len(t, messages, 1)
+		templateData := messages[0].TemplateData
+		assert.Equal(t, hydra.FakeValidLoginChallenge, gjson.GetBytes(templateData, "oauth2_login_request.challenge").String())
+		assert.Equal(t, hydra.FakeClientID, gjson.GetBytes(templateData, "oauth2_login_request.client.client_id").String())
+	})
+
 	t.Run("case=should be able to disable invalid email dispatch", func(t *testing.T) {
 		for _, tc := range []struct {
 			flow      string
@@ -190,7 +213,7 @@ func TestManager(t *testing.T) {
 				send: func(t *testing.T) {
 					s, _, err := reg.RecoveryStrategies(ctx).ActiveStrategies("link")
 					require.NoError(t, err)
-					f, err := recovery.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
+					f, err := recovery.NewFlow(reg, time.Hour, "", u.WithContext(ctx), s, flow.TypeBrowser)
 					require.NoError(t, err)
 
 					require.NoError(t, reg.RecoveryFlowPersister().CreateRecoveryFlow(ctx, f))
@@ -205,7 +228,7 @@ func TestManager(t *testing.T) {
 				send: func(t *testing.T) {
 					s, _, err := reg.VerificationStrategies(ctx).ActiveStrategies("link")
 					require.NoError(t, err)
-					f, err := verification.NewFlow(conf, time.Hour, "", u, s, flow.TypeBrowser)
+					f, err := verification.NewFlow(reg, time.Hour, "", u.WithContext(ctx), s, flow.TypeBrowser)
 					require.NoError(t, err)
 
 					require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))

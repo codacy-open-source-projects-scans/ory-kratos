@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"reflect"
@@ -31,6 +32,7 @@ import (
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
@@ -67,7 +69,6 @@ type UpdateLoginFlowWithOidcMethod struct {
 	//
 	// These parameters are optional and depend on what the upstream identity provider supports.
 	// Supported parameters are:
-	// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
 	// - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
 	// - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
 	// - `acr_values` (string): The `acr_values` specifies the Authentication Context Class Reference values for the authorization request.
@@ -101,7 +102,11 @@ type UpdateLoginFlowWithOidcMethod struct {
 }
 
 func (s *Strategy) handleConflictingIdentity(ctx context.Context, loginFlow *login.Flow, token *identity.CredentialsOIDCEncryptedTokens, claims *Claims, provider Provider, container *AuthCodeContainer) (verdict ConflictingIdentityVerdict, id *identity.Identity, credentials *identity.Credentials, err error) {
-	if s.conflictingIdentityPolicy == nil {
+	if s.conflictingIdentityPolicy == nil && s.d.Config().SelfServiceFlowRegistrationEnabled(ctx) {
+		// Without a conflicting-identity policy there is nothing to merge. The
+		// conflict lookup below is still required when registration is
+		// disabled, because ProcessLogin uses its result to distinguish
+		// account linking from a genuine new sign-up.
 		return ConflictingIdentityVerdictReject, nil, nil, nil
 	}
 
@@ -143,7 +148,18 @@ func (s *Strategy) handleConflictingIdentity(ctx context.Context, loginFlow *log
 
 	existingIdentity, _, _, err := s.d.IdentityManager().ConflictingIdentity(ctx, newIdentity)
 	if err != nil {
-		return ConflictingIdentityVerdictReject, nil, nil, nil
+		if errors.Is(err, sqlcon.ErrNoRows()) {
+			// No existing identity matches the new identity's identifiers.
+			return ConflictingIdentityVerdictReject, nil, nil, nil
+		}
+		// Propagate infrastructure errors instead of misreporting them as
+		// "no conflicting identity", which would surface to the user as a
+		// misleading rejection (e.g. "registration disabled").
+		return ConflictingIdentityVerdictUnknown, nil, nil, err
+	}
+
+	if s.conflictingIdentityPolicy == nil {
+		return ConflictingIdentityVerdictReject, existingIdentity, creds, nil
 	}
 
 	verdict = s.conflictingIdentityPolicy(ctx, existingIdentity, newIdentity, provider, claims)
@@ -344,8 +360,25 @@ func (s *Strategy) ProcessLogin(ctx context.Context, w http.ResponseWriter, r *h
 					WithField("subject", claims.Subject).
 					Debug("Received successful OpenID Connect callback but user is not registered. Re-initializing registration flow now.")
 
-				// If return_to was set before, we need to preserve it.
+				if !s.d.Config().SelfServiceFlowRegistrationEnabled(ctx) && i == nil {
+					// Registration is disabled and no existing identity matches the
+					// provider claims, so this is a genuine new sign-up and not an
+					// account linking attempt. Reject it instead of converting the
+					// flow.
+					return nil, s.HandleError(ctx, w, r, loginFlow, provider.Config().ID, nil, errors.WithStack(registration.ErrRegistrationDisabled()))
+				}
+
 				var opts []registration.FlowOption
+				if i != nil {
+					// A conflicting identity exists, so submitting this flow can
+					// only link to that identity, never create a new one. Mark it
+					// as an internal login → registration conversion for account
+					// linking: such flows may exist while registration is disabled.
+					// Genuine sign-ups (no conflicting identity) stay unmarked and
+					// are only reachable while registration is enabled.
+					opts = append(opts, registration.WithFlowAccountLinking())
+				}
+				// If return_to was set before, we need to preserve it.
 				if len(loginFlow.ReturnTo) > 0 {
 					opts = append(opts, registration.WithFlowReturnTo(loginFlow.ReturnTo))
 				}
@@ -451,6 +484,16 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	f.RawIDTokenNonce = p.IDTokenNonce
 	f.TransientPayload = p.TransientPayload
 
+	// Test flows use a flow-owned random UUID as the CSRF bearer (no browser
+	// cookie is involved in their creation). Verify it in constant time so
+	// that an attacker who discovers the flow ID alone cannot initiate a
+	// parallel OIDC round-trip against the flow.
+	if f.IsTest() {
+		if subtle.ConstantTimeCompare([]byte(p.CSRFToken), []byte(f.CSRFToken)) != 1 {
+			return nil, s.HandleError(ctx, w, r, f, "", nil, errors.WithStack(nosurfx.ErrInvalidCSRFToken()))
+		}
+	}
+
 	pid := p.Provider // this can come from both url query and post body
 	if pid == "" {
 		span.SetAttributes(attribute.String("not_responsible_reason", "provider ID missing"))
@@ -505,7 +548,7 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		return nil, errors.WithStack(flow.ErrCompletedByStrategy)
 	}
 
-	state, pkce, err := s.GenerateState(ctx, provider, f)
+	state, pkce, err := s.GenerateState(ctx, provider, f, x.RequestBaseURL(r))
 	if err != nil {
 		return nil, s.HandleError(ctx, w, r, f, pid, nil, err)
 	}

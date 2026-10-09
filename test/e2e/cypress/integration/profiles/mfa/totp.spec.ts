@@ -46,6 +46,7 @@ context("2FA TOTP", () => {
         })
       })
 
+      // playwright:migrated
       it("should be be asked to sign in with 2fa if set up", () => {
         cy.visit(settings)
         cy.requireStrictAal()
@@ -157,6 +158,7 @@ context("2FA TOTP", () => {
         cy.url().should("eq", "https://www.example.org/")
       })
 
+      // playwright:migrated
       it("should go through several totp lifecycles", () => {
         cy.visit(settings)
 
@@ -301,6 +303,7 @@ context("2FA TOTP", () => {
         cy.expectSettingsSaved()
       })
 
+      // playwright:migrated
       it("should not show totp as an option if not configured", () => {
         cy.visit(login + "?aal=aal2")
         cy.location("pathname").should((loc) => {
@@ -320,6 +323,7 @@ context("2FA TOTP", () => {
         cy.noSession()
       })
 
+      // playwright:migrated
       it("should fail to set up totp if verify code is wrong", () => {
         cy.visit(settings)
         cy.get('input[name="totp_code"]').type("12345678")
@@ -332,6 +336,7 @@ context("2FA TOTP", () => {
 
       // The React app keeps using the same flow. The following scenario used to be broken,
       // because the internal context wasn't populated properly in the flow after settings were saved.
+      // playwright:migrated
       it("should allow changing other settings and then setting up totp", () => {
         cy.visit(settings)
         cy.get('input[name="traits.website"]')

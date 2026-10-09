@@ -9,14 +9,15 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/courier"
+	"github.com/ory/kratos/courier/template"
 	"github.com/ory/kratos/courier/template/email"
 	"github.com/ory/kratos/courier/template/sms"
 	"github.com/ory/kratos/driver/config"
+	"github.com/ory/kratos/hydra"
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/recovery"
@@ -46,6 +47,7 @@ type (
 		RegistrationCodePersistenceProvider
 		LoginCodePersistenceProvider
 
+		hydra.Provider
 		httpx.ClientProvider
 	}
 	SenderProvider interface {
@@ -77,6 +79,14 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 	transientPayload, err := x.ParseRawMessageOrEmpty(f.GetTransientPayload())
 	if err != nil {
 		return errors.WithStack(err)
+	}
+
+	// If the flow was initiated by an OAuth2 login challenge, expose a scoped
+	// view of the OAuth2 client to the courier templates so that messages can
+	// be branded per client.
+	var oauth2LoginRequest *template.OAuth2LoginRequest
+	if p, ok := f.(flow.HydraLoginRequestProvider); ok {
+		oauth2LoginRequest = template.NewOAuth2LoginRequest(p.GetHydraLoginRequest())
 	}
 
 	// send to all addresses
@@ -122,6 +132,7 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 					RequestURL:         f.GetRequestURL(),
 					TransientPayload:   transientPayload,
 					ExpiresInMinutes:   int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+					OAuth2LoginRequest: oauth2LoginRequest,
 					UserRequestHeaders: hook.RemoveDisallowedHeaders(header, s.deps.Config().WebhookHeaderAllowlist(ctx)),
 				})
 			case identity.ChannelTypeSMS:
@@ -130,8 +141,10 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 					RegistrationCode:   rawCode,
 					Identity:           model,
 					RequestURL:         f.GetRequestURL(),
+					RequestURLDomain:   requestURLDomain(f.GetRequestURL()),
 					TransientPayload:   transientPayload,
 					ExpiresInMinutes:   int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+					OAuth2LoginRequest: oauth2LoginRequest,
 					UserRequestHeaders: hook.RemoveDisallowedHeaders(header, s.deps.Config().WebhookHeaderAllowlist(ctx)),
 				})
 			}
@@ -144,12 +157,13 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 			code, err := s.deps.
 				LoginCodePersister().
 				CreateLoginCode(ctx, &CreateLoginCodeParams{
-					AddressType: address.Via,
-					Address:     address.To,
-					RawCode:     rawCode,
-					ExpiresIn:   s.deps.Config().SelfServiceCodeMethodLifespan(ctx),
-					FlowID:      f.GetID(),
-					IdentityID:  id.ID,
+					AddressType:    address.Via,
+					Address:        address.To,
+					RawCode:        rawCode,
+					ExpiresIn:      s.deps.Config().SelfServiceCodeMethodLifespan(ctx),
+					FlowID:         f.GetID(),
+					IdentityID:     id.ID,
+					IdentityRegion: id.Region,
 				})
 			if err != nil {
 				return err
@@ -175,6 +189,7 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 					RequestURL:         f.GetRequestURL(),
 					TransientPayload:   transientPayload,
 					ExpiresInMinutes:   int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+					OAuth2LoginRequest: oauth2LoginRequest,
 					UserRequestHeaders: hook.RemoveDisallowedHeaders(header, s.deps.Config().WebhookHeaderAllowlist(ctx)),
 				})
 			case identity.ChannelTypeSMS:
@@ -183,8 +198,10 @@ func (s *Sender) SendCode(ctx context.Context, f flow.Flow, id *identity.Identit
 					LoginCode:          rawCode,
 					Identity:           model,
 					RequestURL:         f.GetRequestURL(),
+					RequestURLDomain:   requestURLDomain(f.GetRequestURL()),
 					TransientPayload:   transientPayload,
 					ExpiresInMinutes:   int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+					OAuth2LoginRequest: oauth2LoginRequest,
 					UserRequestHeaders: hook.RemoveDisallowedHeaders(header, s.deps.Config().WebhookHeaderAllowlist(ctx)),
 				})
 			}
@@ -391,11 +408,11 @@ func (s *Sender) SendVerificationCode(ctx context.Context, f *verification.Flow,
 	return s.deps.PrivilegedIdentityPool().UpdateVerifiableAddress(ctx, address, "status")
 }
 
-func (s *Sender) constructVerificationLink(ctx context.Context, fID uuid.UUID, codeStr string) string {
+func (s *Sender) constructVerificationLink(ctx context.Context, f *verification.Flow, codeStr string) string {
 	return urlx.CopyWithQuery(
-		urlx.AppendPaths(s.deps.Config().SelfServiceLinkMethodBaseURL(ctx), verification.RouteSubmitFlow),
+		urlx.AppendPaths(x.CourierBaseURL(f.GetCourierBaseURL(), s.deps.Config().SelfPublicURL(ctx)), verification.RouteSubmitFlow),
 		url.Values{
-			"flow": {fID.String()},
+			"flow": {f.ID.String()},
 			"code": {codeStr},
 		}).String()
 }
@@ -419,28 +436,43 @@ func (s *Sender) SendVerificationCodeTo(ctx context.Context, f *verification.Flo
 		return errors.WithStack(err)
 	}
 
+	// If the flow was initiated by an OAuth2 login challenge, expose a scoped
+	// view of the OAuth2 client to the courier templates so that messages can
+	// be branded per client.
+	if f.OAuth2LoginChallenge != "" && f.HydraLoginRequest == nil {
+		hlr, err := s.deps.Hydra().GetLoginRequest(ctx, string(f.OAuth2LoginChallenge))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		f.HydraLoginRequest = hlr
+	}
+	oauth2LoginRequest := template.NewOAuth2LoginRequest(f.HydraLoginRequest)
+
 	var t courier.Template
 
 	// TODO: this can likely be abstracted by making templates not specific to the channel they're using
 	switch via {
 	case identity.ChannelTypeEmail:
 		t = email.NewVerificationCodeValid(s.deps, &email.VerificationCodeValidModel{
-			To:               to,
-			VerificationURL:  s.constructVerificationLink(ctx, f.ID, codeString),
-			Identity:         model,
-			VerificationCode: codeString,
-			RequestURL:       f.GetRequestURL(),
-			TransientPayload: transientPayload,
-			ExpiresInMinutes: int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+			To:                 to,
+			VerificationURL:    s.constructVerificationLink(ctx, f, codeString),
+			Identity:           model,
+			VerificationCode:   codeString,
+			RequestURL:         f.GetRequestURL(),
+			TransientPayload:   transientPayload,
+			ExpiresInMinutes:   int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+			OAuth2LoginRequest: oauth2LoginRequest,
 		})
 	case identity.ChannelTypeSMS:
 		t = sms.NewVerificationCodeValid(s.deps, &sms.VerificationCodeValidModel{
-			To:               to,
-			VerificationCode: codeString,
-			Identity:         model,
-			RequestURL:       f.GetRequestURL(),
-			TransientPayload: transientPayload,
-			ExpiresInMinutes: int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+			To:                 to,
+			VerificationCode:   codeString,
+			Identity:           model,
+			RequestURL:         f.GetRequestURL(),
+			RequestURLDomain:   requestURLDomain(f.GetRequestURL()),
+			TransientPayload:   transientPayload,
+			ExpiresInMinutes:   int(s.deps.Config().SelfServiceCodeMethodLifespan(ctx).Minutes()),
+			OAuth2LoginRequest: oauth2LoginRequest,
 		})
 	default:
 		return errors.WithStack(herodot.ErrInternalServerError().WithReasonf("Expected email or sms but got %s", via))
@@ -480,6 +512,18 @@ func (s *Sender) send(ctx context.Context, via string, t courier.Template) error
 	default:
 		return f.ToUnknownCaseErr()
 	}
+}
+
+// requestURLDomain returns the bare hostname of the flow's request URL. It is
+// used to bind the SMS one-time code to its origin for the Web OTP API. The
+// result is a best-effort hint: a malformed URL yields an empty string and must
+// not block delivery of the code.
+func requestURLDomain(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // hackyInferChannel infers the channel (email or sms) based on the address format.

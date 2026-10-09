@@ -48,6 +48,7 @@ context("2FA lookup secrets", () => {
         cy.sessionRequiresNo2fa()
       })
 
+      // playwright:migrated
       it("should be able to remove lookup codes", () => {
         cy.sessionRequires2fa()
         cy.longPrivilegedSessionTime()
@@ -82,6 +83,7 @@ context("2FA lookup secrets", () => {
         cy.get('*[name="method"][value="password"]').should("not.exist")
       })
 
+      // playwright:migrated
       it("should go through several lookup secret lifecycles", () => {
         cy.visit(settings)
 
@@ -285,6 +287,7 @@ context("2FA lookup secrets", () => {
         }
       })
 
+      // playwright:migrated
       it("should not show lookup as an option if not configured", () => {
         cy.visit(login + "?aal=aal2")
         cy.get('*[name="method"][value="totp"]').should("not.exist")

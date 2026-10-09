@@ -4,11 +4,13 @@
 package identities
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/ory/x/flagx"
 
-	"github.com/ory/x/pagination/keysetpagination"
+	"github.com/ory/x/pagination/keysetclient"
 
 	"github.com/ory/kratos/cmd/cliclient"
 	"github.com/ory/x/cmdx"
@@ -35,7 +37,13 @@ func NewListIdentitiesCmd() *cobra.Command {
 The consistency defaults to ` + "`eventual`" + ` and can be set to ` + "`strong`" + ` or ` + "`eventual`" + `.
 Eventual consistency means that the list operation will return faster and might not include recently created or updated identities. Replication lag is about 5 seconds.`,
 		Example: "{{ .CommandPath }} --page-size 100 --consistency eventual",
-		Args:    cmdx.ZeroOrTwoArgs,
+		Args: func(cmd *cobra.Command, args []string) error {
+			// zero or exactly two args
+			if len(args) != 0 && len(args) != 2 {
+				return fmt.Errorf("expected zero or two args, got %d: %+v", len(args), args)
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := cliclient.NewClient(cmd)
 			if err != nil {
@@ -57,7 +65,7 @@ Eventual consistency means that the list operation will return faster and might 
 				return cmdx.PrintOpenAPIError(cmd, err)
 			}
 
-			pages := keysetpagination.ParseHeader(res)
+			pages := keysetclient.ParseHeader(res)
 			cmdx.PrintTable(cmd, &outputIdentityCollection{
 				Identities:       identities,
 				NextPageToken:    pages.NextToken,

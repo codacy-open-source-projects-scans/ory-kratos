@@ -76,7 +76,7 @@ func TestVerification(t *testing.T) {
 			hc = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				hc = testhelpers.NewClientWithCookies(t)
-				hc.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				hc.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -373,7 +373,7 @@ func TestVerification(t *testing.T) {
 	})
 
 	newValidFlow := func(t *testing.T, fType flow.Type, requestURL string) (*verification.Flow, *link.VerificationToken) {
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", requestURL, nil), nil, fType)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", requestURL, nil), nil, fType)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(context.Background(), f))
@@ -451,7 +451,12 @@ func TestVerification(t *testing.T) {
 	})
 
 	t.Run("description=should apply pending traits change when token is redeemed", func(t *testing.T) {
-		t.Parallel()
+		// Sibling subtests "fires settings post-persist webhook..." and
+		// "post-persist webhook error..." mutate the shared
+		// selfservice.flows.settings.after.profile.hooks config via
+		// conf.MustSet and clean up on subtest exit. Running this subtest
+		// in parallel races against that cleanup and against the shared
+		// SQLite database (SQLITE_BUSY), so it stays sequential.
 		// Create an identity with original traits.
 		pendingID := &identity.Identity{
 			ID:       x.NewUUID(),
@@ -471,7 +476,7 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
 		// Create a verification flow in StateEmailSent.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -586,8 +591,9 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
 		// Create verification flow + PTC linked to the session.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken,
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
 			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -676,8 +682,9 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken,
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
 			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -743,7 +750,9 @@ func TestVerification(t *testing.T) {
 	})
 
 	t.Run("description=should reject pending traits change on concurrent modification", func(t *testing.T) {
-		t.Parallel()
+		// See the note on "should apply pending traits change when token
+		// is redeemed" — this subtest shares config and SQLite state with
+		// the webhook-mutating siblings above and must stay sequential.
 		// Create an identity with original traits.
 		concurrentID := &identity.Identity{
 			ID:       x.NewUUID(),
@@ -771,7 +780,7 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, reg.IdentityManager().Update(ctx, concurrentID, identity.ManagerAllowWriteProtectedTraits))
 
 		// Create a verification flow in StateEmailSent.
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken, httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))
@@ -843,8 +852,9 @@ func TestVerification(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
 
-		f, err := verification.NewFlow(conf, time.Hour, nosurfx.FakeCSRFToken,
+		f, err := verification.NewFlow(reg, time.Hour, nosurfx.FakeCSRFToken,
 			httptest.NewRequest("GET", public.URL+verification.RouteInitBrowserFlow, nil), nil, flow.TypeBrowser)
+
 		require.NoError(t, err)
 		f.State = flow.StateEmailSent
 		require.NoError(t, reg.VerificationFlowPersister().CreateVerificationFlow(ctx, f))

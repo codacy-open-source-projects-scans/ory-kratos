@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httprouterx"
 
 	"github.com/ory/kratos/corpx"
@@ -53,8 +54,8 @@ func TestFlowLifecycle(t *testing.T) {
 	fakeHydra := hydra.NewFake()
 	reg.SetHydra(fakeHydra)
 
-	routerPublic := httprouterx.NewTestRouterPublic(t)
-	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, routerPublic, httprouterx.NewTestRouterAdminWithPrefix(t))
+	routerPublic := httprouterx.NewRouterPublic()
+	ts, _ := testhelpers.NewKratosServerWithRouters(t, reg, routerPublic, httprouterx.NewRouterAdminWithPrefix())
 	loginTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
 
 	returnToTS := testhelpers.NewRedirTS(t, "return_to", conf)
@@ -176,7 +177,7 @@ func TestFlowLifecycle(t *testing.T) {
 				}
 				require.NoError(t, reg.LoginFlowPersister().CreateLoginFlow(context.Background(), &f))
 
-				res, err := http.PostForm(ts.URL+login.RouteSubmitFlow+"?flow="+f.ID.String(), values)
+				res, err := testhelpers.NewTestClient(t).PostForm(ts.URL+login.RouteSubmitFlow+"?flow="+f.ID.String(), values)
 				require.NoError(t, err)
 				body := x.MustReadAll(res.Body)
 				require.NoError(t, res.Body.Close())
@@ -375,10 +376,16 @@ func TestFlowLifecycle(t *testing.T) {
 				conf.MustSet(ctx, config.ViperKeySelfServiceLoginRequestLifespan, "10m")
 			})
 
-			expired := time.Now().Add(-time.Minute)
+			// Freeze the clock so the handler and the expected error read the same instant. The "expired N minutes
+			// ago" reason is then deterministic instead of depending on the request round-trip time.
+			now := time.Now().UTC()
+			reg.SetClock(clock.NewMock(now))
+			t.Cleanup(func() { reg.SetClock(clock.New()) })
+
+			expired := now.Add(-time.Minute)
 			run := func(t *testing.T, tt flow.Type, aal string, values string, isSPA bool) (string, *http.Response) {
 				f := login.Flow{
-					Type: tt, ExpiresAt: expired, IssuedAt: time.Now(),
+					Type: tt, ExpiresAt: expired, IssuedAt: now,
 					UI: container.New(""), Refresh: false, RequestedAAL: identity.AuthenticatorAssuranceLevel(aal),
 				}
 				require.NoError(t, reg.LoginFlowPersister().CreateLoginFlow(context.Background(), &f))
@@ -393,7 +400,7 @@ func TestFlowLifecycle(t *testing.T) {
 					req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 				}
 
-				res, err := http.DefaultClient.Do(req)
+				res, err := testhelpers.NewTestClient(t).Do(req)
 				require.NoError(t, err)
 				body := x.MustReadAll(res.Body)
 				require.NoError(t, res.Body.Close())
@@ -404,7 +411,7 @@ func TestFlowLifecycle(t *testing.T) {
 				actual, res := run(t, flow.TypeAPI, "aal1", `{"method":"password"}`, false)
 				assert.Contains(t, res.Request.URL.String(), login.RouteSubmitFlow)
 				assert.NotEqual(t, "00000000-0000-0000-0000-000000000000", gjson.Get(actual, "use_flow_id").String())
-				assertx.EqualAsJSONExcept(t, flow.NewFlowExpiredError(expired), json.RawMessage(actual), []string{"use_flow_id", "since"}, "expired", "%s", actual)
+				assertx.EqualAsJSONExcept(t, flow.NewFlowExpiredError(reg.Clock(), expired), json.RawMessage(actual), []string{"use_flow_id", "since"}, "expired", "%s", actual)
 			})
 
 			t.Run("type=browser", func(t *testing.T) {
@@ -417,7 +424,7 @@ func TestFlowLifecycle(t *testing.T) {
 				actual, res := run(t, flow.TypeBrowser, "aal1", `{"method":"password"}`, true)
 				assert.Contains(t, res.Request.URL.String(), login.RouteSubmitFlow)
 				assert.NotEqual(t, "00000000-0000-0000-0000-000000000000", gjson.Get(actual, "use_flow_id").String())
-				assertx.EqualAsJSONExcept(t, flow.NewFlowExpiredError(expired), json.RawMessage(actual), []string{"use_flow_id", "since"}, "expired", "%s", actual)
+				assertx.EqualAsJSONExcept(t, flow.NewFlowExpiredError(reg.Clock(), expired), json.RawMessage(actual), []string{"use_flow_id", "since"}, "expired", "%s", actual)
 			})
 		})
 
@@ -921,7 +928,7 @@ func TestGetFlow(t *testing.T) {
 	})
 
 	t.Run("case=csrf cookie missing", func(t *testing.T) {
-		client := http.DefaultClient
+		client := testhelpers.NewTestClient(t)
 		setupLoginUI(t, client)
 		body := testhelpers.EasyGetBody(t, client, public.URL+login.RouteInitBrowserFlow)
 

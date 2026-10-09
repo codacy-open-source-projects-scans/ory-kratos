@@ -76,10 +76,12 @@ func TestHandler(t *testing.T) {
 	otherUser := testhelpers.NewHTTPClientWithArbitrarySessionCookie(ctx, t, reg)
 
 	newExpiredFlow := func() *settings.Flow {
-		f, err := settings.NewFlow(conf, -time.Minute,
+		f, err := settings.NewFlow(reg,
 			&http.Request{URL: urlx.ParseOrPanic(publicTS.URL + login.RouteInitBrowserFlow)},
 			primaryIdentity, flow.TypeBrowser)
+
 		require.NoError(t, err)
+		f.ExpiresAt = f.IssuedAt.Add(-time.Minute)
 		return f
 	}
 
@@ -150,7 +152,7 @@ func TestHandler(t *testing.T) {
 	t.Run("endpoint=init", func(t *testing.T) {
 		t.Run("description=init a flow as API", func(t *testing.T) {
 			t.Run("description=without privileges", func(t *testing.T) {
-				res, body := initFlow(t, new(http.Client), true)
+				res, body := initFlow(t, testhelpers.NewTestClient(t), true)
 				assert.Equalf(t, http.StatusUnauthorized, res.StatusCode, "%s", body)
 				assert.Equalf(t, text.ErrIDNoActiveSession, gjson.GetBytes(body, "error.id").String(), "%s", body)
 			})
@@ -272,7 +274,7 @@ func TestHandler(t *testing.T) {
 
 		t.Run("description=init a flow as SPA", func(t *testing.T) {
 			t.Run("description=without privileges", func(t *testing.T) {
-				res, body := initSPAFlow(t, new(http.Client))
+				res, body := initSPAFlow(t, testhelpers.NewTestClient(t))
 				assert.Equalf(t, http.StatusUnauthorized, res.StatusCode, "%s", body)
 				assert.Equalf(t, text.ErrIDNoActiveSession, gjson.GetBytes(body, "error.id").String(), "%s", body)
 			})

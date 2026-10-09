@@ -37,6 +37,7 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/x/assertx"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/ioutilx"
 	"github.com/ory/x/sqlxx"
@@ -91,7 +92,7 @@ func TestAdminStrategy(t *testing.T) {
 		require.NoError(t, err)
 
 		r := &http.Request{URL: new(url.URL)}
-		f, err := recovery.NewFlow(reg.Config(), time.Minute, "", r, s, flow.TypeBrowser)
+		f, err := recovery.NewFlow(reg, time.Minute, "", r, s, flow.TypeBrowser)
 		require.NoError(t, err)
 
 		require.IsType(t, &link.Strategy{}, ps)
@@ -268,7 +269,7 @@ func TestRecovery(t *testing.T) {
 			hc = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				hc = testhelpers.NewClientWithCookies(t)
-				hc.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				hc.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -358,7 +359,7 @@ func TestRecovery(t *testing.T) {
 			hc := testhelpers.NewDebugClient(t)
 			if !isAPI {
 				hc = testhelpers.NewClientWithCookies(t)
-				hc.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				hc.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 
 			var f *kratos.RecoveryFlow
@@ -496,7 +497,7 @@ func TestRecovery(t *testing.T) {
 			assert.Contains(t, res.Request.URL.String(), conf.SelfServiceFlowSettingsUI(ctx).String())
 
 			body := ioutilx.MustReadAll(res.Body)
-			assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+			assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 				gjson.GetBytes(body, "ui.messages.0.text").String())
 			assert.Equal(t, returnTo, gjson.GetBytes(body, "return_to").String())
 
@@ -572,7 +573,7 @@ func TestRecovery(t *testing.T) {
 					createIdentityToRecover(t, reg, email)
 
 					hc := testhelpers.NewClientWithCookies(t)
-					hc.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					hc.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 
 					f := tc.f(t, hc)
 

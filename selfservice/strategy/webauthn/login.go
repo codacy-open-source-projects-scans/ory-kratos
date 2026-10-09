@@ -287,9 +287,15 @@ func (s *Strategy) loginAuthenticate(ctx context.Context, r *http.Request, f *lo
 		webAuthCreds = o.Credentials.ToWebAuthn()
 	}
 
-	if _, err := web.ValidateLogin(webauthnx.NewUser(o.UserHandle, webAuthCreds, web.Config), webAuthnSess, webAuthnResponse); err != nil {
+	validatedCredential, err := web.ValidateLogin(webauthnx.NewUser(o.UserHandle, webAuthCreds, web.Config), webAuthnSess, webAuthnResponse)
+	if err != nil {
 		return nil, s.handleLoginError(r, f, errors.WithStack(schema.NewWebAuthnVerifierWrongError("#/")))
 	}
+
+	// Persist the updated signature counter and clone warning for W3C WebAuthn
+	// clone detection. This must not block the login: the user already proved
+	// possession of the authenticator.
+	webauthnx.UpdateSignCountAfterLogin(ctx, s.d, i, identity.CredentialsTypeWebAuthn, validatedCredential)
 
 	// Remove the WebAuthn URL from the internal context now that it is set!
 	f.InternalContext, err = sjson.DeleteBytes(f.InternalContext, flow.PrefixInternalContextKey(s.ID(), InternalContextKeySessionData))
@@ -382,8 +388,9 @@ func (s *Strategy) PopulateLoginMethodSecondFactor(r *http.Request, sr *login.Fl
 		return nil
 	}
 
-	// We have done proper validation before so this should never error
-	sess, err := s.d.SessionManager().FetchFromRequest(r.Context(), r)
+	// We have done proper validation before so this should never error.
+	// The full expansion is required: the form hydrator reads the identity's credentials.
+	sess, err := s.d.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 	if err != nil {
 		return err
 	}

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
+	"github.com/ory/x/clock"
 	"github.com/ory/x/configx"
 
 	"github.com/ory/kratos/corpx"
@@ -68,8 +68,8 @@ func (c ClientType) String() string {
 	return string(c)
 }
 
-func apiHttpClient(*testing.T) *http.Client {
-	return &http.Client{}
+func apiHttpClient(t *testing.T) *http.Client {
+	return testhelpers.NewTestClient(t)
 }
 
 func spaHttpClient(t *testing.T) *http.Client {
@@ -97,8 +97,8 @@ var flowTypeCases = []struct {
 	{
 		FlowType:   flow.TypeAPI,
 		ClientType: RecoveryClientTypeAPI,
-		GetClient: func(_ *testing.T) *http.Client {
-			return &http.Client{}
+		GetClient: func(t *testing.T) *http.Client {
+			return testhelpers.NewTestClient(t)
 		},
 		FormContentType: "application/json",
 	},
@@ -168,7 +168,7 @@ func TestRecovery(t *testing.T) {
 			client = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				client = testhelpers.NewClientWithCookies(t)
-				client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -274,7 +274,7 @@ func TestRecovery(t *testing.T) {
 			}, http.StatusOK)
 			body := checkRecovery(t, client, RecoveryClientTypeBrowser, email, recoverySubmissionResponse)
 
-			assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+			assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 				gjson.Get(body, "ui.messages.0.text").String())
 
 			res, err := client.Get(public.URL + session.RouteWhoami)
@@ -300,7 +300,7 @@ func TestRecovery(t *testing.T) {
 		})
 
 		t.Run("type=api", func(t *testing.T) {
-			client := &http.Client{}
+			client := testhelpers.NewTestClient(t)
 			email := "recoverme4@ory.sh"
 			createIdentityToRecover(t, reg, email)
 			recoverySubmissionResponse := submitRecovery(t, client, RecoveryClientTypeAPI, func(v url.Values) {
@@ -420,7 +420,7 @@ func TestRecovery(t *testing.T) {
 					email := testhelpers.RandomEmail()
 					i := createIdentityToRecover(t, reg, email)
 
-					client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 					f := tc.f(t, client, i)
 
 					formPayload := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
@@ -433,7 +433,7 @@ func TestRecovery(t *testing.T) {
 
 					body = checkRecovery(t, client, RecoveryClientTypeBrowser, email, body)
 
-					require.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+					require.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 						gjson.Get(body, "ui.messages.0.text").String())
 
 					settingsId := gjson.Get(body, "id").String()
@@ -525,7 +525,7 @@ func TestRecovery(t *testing.T) {
 				client := testhelpers.NewDebugClient(t)
 				if !isAPI {
 					client = testhelpers.NewClientWithCookies(t)
-					client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 				}
 
 				var f *kratos.RecoveryFlow
@@ -787,15 +787,15 @@ func TestRecovery(t *testing.T) {
 	t.Run("description=should not be able to submit recover address after flow expired", func(t *testing.T) {
 		recoveryEmail := "recoverme5@ory.sh"
 		createIdentityToRecover(t, reg, recoveryEmail)
-		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Millisecond*200)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
-		})
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
 
 		c := testhelpers.NewClientWithCookies(t)
 		rs := testhelpers.GetRecoveryFlow(t, c, public)
 
-		time.Sleep(time.Millisecond * 201)
+		mockClock.Add(2 * time.Minute)
 
 		res, err := c.PostForm(rs.Ui.Action, url.Values{"email": {recoveryEmail}})
 		require.NoError(t, err)
@@ -813,10 +813,10 @@ func TestRecovery(t *testing.T) {
 	t.Run("description=should not be able to submit code after flow expired", func(t *testing.T) {
 		recoveryEmail := "recoverme6@ory.sh"
 		createIdentityToRecover(t, reg, recoveryEmail)
-		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Millisecond*200)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
-		})
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
 
 		c := testhelpers.NewClientWithCookies(t)
 
@@ -831,13 +831,14 @@ func TestRecovery(t *testing.T) {
 
 		recoveryCode := testhelpers.CourierExpectCodeInMessage(t, message, 1)
 
-		time.Sleep(time.Millisecond * 201)
+		// 1-minute lifespan + 2 minutes => deterministically "expired 2.00 minutes ago".
+		mockClock.Add(3 * time.Minute)
 
 		body = submitRecoveryCode(t, c, body, RecoveryClientTypeBrowser, recoveryCode, http.StatusOK)
 
 		assert.NotEqual(t, gjson.Get(body, "id"), initialFlowId)
 
-		assert.Regexpf(t, regexp.MustCompile(`The recovery flow expired 0\.0\d minutes ago, please try again\.`), gjson.Get(body, "ui.messages.0.text").Str, "%s", body)
+		assert.Equalf(t, "The recovery flow expired 2.00 minutes ago, please try again.", gjson.Get(body, "ui.messages.0.text").Str, "%s", body)
 
 		addr, err := reg.IdentityPool().FindVerifiableAddressByValue(context.Background(), identity.AddressTypeEmail, recoveryEmail)
 		require.NoError(t, err)
@@ -1027,7 +1028,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 			client = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				client = testhelpers.NewClientWithCookies(t)
-				client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -1144,7 +1145,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 			}, http.StatusOK)
 			body := checkRecovery(t, client, RecoveryClientTypeBrowser, email, recoverySubmissionResponse)
 
-			assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+			assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 				gjson.Get(body, "ui.messages.0.text").String())
 
 			res, err := client.Get(public.URL + session.RouteWhoami)
@@ -1170,7 +1171,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 		})
 
 		t.Run("type=api", func(t *testing.T) {
-			client := &http.Client{}
+			client := testhelpers.NewTestClient(t)
 			email := testhelpers.RandomEmail()
 			createIdentityToRecover(t, reg, email)
 			recoverySubmissionResponse := submitRecoveryForm(t, client, RecoveryClientTypeAPI, func(v url.Values) {
@@ -1250,7 +1251,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 					email := testhelpers.RandomEmail()
 					i := createIdentityToRecover(t, reg, email)
 
-					client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 					f := tc.f(t, client, i)
 
 					formPayload := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
@@ -1263,7 +1264,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 
 					body = checkRecovery(t, client, RecoveryClientTypeBrowser, email, body)
 
-					require.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+					require.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 						gjson.Get(body, "ui.messages.0.text").String())
 
 					settingsId := gjson.Get(body, "id").String()
@@ -1630,7 +1631,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 
 	t.Run("description=does not issue csrf cookie when submitting API flow", func(t *testing.T) {
 		t.Run("type="+RecoveryClientTypeAPI.String(), func(t *testing.T) {
-			c := new(http.Client)
+			c := testhelpers.NewTestClient(t)
 			recoveryEmail := testhelpers.RandomEmail()
 			_ = createIdentityToRecover(t, reg, recoveryEmail)
 
@@ -1688,10 +1689,10 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 			t.Run("type="+testCase.ClientType.String(), func(t *testing.T) {
 				recoveryEmail := testhelpers.RandomEmail()
 				createIdentityToRecover(t, reg, recoveryEmail)
-				conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Millisecond*100)
-				t.Cleanup(func() {
-					conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
-				})
+				mockClock := clock.NewMock(time.Now())
+				reg.SetClock(mockClock)
+				t.Cleanup(func() { reg.SetClock(clock.New()) })
+				conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
 
 				c := testCase.GetClient(t)
 				var rs *kratos.RecoveryFlow
@@ -1702,7 +1703,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 					fallthrough
 				case RecoveryClientTypeSPA:
 					rs = testhelpers.GetRecoveryFlow(t, c, public)
-					time.Sleep(time.Millisecond * 110)
+					mockClock.Add(2 * time.Minute)
 					res, err = c.PostForm(rs.Ui.Action, url.Values{"email": {recoveryEmail}, "method": {"code"}})
 					require.NoError(t, err)
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -1710,7 +1711,7 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 					assert.Contains(t, res.Request.URL.String(), conf.SelfServiceFlowRecoveryUI(ctx).String())
 				case RecoveryClientTypeAPI:
 					rs = testhelpers.InitializeRecoveryFlowViaAPI(t, c, public)
-					time.Sleep(time.Millisecond * 110)
+					mockClock.Add(2 * time.Minute)
 					form := testhelpers.EncodeFormAsJSON(t, true, url.Values{"email": {recoveryEmail}, "method": {"code"}})
 					res, err = c.Post(rs.Ui.Action, "application/json", bytes.NewBufferString(form))
 					require.NoError(t, err)
@@ -1734,10 +1735,10 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 	})
 
 	t.Run("description=should not be able to submit code after flow expired", func(t *testing.T) {
-		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Millisecond*200)
-		t.Cleanup(func() {
-			conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
-		})
+		mockClock := clock.NewMock(time.Now())
+		reg.SetClock(mockClock)
+		t.Cleanup(func() { reg.SetClock(clock.New()) })
+		conf.MustSet(ctx, config.ViperKeySelfServiceRecoveryRequestLifespan, time.Minute)
 		for _, testCase := range flowTypeCases {
 			t.Run("type="+testCase.ClientType.String(), func(t *testing.T) {
 				recoveryEmail := testhelpers.RandomEmail()
@@ -1756,13 +1757,13 @@ func TestRecovery_WithContinueWith(t *testing.T) {
 
 				recoveryCode := testhelpers.CourierExpectCodeInMessage(t, message, 1)
 
-				time.Sleep(time.Millisecond * 201)
+				mockClock.Add(3 * time.Minute)
 
 				if testCase.FlowType == "browser" {
 					body = submitRecoveryCode(t, c, body, testCase.ClientType, recoveryCode, http.StatusOK)
 					assert.NotEqual(t, gjson.Get(body, "id"), initialFlowId)
 
-					assert.Regexpf(t, regexp.MustCompile(`The recovery flow expired 0\.0\d minutes ago, please try again\.`), gjson.Get(body, "ui.messages.0.text").Str, "%s", body)
+					assert.Equalf(t, "The recovery flow expired 2.00 minutes ago, please try again.", gjson.Get(body, "ui.messages.0.text").Str, "%s", body)
 				} else {
 					body = submitRecoveryCode(t, c, body, testCase.ClientType, recoveryCode, http.StatusGone)
 					assert.NotEqual(t, gjson.Get(body, "id"), initialFlowId)
@@ -1991,7 +1992,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Email(t *testing.T) {
 			client = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				client = testhelpers.NewClientWithCookies(t)
-				client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -2083,7 +2084,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Email(t *testing.T) {
 
 			body := recoverHappyPath(t, client, RecoveryClientTypeBrowser, email)
 
-			assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+			assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 				gjson.Get(body, "ui.messages.0.text").String())
 
 			res, err := client.Get(public.URL + session.RouteWhoami)
@@ -2108,7 +2109,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Email(t *testing.T) {
 		})
 
 		t.Run("type=api", func(t *testing.T) {
-			client := &http.Client{}
+			client := testhelpers.NewTestClient(t)
 			email := testhelpers.RandomEmail()
 			createIdentityToRecover(t, reg, email)
 
@@ -2187,7 +2188,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Email(t *testing.T) {
 					email := testhelpers.RandomEmail()
 					i := createIdentityToRecover(t, reg, email)
 
-					client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 					f := tc.f(t, client, i)
 
 					formPayload := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
@@ -2198,7 +2199,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Email(t *testing.T) {
 
 					body = extractCodeFromCourierAndSubmit(t, client, RecoveryClientTypeBrowser, email, body, http.StatusOK)
 
-					require.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+					require.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 						gjson.Get(body, "ui.messages.0.text").String())
 
 					settingsId := gjson.Get(body, "id").String()
@@ -2769,7 +2770,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Phone(t *testing.T) {
 			client = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				client = testhelpers.NewClientWithCookies(t)
-				client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -2844,7 +2845,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Phone(t *testing.T) {
 
 			body := recoverHappyPath(t, client, RecoveryClientTypeBrowser, address)
 
-			assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+			assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 				gjson.Get(body, "ui.messages.0.text").String())
 
 			res, err := client.Get(public.URL + session.RouteWhoami)
@@ -2869,7 +2870,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Phone(t *testing.T) {
 		})
 
 		t.Run("type=api", func(t *testing.T) {
-			client := &http.Client{}
+			client := testhelpers.NewTestClient(t)
 			address := testhelpers.RandomPhone()
 			createIdentityToRecoverPhone(t, reg, address)
 
@@ -2948,7 +2949,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Phone(t *testing.T) {
 					address := testhelpers.RandomPhone()
 					i := createIdentityToRecoverPhone(t, reg, address)
 
-					client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 					f := tc.f(t, client, i)
 
 					formPayload := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
@@ -2959,7 +2960,7 @@ func TestRecovery_V2_WithContinueWith_OneAddress_Phone(t *testing.T) {
 
 					body = extractCodeFromCourierAndSubmit(t, client, RecoveryClientTypeBrowser, address, body, http.StatusOK)
 
-					require.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+					require.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 						gjson.Get(body, "ui.messages.0.text").String())
 
 					settingsId := gjson.Get(body, "id").String()
@@ -3520,7 +3521,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 			client = testhelpers.NewDebugClient(t)
 			if !isAPI {
 				client = testhelpers.NewClientWithCookies(t)
-				client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+				client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 			}
 		}
 
@@ -3646,7 +3647,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 					body = recoverHappyPath(t, client, RecoveryClientTypeBrowser, address2, address1)
 				}
 
-				assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+				assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 					gjson.Get(body, "ui.messages.0.text").String())
 
 				res, err := client.Get(public.URL + session.RouteWhoami)
@@ -3677,7 +3678,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 			})
 
 			t.Run("type=api", func(t *testing.T) {
-				client := &http.Client{}
+				client := testhelpers.NewTestClient(t)
 				address1 := testhelpers.RandomEmail()
 				address2 := testhelpers.RandomPhone()
 				createIdentityToRecoverEmailAndPhone(t, reg, address1, address2)
@@ -3764,7 +3765,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 					address2 := testhelpers.RandomPhone()
 					i := createIdentityToRecoverEmailAndPhone(t, reg, address1, address2)
 
-					client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+					client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 					f := tc.f(t, client, i)
 
 					formPayload := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
@@ -3791,7 +3792,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 
 					body = extractCodeFromCourierAndSubmit(t, client, RecoveryClientTypeBrowser, address2, body, http.StatusOK)
 
-					require.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+					require.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 						gjson.Get(body, "ui.messages.0.text").String())
 
 					settingsId := gjson.Get(body, "id").String()
@@ -4477,7 +4478,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 		checkRecoveryScreenAskForCode(t, address1, body)
 
 		body = extractCodeFromCourierAndSubmit(t, client, RecoveryClientTypeBrowser, address1, body, http.StatusOK)
-		assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+		assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 			gjson.Get(body, "ui.messages.0.text").String())
 	})
 
@@ -4519,7 +4520,7 @@ func TestRecovery_V2_WithContinueWith_SeveralAddresses(t *testing.T) {
 		checkRecoveryScreenAskForCode(t, address2, body)
 
 		body = extractCodeFromCourierAndSubmit(t, client, RecoveryClientTypeBrowser, address2, body, http.StatusOK)
-		assert.Equal(t, text.NewRecoverySuccessful(time.Now().Add(time.Hour)).Text,
+		assert.Equal(t, text.NewRecoverySuccessful(clock.New(), time.Now().Add(time.Hour)).Text,
 			gjson.Get(body, "ui.messages.0.text").String())
 	})
 }

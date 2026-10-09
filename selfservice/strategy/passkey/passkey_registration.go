@@ -194,9 +194,30 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, regFlow *reg
 	return nil
 }
 
+// passkeyCreateData carries the WebAuthn registration ceremony options to
+// the bundled JS. Both display-name fields are populated from the identity
+// schema's flagged traits: DisplayNameFieldName is the alphabetically-first
+// candidate kept for backward compatibility with custom UIs that only read
+// the singular field; DisplayNameFieldNames is the full sorted list. Newer
+// clients should consume DisplayNameFieldNames and pick the first form
+// field with a non-empty value.
 type passkeyCreateData struct {
-	CredentialOptions    *protocol.CredentialCreation `json:"credentialOptions"`
-	DisplayNameFieldName string                       `json:"displayNameFieldName"`
+	CredentialOptions     *protocol.CredentialCreation `json:"credentialOptions"`
+	DisplayNameFieldName  string                       `json:"displayNameFieldName"`
+	DisplayNameFieldNames []string                     `json:"displayNameFieldNames"`
+}
+
+// skipMethodOnMissingDisplayName downgrades errNoDisplayNameTrait to a
+// warning so that a passkey method without a usable display-name trait drops
+// its UI nodes instead of failing the whole registration flow: all other
+// enabled methods must keep working even when the passkey method is
+// misconfigured. Any other error is returned unchanged.
+func (s *Strategy) skipMethodOnMissingDisplayName(r *http.Request, err error) error {
+	if !errors.Is(err, errNoDisplayNameTrait) {
+		return err
+	}
+	s.d.Logger().WithRequest(r).Warn("The passkey method is enabled, but the identity schema does not mark any trait as a passkey display name (passkey.display_name) or WebAuthn identifier (webauthn.identifier). The passkey method will not be offered on registration flows. Update the identity schema or disable the passkey method.")
+	return nil
 }
 
 func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.Flow) error {
@@ -205,7 +226,7 @@ func (s *Strategy) PopulateRegistrationMethod(r *http.Request, f *registration.F
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	opts, err := s.hydratePassKeyRegistrationOptions(ctx, f)
 	if err != nil {
-		return err
+		return s.skipMethodOnMissingDisplayName(r, err)
 	}
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
@@ -248,7 +269,7 @@ func (s *Strategy) PopulateRegistrationMethodCredentials(r *http.Request, f *reg
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	opts, err := s.hydratePassKeyRegistrationOptions(ctx, f)
 	if err != nil {
-		return err
+		return s.skipMethodOnMissingDisplayName(r, err)
 	}
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
@@ -277,7 +298,10 @@ func (s *Strategy) PopulateRegistrationMethodProfile(r *http.Request, f *registr
 
 	opts, err := s.hydratePassKeyRegistrationOptions(ctx, f)
 	if err != nil {
-		return err
+		// Without hydrated options no passkey nodes were added by
+		// PopulateRegistrationMethodCredentials either, so there is nothing
+		// to remove here.
+		return s.skipMethodOnMissingDisplayName(r, err)
 	}
 
 	f.UI.SetCSRF(s.d.GenerateCSRFToken(r))
@@ -299,11 +323,16 @@ func (s *Strategy) hydratePassKeyRegistrationOptions(ctx context.Context, f *reg
 	}
 
 	createData := new(passkeyCreateData)
-	fieldName, err := s.PasskeyDisplayNameFromSchema(ctx, defaultSchemaURL.String())
+	fieldNames, err := s.PasskeyDisplayNameFromSchema(ctx, defaultSchemaURL.String())
 	if err != nil {
 		return nil, err
 	}
-	createData.DisplayNameFieldName = fieldName
+	// fieldNames is guaranteed non-empty here: PasskeyDisplayNameFromSchema
+	// returns at least one candidate or an error. The singular field keeps the
+	// alphabetically-first candidate for backward compatibility with custom UIs
+	// that only read it.
+	createData.DisplayNameFieldNames = fieldNames
+	createData.DisplayNameFieldName = fieldNames[0]
 
 	webAuthn, err := webauthn.New(s.d.Config().PasskeyConfig(ctx))
 	if err != nil {

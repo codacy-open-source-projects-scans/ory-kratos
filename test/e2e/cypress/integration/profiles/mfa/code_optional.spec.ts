@@ -42,6 +42,7 @@ context("2FA code with optional field", () => {
           cy.deleteMail()
         })
 
+        // playwright:migrated
         it("should not show 2FA page during login when optionalMfaEmail field is empty", () => {
           // Log out first
           cy.clearAllCookies()
@@ -89,6 +90,7 @@ context("2FA code with optional field", () => {
           cy.deleteMail()
         })
 
+        // playwright:migrated
         it("should show 2FA page during login when optionalMfaEmail field is configured", () => {
           // Log out first
           cy.clearAllCookies()

@@ -205,5 +205,68 @@ func TestFlowPersister(ctx context.Context, p persistence.Persister) func(t *tes
 				require.ErrorIs(t, err, sqlcon.ErrNoRows())
 			})
 		})
+
+		t.Run("case=test-flow persister helpers", func(t *testing.T) {
+			// seedFlow creates a login flow under the given persister. When
+			// isTest is true the flow is marked as a test flow.
+			seedFlow := func(t *testing.T, p persistence.Persister, isTest bool, expiresAt time.Time) *login.Flow {
+				t.Helper()
+				f := &login.Flow{
+					ID:              x.NewUUID(),
+					Type:            flow.TypeBrowser,
+					State:           flow.StateChooseMethod,
+					RequestURL:      "https://example.com/self-service/login/browser",
+					IssuedAt:        time.Now().UTC(),
+					ExpiresAt:       expiresAt,
+					CSRFToken:       "csrf",
+					UI:              container.New(""),
+					InternalContext: []byte(`{}`),
+				}
+				if isTest {
+					require.NoError(t, f.SetTestContext(&login.TestContext{ProviderID: "google"}))
+				}
+				require.NoError(t, p.CreateLoginFlow(ctx, f))
+				return f
+			}
+
+			t.Run("DeleteTestLoginFlow rejects non-test-flow rows", func(t *testing.T) {
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				f := seedFlow(t, p, false, time.Now().UTC().Add(time.Hour))
+
+				err := p.DeleteTestLoginFlow(ctx, f.ID)
+				require.ErrorIs(t, err, sqlcon.ErrNoRows())
+
+				// Row must still be there.
+				_, err = p.GetLoginFlow(ctx, f.ID)
+				require.NoError(t, err)
+			})
+
+			t.Run("DeleteTestLoginFlow rejects wrong NID", func(t *testing.T) {
+				_, pA := testhelpers.NewNetwork(t, ctx, p)
+				_, pB := testhelpers.NewNetwork(t, ctx, p)
+				fA := seedFlow(t, pA, true, time.Now().UTC().Add(time.Hour))
+
+				err := pB.DeleteTestLoginFlow(ctx, fA.ID)
+				require.ErrorIs(t, err, sqlcon.ErrNoRows())
+
+				// Row survives from the owning NID's perspective.
+				_, err = pA.GetLoginFlow(ctx, fA.ID)
+				require.NoError(t, err)
+			})
+
+			t.Run("DeleteTestLoginFlow removes only the targeted row", func(t *testing.T) {
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				a := seedFlow(t, p, true, time.Now().UTC().Add(time.Hour))
+				b := seedFlow(t, p, true, time.Now().UTC().Add(time.Hour))
+
+				require.NoError(t, p.DeleteTestLoginFlow(ctx, a.ID))
+
+				_, err := p.GetLoginFlow(ctx, a.ID)
+				require.ErrorIs(t, err, sqlcon.ErrNoRows())
+
+				_, err = p.GetLoginFlow(ctx, b.ID)
+				require.NoError(t, err)
+			})
+		})
 	}
 }

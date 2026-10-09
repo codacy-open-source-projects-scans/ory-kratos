@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/fips140"
 	"crypto/sha512"
 	"encoding/json"
 	"fmt"
@@ -26,9 +27,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/publicsuffix"
-
-	"github.com/ory/kratos/x"
 
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3"
@@ -37,11 +35,13 @@ import (
 	"github.com/ory/kratos/request"
 	"github.com/ory/x/configx"
 	"github.com/ory/x/contextx"
+	"github.com/ory/x/corsx"
 	"github.com/ory/x/crdbx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/jsonschemax"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/region"
 	"github.com/ory/x/watcherx"
 )
 
@@ -69,6 +69,10 @@ const (
 	ViperKeyCourierTemplatesRecoveryCodeValidSMS             = "courier.templates.recovery_code.valid.sms"
 	ViperKeyCourierTemplatesLoginCodeValidSMS                = "courier.templates.login_code.valid.sms"
 	ViperKeyCourierTemplatesRegistrationCodeValidSMS         = "courier.templates.registration_code.valid.sms"
+	ViperKeyCourierTemplatesVerifiableAddressChangedEmail    = "courier.templates.verifiable_address_changed.email"
+	ViperKeyCourierTemplatesVerifiableAddressChangedSMS      = "courier.templates.verifiable_address_changed.sms"
+	ViperKeyCourierTemplatesAuthenticatorKeyAddedEmail       = "courier.templates.authenticator_key_added.email"
+	ViperKeyCourierTemplatesAuthenticatorKeyAddedSMS         = "courier.templates.authenticator_key_added.sms"
 	ViperKeyCourierDeliveryStrategy                          = "courier.delivery_strategy"
 	ViperKeyCourierHTTPRequestConfig                         = "courier.http.request_config"
 	ViperKeyCourierTemplatesLoginCodeValidEmail              = "courier.templates.login_code.valid.email"
@@ -105,6 +109,8 @@ const (
 	ViperKeyUseLegacyShowVerificationUI                      = "feature_flags.legacy_continue_with_verification_ui"
 	ViperKeyLegacyOIDCRegistrationGroup                      = "feature_flags.legacy_oidc_registration_node_group"
 	ViperKeyUseLegacyRequireVerifiedLoginError               = "feature_flags.legacy_require_verified_login_error"
+	ViperKeyLegacyAllowInsecureOrigins                       = "feature_flags.legacy_allow_insecure_origins"
+	ViperKeyRefreshLoginChooseAddress                        = "feature_flags.refresh_login_choose_address"
 	ViperKeySessionRefreshMinTimeLeft                        = "session.earliest_possible_extend"
 	ViperKeyCookieSameSite                                   = "cookies.same_site"
 	ViperKeyCookieDomain                                     = "cookies.domain"
@@ -130,6 +136,7 @@ const (
 	ViperKeySelfServiceLoginBeforeHooks                      = "selfservice.flows.login.before.hooks"
 	ViperKeySelfServiceErrorUI                               = "selfservice.flows.error.ui_url"
 	ViperKeySelfServiceLogoutBrowserDefaultReturnTo          = "selfservice.flows.logout.after." + DefaultBrowserReturnURL
+	ViperKeySelfServiceLogoutClearBrowserData                = "selfservice.flows.logout.clear_browser_data"
 	ViperKeySelfServiceSettingsURL                           = "selfservice.flows.settings.ui_url"
 	ViperKeySelfServiceSettingsAfter                         = "selfservice.flows.settings.after"
 	ViperKeySelfServiceSettingsBeforeHooks                   = "selfservice.flows.settings.before.hooks"
@@ -190,6 +197,13 @@ const (
 	ViperKeyPasskeyRPDisplayName                             = "selfservice.methods.passkey.config.rp.display_name"
 	ViperKeyPasskeyRPID                                      = "selfservice.methods.passkey.config.rp.id"
 	ViperKeyPasskeyRPOrigins                                 = "selfservice.methods.passkey.config.rp.origins"
+	ViperKeyPasskeyAuthenticatorAttachment                   = "selfservice.methods.passkey.config.authenticator_selection.attachment"
+	ViperKeyPasskeyResidentKey                               = "selfservice.methods.passkey.config.authenticator_selection.resident_key"
+	ViperKeyPasskeyUserVerification                          = "selfservice.methods.passkey.config.authenticator_selection.user_verification"
+	ViperKeyPasskeyAttestationPreference                     = "selfservice.methods.passkey.config.attestation.preference"
+	ViperKeyPasskeyRegistrationTimeout                       = "selfservice.methods.passkey.config.timeouts.registration"
+	ViperKeyPasskeyLoginTimeout                              = "selfservice.methods.passkey.config.timeouts.login"
+	ViperKeyOrganizations                                    = "selfservice.methods.b2b.config.organizations"
 	ViperKeyOAuth2ProviderURL                                = "oauth2_provider.url"
 	ViperKeyOAuth2ProviderHeader                             = "oauth2_provider.headers"
 	ViperKeyOAuth2ProviderOverrideReturnTo                   = "oauth2_provider.override_return_to"
@@ -317,6 +331,10 @@ type (
 		CourierSMSTemplatesRecoveryCodeValid(ctx context.Context) *CourierSMSTemplate
 		CourierSMSTemplatesLoginCodeValid(ctx context.Context) *CourierSMSTemplate
 		CourierSMSTemplatesRegistrationCodeValid(ctx context.Context) *CourierSMSTemplate
+		CourierTemplatesVerifiableAddressChanged(ctx context.Context) *CourierEmailTemplate
+		CourierSMSTemplatesVerifiableAddressChanged(ctx context.Context) *CourierSMSTemplate
+		CourierTemplatesAuthenticatorKeyAdded(ctx context.Context) *CourierEmailTemplate
+		CourierSMSTemplatesAuthenticatorKeyAdded(ctx context.Context) *CourierSMSTemplate
 		CourierMessageRetries(ctx context.Context) int
 		CourierWorkerPullCount(ctx context.Context) int
 		CourierWorkerPullWait(ctx context.Context) time.Duration
@@ -411,6 +429,20 @@ func New(ctx context.Context, l *logrusx.Logger, stdOutOrErr io.Writer, ctxer co
 	if !p.SkipValidation() {
 		if err := c.validateIdentitySchemas(ctx); err != nil {
 			return nil, err
+		}
+		if fips140.Enabled() {
+			if len(p.Strings(ViperKeySecretsPagination)) == 0 {
+				return nil, errors.New("you must provide `secrets.pagination` for FIPS compliance")
+			}
+			if len(p.Strings(ViperKeySecretsCipher)) == 0 {
+				return nil, errors.New("you must provide `secrets.cipher` for FIPS compliance")
+			}
+			if len(p.Strings(ViperKeySecretsCookie)) == 0 {
+				return nil, errors.New("you must provide `secrets.cookie` for FIPS compliance")
+			}
+			if len(p.Strings(ViperKeySecretsDefault)) == 0 {
+				return nil, errors.New("you must provide `secrets.default` for FIPS compliance")
+			}
 		}
 	}
 
@@ -1007,6 +1039,21 @@ func (p *Config) SessionLifespan(ctx context.Context) time.Duration {
 	return p.GetProvider(ctx).DurationF(ViperKeySessionLifespan, time.Hour*24)
 }
 
+// OrganizationSessionLifespan returns the effective session lifespan for a
+// session issued to the given organization. If orgID is uuid.Nil, or no
+// matching organization is configured, or the organization has no
+// session_lifespan override, the project-level session.lifespan is returned.
+func (p *Config) OrganizationSessionLifespan(ctx context.Context, orgID uuid.UUID) time.Duration {
+	if orgID != uuid.Nil {
+		for _, org := range p.Organizations(ctx) {
+			if org.ID == orgID && org.SessionLifespan > 0 {
+				return org.SessionLifespan
+			}
+		}
+	}
+	return p.SessionLifespan(ctx)
+}
+
 func (p *Config) SessionPersistentCookie(ctx context.Context) bool {
 	return p.GetProvider(ctx).Bool(ViperKeySessionPersistentCookie)
 }
@@ -1023,15 +1070,11 @@ func (p *Config) SelfServiceBrowserAllowedReturnToDomains(ctx context.Context) (
 			p.l.WithError(err).Warnf("Ignoring URL \"%s\" from configuration key \"%s.%d\".", u, ViperKeyURLsAllowedReturnToDomains, k)
 			continue
 		}
-		if parsed.Host == "*" {
-			p.l.Warnf("Ignoring wildcard \"%s\" from configuration key \"%s.%d\".", u, ViperKeyURLsAllowedReturnToDomains, k)
-			continue
-		}
-		eTLD, icann := publicsuffix.PublicSuffix(parsed.Host)
-		if len(parsed.Host) > 0 &&
-			parsed.Host[:1] == "*" &&
-			icann &&
-			parsed.Host == fmt.Sprintf("*.%s", eTLD) {
+		// A wildcard host must use the labelled form "*.example.com" bounded at a
+		// registrable domain. Reject bare "*", dot-less "*foo.com", public-suffix
+		// "*.com", and mid-label "foo.*.com" wildcards — each would match an
+		// attacker-registrable host. See corsx.ClassifyOrigin.
+		if corsx.ClassifyOrigin(parsed.Host).IsUnsafeWildcard() && !p.LegacyAllowInsecureOrigins(ctx) {
 			p.l.Warnf("Ignoring wildcard \"%s\" from configuration key \"%s.%d\".", u, ViperKeyURLsAllowedReturnToDomains, k)
 			continue
 		}
@@ -1178,6 +1221,22 @@ func (p *Config) CourierSMSTemplatesRegistrationCodeValid(ctx context.Context) *
 	return p.CourierSMSTemplatesHelper(ctx, ViperKeyCourierTemplatesRegistrationCodeValidSMS)
 }
 
+func (p *Config) CourierTemplatesVerifiableAddressChanged(ctx context.Context) *CourierEmailTemplate {
+	return p.CourierEmailTemplatesHelper(ctx, ViperKeyCourierTemplatesVerifiableAddressChangedEmail)
+}
+
+func (p *Config) CourierSMSTemplatesVerifiableAddressChanged(ctx context.Context) *CourierSMSTemplate {
+	return p.CourierSMSTemplatesHelper(ctx, ViperKeyCourierTemplatesVerifiableAddressChangedSMS)
+}
+
+func (p *Config) CourierTemplatesAuthenticatorKeyAdded(ctx context.Context) *CourierEmailTemplate {
+	return p.CourierEmailTemplatesHelper(ctx, ViperKeyCourierTemplatesAuthenticatorKeyAddedEmail)
+}
+
+func (p *Config) CourierSMSTemplatesAuthenticatorKeyAdded(ctx context.Context) *CourierSMSTemplate {
+	return p.CourierSMSTemplatesHelper(ctx, ViperKeyCourierTemplatesAuthenticatorKeyAddedSMS)
+}
+
 func (p *Config) CourierTemplatesLoginCodeValid(ctx context.Context) *CourierEmailTemplate {
 	return p.CourierEmailTemplatesHelper(ctx, ViperKeyCourierTemplatesLoginCodeValidEmail)
 }
@@ -1320,12 +1379,12 @@ func (p *Config) SelfServiceFlowRecoveryNotifyUnknownRecipients(ctx context.Cont
 	return p.GetProvider(ctx).BoolF(ViperKeySelfServiceRecoveryNotifyUnknownRecipients, false)
 }
 
-func (p *Config) SelfServiceLinkMethodLifespan(ctx context.Context) time.Duration {
-	return p.GetProvider(ctx).DurationF(ViperKeyLinkLifespan, time.Hour)
+func (p *Config) SelfServiceFlowLogoutClearBrowserData(ctx context.Context) bool {
+	return p.GetProvider(ctx).BoolF(ViperKeySelfServiceLogoutClearBrowserData, false)
 }
 
-func (p *Config) SelfServiceLinkMethodBaseURL(ctx context.Context) *url.URL {
-	return cmp.Or(x.BaseURLFromContext(ctx), p.SelfPublicURL(ctx))
+func (p *Config) SelfServiceLinkMethodLifespan(ctx context.Context) time.Duration {
+	return p.GetProvider(ctx).DurationF(ViperKeyLinkLifespan, time.Hour)
 }
 
 func (p *Config) SelfServiceCodeMethodLifespan(ctx context.Context) time.Duration {
@@ -1402,6 +1461,13 @@ func (p *Config) FeatureFlagFasterSessionExtend(ctx context.Context) bool {
 	return p.GetProvider(ctx).Bool(ViperKeyFeatureFlagFasterSessionExtend)
 }
 
+// LegacyAllowInsecureOrigins restores legacy behavior where wildcard return URLs
+// and CORS origins need not be bounded at a registrable domain. Insecure; only
+// set by the Ory Network for grandfathered projects. Default false.
+func (p *Config) LegacyAllowInsecureOrigins(ctx context.Context) bool {
+	return p.GetProvider(ctx).Bool(ViperKeyLegacyAllowInsecureOrigins)
+}
+
 func (p *Config) SessionWhoAmICachingMaxAge(ctx context.Context) time.Duration {
 	return p.GetProvider(ctx).DurationF(ViperKeySessionWhoAmICachingMaxAge, 0)
 }
@@ -1412,6 +1478,10 @@ func (p *Config) UseContinueWithTransitions(ctx context.Context) bool {
 
 func (p *Config) ChooseRecoveryAddress(ctx context.Context) bool {
 	return p.GetProvider(ctx).Bool(ViperKeyChooseRecoveryAddress)
+}
+
+func (p *Config) RefreshLoginChooseAddress(ctx context.Context) bool {
+	return p.GetProvider(ctx).Bool(ViperKeyRefreshLoginChooseAddress)
 }
 
 func (p *Config) SessionRefreshMinTimeLeft(ctx context.Context) time.Duration {
@@ -1517,18 +1587,63 @@ func (p *Config) PasskeyConfig(ctx context.Context) *webauthn.Config {
 	scheme := p.SelfPublicURL(ctx).Scheme
 	id := p.GetProvider(ctx).String(ViperKeyPasskeyRPID)
 	origins := p.GetProvider(ctx).StringsF(ViperKeyPasskeyRPOrigins, []string{scheme + "://" + id})
-	return &webauthn.Config{
-		RPDisplayName: p.GetProvider(ctx).String(ViperKeyPasskeyRPDisplayName),
-		RPID:          id,
-		RPOrigins:     origins,
-		AuthenticatorSelection: protocol.AuthenticatorSelection{
-			AuthenticatorAttachment: "platform",
-			RequireResidentKey:      new(true),
-			ResidentKey:             protocol.ResidentKeyRequirementRequired,
-			UserVerification:        protocol.VerificationPreferred,
-		},
+
+	residentKey := protocol.ResidentKeyRequirement(
+		p.GetProvider(ctx).StringF(ViperKeyPasskeyResidentKey, string(protocol.ResidentKeyRequirementRequired)))
+	requireResidentKey := residentKey == protocol.ResidentKeyRequirementRequired
+
+	authSel := protocol.AuthenticatorSelection{
+		RequireResidentKey: &requireResidentKey,
+		ResidentKey:        residentKey,
+		UserVerification: protocol.UserVerificationRequirement(
+			p.GetProvider(ctx).StringF(ViperKeyPasskeyUserVerification, string(protocol.VerificationPreferred))),
+	}
+	// Only constrain authenticator attachment when the operator explicitly
+	// configures it. Omitting the field lets users register either platform
+	// or cross-platform authenticators, which matches the WebAuthn spec's
+	// "no preference" behavior.
+	if attachment := p.GetProvider(ctx).String(ViperKeyPasskeyAuthenticatorAttachment); attachment != "" {
+		authSel.AuthenticatorAttachment = protocol.AuthenticatorAttachment(attachment)
+	}
+
+	cfg := &webauthn.Config{
+		RPDisplayName:          p.GetProvider(ctx).String(ViperKeyPasskeyRPDisplayName),
+		RPID:                   id,
+		RPOrigins:              origins,
+		AuthenticatorSelection: authSel,
+		AttestationPreference: protocol.ConveyancePreference(
+			p.GetProvider(ctx).StringF(ViperKeyPasskeyAttestationPreference, string(protocol.PreferNoAttestation))),
 		EncodeUserIDAsString: false,
 	}
+
+	if d := p.GetProvider(ctx).Duration(ViperKeyPasskeyRegistrationTimeout); d > 0 {
+		cfg.Timeouts.Registration = webauthn.TimeoutConfig{
+			Timeout:    d,
+			TimeoutUVD: d,
+		}
+	}
+	if d := p.GetProvider(ctx).Duration(ViperKeyPasskeyLoginTimeout); d > 0 {
+		cfg.Timeouts.Login = webauthn.TimeoutConfig{
+			Timeout:    d,
+			TimeoutUVD: d,
+		}
+	}
+
+	return cfg
+}
+
+type Organization struct {
+	ID              uuid.UUID     `koanf:"id"`
+	Domains         []string      `koanf:"domains"`
+	DefaultRegion   region.Region `koanf:"default_region"`
+	SessionLifespan time.Duration `koanf:"session_lifespan"`
+}
+
+func (p *Config) Organizations(ctx context.Context) (orgs []Organization) {
+	if err := p.GetProvider(ctx).Unmarshal(ViperKeyOrganizations, &orgs); err != nil {
+		return nil
+	}
+	return orgs
 }
 
 func (p *Config) HasherPasswordHashingAlgorithm(ctx context.Context) string {

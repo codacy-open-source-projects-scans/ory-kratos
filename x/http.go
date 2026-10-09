@@ -18,11 +18,13 @@ type ctxKey struct{}
 
 var baseURLKey ctxKey
 
+// WithBaseURL stores the supplied base URL on the context. The URL's scheme
+// is preserved verbatim — callers that need an https guarantee must enforce
+// it themselves before calling.
 func WithBaseURL(ctx context.Context, baseURL *url.URL) context.Context {
 	if baseURL == nil {
 		return ctx
 	}
-	baseURL.Scheme = "https" // Force https
 	return context.WithValue(ctx, baseURLKey, baseURL)
 }
 
@@ -38,19 +40,28 @@ func BaseURLFromContext(ctx context.Context) *url.URL {
 	return nil
 }
 
-// FlowBaseURL returns the base URL to be used for a self-service flow. It will
-// either take the request URL, or an explicit base URL set in the context.
-func FlowBaseURL(ctx context.Context, flow interface{ GetRequestURL() string }) (*url.URL, error) {
+// BaseURLStringFromContext returns the captured base URL as a string, or an
+// empty string if none is set. Used to copy the captured URL onto a flow
+// row at creation time (where it lives next to the rest of the flow rather
+// than being plumbed via context to every consumer).
+func BaseURLStringFromContext(ctx context.Context) string {
 	if u := BaseURLFromContext(ctx); u != nil {
-		return u, nil
+		return u.String()
 	}
-	u, err := url.Parse(flow.GetRequestURL())
-	if err != nil {
-		return nil, err
-	}
-	u.Path = "/"
+	return ""
+}
 
-	return u, nil
+// CourierBaseURL parses the courier base URL captured on a flow at init time
+// (recovery.Flow.CourierBaseURL / verification.Flow.CourierBaseURL) and
+// returns it as a *url.URL. When the captured value is empty or unparseable,
+// it returns the supplied fallback (typically Config.SelfPublicURL).
+func CourierBaseURL(courierBaseURL string, fallback *url.URL) *url.URL {
+	if courierBaseURL != "" {
+		if u, err := url.Parse(courierBaseURL); err == nil {
+			return u
+		}
+	}
+	return fallback
 }
 
 func RequestURL(r *http.Request) *url.URL {
@@ -69,6 +80,25 @@ func RequestURL(r *http.Request) *url.URL {
 	}
 
 	return &source
+}
+
+// RequestBaseURL returns the customer-facing base URL of the request.
+//
+// If a base URL was captured on the request context (e.g. by a proxy-aware
+// middleware that validated an Ory-Base-URL-Rewrite / X-Ory-Original-Host
+// header), that value wins — it is the URL the end user's browser actually
+// used, which may differ from the host this service was reached at. This is
+// the value an OIDC/SAML callback must be redirected back to.
+//
+// Otherwise it falls back to the request's own scheme://host[:port] (honoring
+// X-Forwarded-Host / X-Forwarded-Proto via RequestURL), with no path, query,
+// or fragment.
+func RequestBaseURL(r *http.Request) string {
+	if captured := BaseURLStringFromContext(r.Context()); captured != "" {
+		return captured
+	}
+	u := RequestURL(r)
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
 }
 
 // SendFlowCompletedAsRedirectOrJSON should be used when a login, registration, ... flow has been completed successfully.

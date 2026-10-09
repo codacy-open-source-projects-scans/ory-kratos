@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/ory/kratos/identity"
 	"github.com/ory/pop/v6"
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/otelx"
@@ -86,6 +87,13 @@ func buildInsertQueryArgs[T any](ctx context.Context, models []*T, opts *createO
 	// We sort for the sole reason that the test snapshots are deterministic.
 	sort.Strings(columns)
 
+	// Extra columns trail the sorted model columns; values are appended in
+	// the same order in buildInsertQueryValues.
+	for _, ec := range opts.extraColumns {
+		columns = append(columns, ec.K)
+		placeholderRow = append(placeholderRow, "?")
+	}
+
 	for _, col := range columns {
 		quotedColumns = append(quotedColumns, opts.quoter.Quote(col))
 	}
@@ -102,8 +110,8 @@ func buildInsertQueryArgs[T any](ctx context.Context, models []*T, opts *createO
 		pl := make([]string, len(placeholderRow))
 		copy(pl, placeholderRow)
 
-		// There is a special case - when using CockroachDB we want to generate
-		// UUIDs using "gen_random_uuid()" which ends up in a VALUE statement of:
+		// PostgreSQL-compatible databases can generate UUIDs using
+		// "gen_random_uuid()", which ends up in a VALUE statement of:
 		//
 		//	(gen_random_uuid(), ?, ?, ?),
 		for k := range placeholderRow {
@@ -117,7 +125,7 @@ func buildInsertQueryArgs[T any](ctx context.Context, models []*T, opts *createO
 				continue
 			}
 
-			if val == uuid.Nil && opts.dialect == dbal.DriverCockroachDB && !opts.partialInserts {
+			if val == uuid.Nil && dbal.IsPostgresCompatible(opts.dialect) && !opts.partialInserts {
 				pl[k] = "gen_random_uuid()"
 				break
 			}
@@ -138,8 +146,9 @@ func buildInsertQueryValues[T any](columns []string, models []*T, opts *createOp
 		m := reflect.ValueOf(m)
 
 		now := opts.now()
-		// Append model fields to args
-		for _, c := range columns {
+		// Model fields only — extra columns aren't on the struct.
+		modelColumnCount := len(columns) - len(opts.extraColumns)
+		for _, c := range columns[:modelColumnCount] {
 			field := opts.mapper.FieldByName(m, c)
 
 			switch c {
@@ -152,9 +161,9 @@ func buildInsertQueryValues[T any](columns []string, models []*T, opts *createOp
 			case "id":
 				if field.Interface().(uuid.UUID) != uuid.Nil {
 					break // breaks switch, not for
-				} else if opts.dialect == dbal.DriverCockroachDB && !opts.partialInserts {
+				} else if dbal.IsPostgresCompatible(opts.dialect) && !opts.partialInserts {
 					// This is a special case:
-					// 1. We're using cockroach
+					// 1. We're using a PostgreSQL-compatible database.
 					// 2. It's the primary key field ("ID")
 					// 3. A UUID was not yet set.
 					//
@@ -184,6 +193,10 @@ func buildInsertQueryValues[T any](columns []string, models []*T, opts *createOp
 				}
 			}
 		}
+
+		for _, ec := range opts.extraColumns {
+			values = append(values, ec.V)
+		}
 	}
 
 	return values, nil
@@ -195,9 +208,18 @@ type createOpts struct {
 	mapper         *reflectx.Mapper
 	quoter         quoter
 	now            func() time.Time
+	extraColumns   []identity.ExtraColumn
 }
 
 type CreateOpts func(*createOpts)
+
+// WithExtraColumns appends fixed (K, V) columns to every row of the batch.
+// All rows receive the same values; group rows by extra-column values first.
+func WithExtraColumns(cols []identity.ExtraColumn) CreateOpts {
+	return func(o *createOpts) {
+		o.extraColumns = append(o.extraColumns, cols...)
+	}
+}
 
 // WithPartialInserts allows to insert only the models that do not conflict with
 // an existing record. WithPartialInserts will also generate the IDs for the
@@ -256,7 +278,7 @@ func Create[T any](ctx context.Context, p *TracerConnection, models []*T, opts .
 
 	var returningClause string
 	if conn.Dialect.Name() != dbal.DriverMySQL {
-		// PostgreSQL, CockroachDB, SQLite support RETURNING.
+		// PostgreSQL, CockroachDB, YugabyteDB, and SQLite support RETURNING.
 		if options.partialInserts {
 			returningClause = fmt.Sprintf("ON CONFLICT DO NOTHING RETURNING %s", model.IDField())
 		} else {

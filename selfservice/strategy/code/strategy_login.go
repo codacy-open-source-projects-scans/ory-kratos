@@ -190,8 +190,16 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 	}
 
 	if p, err := s.methodEnabledAndAllowedFromRequest(r, f); errors.Is(err, flow.ErrStrategyNotResponsible) {
-		if !s.deps.Config().SelfServiceCodeStrategy(ctx).MFAEnabled {
-			span.SetAttributes(attribute.String("not_responsible_reason", "MFA is not enabled"))
+		// Address submit buttons post `address` with no `method`. Second-factor
+		// buttons require MFA. First-factor refresh buttons additionally require
+		// the refresh address picker feature flag and passwordless code login;
+		// the address resolves the identifier downstream (ory/kratos#4194).
+		codeConfig := s.deps.Config().SelfServiceCodeStrategy(ctx)
+		allowFirstFactorRefreshAddress := f.Refresh &&
+			codeConfig.PasswordlessEnabled &&
+			s.deps.Config().RefreshLoginChooseAddress(ctx)
+		if !codeConfig.MFAEnabled && !allowFirstFactorRefreshAddress {
+			span.SetAttributes(attribute.String("not_responsible_reason", "code method is not enabled"))
 			return nil, err
 		}
 
@@ -232,6 +240,12 @@ func (s *Strategy) Login(w http.ResponseWriter, r *http.Request, f *login.Flow, 
 		id, addresses, err := s.findIdentityForIdentifier(ctx, identifier, f.RequestedAAL, sess)
 		if err != nil {
 			return nil, s.HandleLoginError(r, f, &p, err, false)
+		}
+		// On a refresh login the identity is fixed by the active session.
+		// A submitted address that resolves to a different identity must not
+		// be able to trigger a code or switch the session (ory/kratos#4194).
+		if f.Refresh && sess.Identity != nil && id.ID != sess.Identity.ID {
+			return nil, s.HandleLoginError(r, f, &p, errors.WithStack(schema.NewNoCodeAuthnCredentials()), false)
 		}
 		if err := s.loginSendCode(ctx, w, r, f, id, identifier, addresses, false); err != nil {
 			return nil, s.HandleLoginError(r, f, &p, err, false)
@@ -279,6 +293,14 @@ func (s *Strategy) FastLogin1FA(w http.ResponseWriter, r *http.Request, f *login
 	id, addresses, err := s.findIdentityForIdentifier(ctx, identifier, f.RequestedAAL, sess)
 	if err != nil {
 		return err
+	}
+
+	// On a refresh login the identity is fixed by the active session. Do not
+	// let a submitted identifier resolve a different identity and trigger a
+	// code to a foreign address (ory/kratos#4194). Returning "not responsible"
+	// keeps the response identical to the no-fast-login case (no enumeration).
+	if f.Refresh && sess.Identity != nil && id.ID != sess.Identity.ID {
+		return flow.ErrStrategyNotResponsible
 	}
 
 	accountEnumerationMitigate := s.deps.Config().SecurityAccountEnumerationMitigate(r.Context())
@@ -506,6 +528,16 @@ func (s *Strategy) loginSendCode(ctx context.Context, w http.ResponseWriter, r *
 		return errors.WithStack(err)
 	}
 
+	// Fetch the OAuth2 login request before sending out the code so that
+	// courier templates can access the OAuth2 client that initiated the flow.
+	if f.OAuth2LoginChallenge != "" {
+		hlr, err := s.deps.Hydra().GetLoginRequest(ctx, string(f.OAuth2LoginChallenge))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		f.HydraLoginRequest = hlr
+	}
+
 	// kratos only supports `email` identifiers at the moment with the code method
 	// this is validated in the identity validation step above
 	if err := s.deps.CodeSender().SendCode(ctx, f, id, r.Header, addresses...); err != nil {
@@ -522,14 +554,6 @@ func (s *Strategy) loginSendCode(ctx context.Context, w http.ResponseWriter, r *
 	f.Active = identity.CredentialsTypeCodeAuth
 	if err = s.deps.LoginFlowPersister().UpdateLoginFlow(ctx, f); err != nil {
 		return err
-	}
-
-	if f.OAuth2LoginChallenge != "" {
-		hlr, err := s.deps.Hydra().GetLoginRequest(ctx, string(f.OAuth2LoginChallenge))
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		f.HydraLoginRequest = hlr
 	}
 
 	if x.IsJSONRequest(r) {
@@ -580,6 +604,11 @@ func (s *Strategy) loginVerifyCode(ctx context.Context, f *login.Flow, p *update
 	}
 	if err != nil {
 		return nil, err
+	}
+	// Defense in depth: a refresh login must complete against the session's
+	// own identity, never one resolved from a foreign submitted address.
+	if f.Refresh && sess.Identity != nil && i.ID != sess.Identity.ID {
+		return nil, errors.WithStack(schema.NewNoCodeAuthnCredentials())
 	}
 
 	loginCode, err := s.deps.LoginCodePersister().UseLoginCode(ctx, f.ID, i.ID, p.Code)

@@ -14,6 +14,7 @@ import (
 	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/nosurfx"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
@@ -34,6 +35,7 @@ var _ login.PostHookExecutor = new(AddressVerifier)
 
 type (
 	addressVerifierDependencies interface {
+		clock.Provider
 		config.Provider
 		nosurfx.CSRFTokenGeneratorProvider
 		nosurfx.CSRFProvider
@@ -97,7 +99,7 @@ func (e *AddressVerifier) ExecuteLoginPostHook(w http.ResponseWriter, r *http.Re
 			continue
 		}
 
-		verificationFlow, err := verification.NewPostHookFlow(e.r.Config(),
+		verificationFlow, err := verification.NewPostHookFlow(e.r,
 			e.r.Config().SelfServiceFlowVerificationRequestLifespan(ctx),
 			e.r.GenerateCSRFToken(r), r, strategies, f)
 		if err != nil {
@@ -112,6 +114,14 @@ func (e *AddressVerifier) ExecuteLoginPostHook(w http.ResponseWriter, r *http.Re
 			if err := strategy.PopulateVerificationMethod(r, verificationFlow); err != nil {
 				return err
 			}
+		}
+
+		// The code strategy's PopulateVerificationMethod sets the email "code sent"
+		// message unconditionally; override it with the message that matches the
+		// channel the code was sent over. The legacy link strategy sends a link,
+		// not a code, and sets no message — leave it untouched.
+		if primaryStrategy.NodeGroup() == node.CodeGroup {
+			verificationFlow.UI.Messages.Set(text.VerificationCodeSentMessage(address.Via))
 		}
 
 		verificationFlow.SessionID = uuid.NullUUID{UUID: s.ID, Valid: true}

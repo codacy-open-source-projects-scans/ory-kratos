@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -31,6 +32,8 @@ import (
 	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/selfservice/strategy"
 	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/text"
+	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
 )
 
@@ -141,6 +144,17 @@ func (s *Strategy) linkableProviders(conf *ConfigurationCollection, confidential
 	return result, nil
 }
 
+// settingsNodeGroup returns the UI node group for this strategy's settings
+// link/unlink nodes. SAML nodes use the SAML group so a sibling strategy's
+// group-scoped removal does not clobber them (both strategies share the OSS
+// PopulateSettingsMethod, which names every link/unlink node "link"/"unlink").
+func (s *Strategy) settingsNodeGroup() node.UiNodeGroup {
+	if s.credType == identity.CredentialsTypeSAML {
+		return node.SAMLGroup
+	}
+	return node.OpenIDConnectGroup
+}
+
 func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, id *identity.Identity, sr *settings.Flow) (err error) {
 	ctx, span := s.d.Tracer(ctx).Tracer().Start(ctx, "selfservice.strategy.oidc.Strategy.PopulateSettingsMethod")
 	defer otelx.End(span, &err)
@@ -160,10 +174,57 @@ func (s *Strategy) PopulateSettingsMethod(ctx context.Context, r *http.Request, 
 		return err
 	}
 
-	sr.UI.GetNodes().Remove("unlink", "link")
+	group := s.settingsNodeGroup()
+	sr.UI.GetNodes().RemoveInGroup(group, "unlink", "link")
 	sr.UI.SetCSRF(s.d.GenerateCSRFToken(r))
+
+	if sr.OrganizationID.Valid {
+		boundToFlowOrg := id.OrganizationID.Valid && id.OrganizationID.UUID == sr.OrganizationID.UUID
+
+		// Org-scoped settings: render only providers belonging to this org.
+		// Already-linked providers render as disabled unlink nodes (the org
+		// owns the binding, so the user cannot remove it). Unlinked providers
+		// render as link nodes — disabled when the identity is already bound
+		// to this org, active otherwise (first-time bind).
+		linkedIDs := make(map[string]struct{}, len(linked))
+		for _, p := range linked {
+			linkedIDs[p.Config().ID] = struct{}{}
+		}
+		for _, p := range conf.Providers {
+			if !flowOrgMatchesProvider(sr, p.OrganizationID) {
+				continue
+			}
+			_, alreadyLinked := linkedIDs[p.ID]
+			var n *node.Node
+			if alreadyLinked {
+				n = NewUnlinkNode(p.ID, cmp.Or(p.Label, p.ID))
+			} else {
+				n = NewLinkNode(p.ID, cmp.Or(p.Label, p.ID))
+			}
+			n.Group = group
+			if alreadyLinked || boundToFlowOrg {
+				if attrs, ok := n.Attributes.(*node.InputAttributes); ok {
+					attrs.Disabled = true
+				}
+			}
+			sr.UI.GetNodes().Append(n)
+		}
+		if boundToFlowOrg {
+			// Cloud OIDC and SAML org strategies both delegate here; dedupe so
+			// the managed-by-organization message appears exactly once.
+			hasMsg := slices.ContainsFunc(sr.UI.Messages, func(m text.Message) bool {
+				return m.ID == text.InfoSelfServiceSettingsManagedByOrganization
+			})
+			if !hasMsg {
+				sr.UI.Messages.Add(text.NewInfoSelfServiceSettingsManagedByOrganization())
+			}
+		}
+		return nil
+	}
+
+	// Non-org settings flow: existing behavior.
 	for _, l := range linkable {
-		// We do not want to offer to link SSO providers in the settings.
+		// We do not want to offer to link SSO providers in the regular settings flow.
 		if l.Config().OrganizationID != "" {
 			continue
 		}
@@ -230,7 +291,6 @@ type updateSettingsFlowWithOidcMethod struct {
 	//
 	// These parameters are optional and depend on what the upstream identity provider supports.
 	// Supported parameters are:
-	// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
 	// - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
 	// - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
 	// - `acr_values` (string): The `acr_values` specifies the Authentication Context Class Reference values for the authorization request.
@@ -261,6 +321,10 @@ func (s *Strategy) Settings(ctx context.Context, w http.ResponseWriter, r *http.
 		return nil, err
 	}
 	f.TransientPayload = p.TransientPayload
+
+	if f.OrganizationID.Valid && len(p.Unlink) > 0 {
+		return nil, errors.WithStack(herodot.ErrBadRequest().WithReason("Cannot unlink an organization-scoped credential through the settings flow."))
+	}
 
 	ctxUpdate, err := settings.PrepareUpdate(s.d, w, r, f, ss, settings.ContinuityKey(s.SettingsStrategyID()), &p)
 	if errors.Is(err, settings.ErrContinuePreviousAction) {
@@ -336,7 +400,17 @@ func (s *Strategy) isLinkable(ctx context.Context, ctxUpdate *settings.UpdateCon
 	var found bool
 	for _, available := range linkable {
 		if toLink == available.Config().ID {
+			// The provider must match the flow's organization scope. An
+			// org-scoped flow may link only providers of that organization; a
+			// non-org flow may link only providers with no organization. We
+			// reuse ConnectionExistValidationError rather than a distinct
+			// "wrong organization" message so an attacker cannot probe which
+			// providers another organization has configured.
+			if !flowOrgMatchesProvider(ctxUpdate.Flow, available.Config().OrganizationID) {
+				return nil, errors.WithStack(ConnectionExistValidationError)
+			}
 			found = true
+			break
 		}
 	}
 
@@ -345,6 +419,21 @@ func (s *Strategy) isLinkable(ctx context.Context, ctxUpdate *settings.UpdateCon
 	}
 
 	return i, nil
+}
+
+// flowOrgMatchesProvider reports whether a provider with organization id
+// providerOrg may be linked through flow f. An org-scoped flow accepts only
+// providers of that organization; a non-org flow accepts only providers with
+// no organization.
+func flowOrgMatchesProvider(f *settings.Flow, providerOrg string) bool {
+	if !f.OrganizationID.Valid {
+		return providerOrg == ""
+	}
+	providerOrgID, err := uuid.FromString(providerOrg)
+	if err != nil {
+		return false
+	}
+	return providerOrgID == f.OrganizationID.UUID
 }
 
 func (s *Strategy) initLinkProvider(ctx context.Context, w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithOidcMethod) error {
@@ -366,7 +455,7 @@ func (s *Strategy) initLinkProvider(ctx context.Context, w http.ResponseWriter, 
 		return s.handleSettingsError(ctx, w, r, ctxUpdate, p, err)
 	}
 
-	state, pkce, err := s.GenerateState(ctx, provider, ctxUpdate.Flow)
+	state, pkce, err := s.GenerateState(ctx, provider, ctxUpdate.Flow, x.RequestBaseURL(r))
 	if err != nil {
 		return s.handleSettingsError(ctx, w, r, ctxUpdate, p, err)
 	}

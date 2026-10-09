@@ -6,6 +6,8 @@ package text
 import (
 	"fmt"
 	"time"
+
+	"github.com/ory/x/clock"
 )
 
 func NewInfoLoginReAuth() *Message {
@@ -140,10 +142,10 @@ func NewInfoLoginWithAndLink(provider string) *Message {
 	}
 }
 
-func NewErrorValidationLoginFlowExpired(expiredAt time.Time) *Message {
+func NewErrorValidationLoginFlowExpired(c clock.Clock, expiredAt time.Time) *Message {
 	return &Message{
 		ID:   ErrorValidationLoginFlowExpired,
-		Text: fmt.Sprintf("The login flow expired %.2f minutes ago, please try again.", Since(expiredAt).Minutes()),
+		Text: fmt.Sprintf("The login flow expired %.2f minutes ago, please try again.", c.Now().Sub(expiredAt).Minutes()),
 		Type: Error,
 		Context: context(map[string]any{
 			"expired_at":      expiredAt,
@@ -237,6 +239,19 @@ func NewLoginCodeSent() *Message {
 		ID:   InfoSelfServiceLoginCodeSent,
 		Type: Info,
 		Text: "A code was sent to the address you provided. If you didn't receive it, please check the spelling of the address and try again.",
+	}
+}
+
+// NewLoginCodeSentForAuthenticatedUser is shown on refresh and second factor
+// login flows where the address is bound to the authenticated identity rather
+// than typed by the user. The wording avoids the inaccurate "address you
+// provided" phrasing and the unhelpful "check the spelling" guidance, since
+// the user cannot change the recipient mid-flow.
+func NewLoginCodeSentForAuthenticatedUser() *Message {
+	return &Message{
+		ID:   InfoSelfServiceLoginCodeSentForAuthenticatedUser,
+		Type: Info,
+		Text: "A code was sent to your address. If you didn't receive it, please try again.",
 	}
 }
 

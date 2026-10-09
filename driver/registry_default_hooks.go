@@ -56,7 +56,11 @@ func (m *RegistryDefault) HookVerifyNewAddress() *hook.VerifyNewAddress {
 	return m.hookVerifyNewAddress
 }
 
-func (m *RegistryDefault) WithHooks(hooks map[string]func(config.SelfServiceHook) interface{}) {
+func (m *RegistryDefault) HookNotifyPreviousAddresses(c *hook.NotifyPreviousAddressesConfig) *hook.NotifyPreviousAddresses {
+	return hook.NewNotifyPreviousAddresses(m, c)
+}
+
+func (m *RegistryDefault) WithHooks(hooks map[string]NewHookFn) {
 	m.injectedSelfserviceHooks = hooks
 }
 func (m *RegistryDefault) WithExtraHandlers(handlers []NewHandler) {
@@ -68,8 +72,8 @@ func getHooks[T any](m *RegistryDefault, credentialsType string, configs []confi
 
 	var addSessionIssuer bool
 allHooksLoop:
-	for _, h := range configs {
-		switch h.Name {
+	for _, hookConfig := range configs {
+		switch hookConfig.Name {
 		case hook.KeySessionIssuer:
 			// The session issuer hook always needs to come last.
 			addSessionIssuer = true
@@ -79,8 +83,8 @@ allHooksLoop:
 			}
 		case hook.KeyWebHook:
 			cfg := request.Config{}
-			if err := json.Unmarshal(h.Config, &cfg); err != nil {
-				m.l.WithError(err).WithField("raw_config", string(h.Config)).Error("failed to unmarshal hook configuration, ignoring hook")
+			if err := json.Unmarshal(hookConfig.Config, &cfg); err != nil {
+				m.l.WithError(err).WithField("raw_config", string(hookConfig.Config)).Error("failed to unmarshal hook configuration, ignoring hook")
 				return nil, errors.WithStack(fmt.Errorf("failed to unmarshal webhook configuration for %s: %w", credentialsType, err))
 			}
 			if h, ok := any(hook.NewWebHook(m, &cfg)).(T); ok {
@@ -102,10 +106,21 @@ allHooksLoop:
 			if h, ok := any(m.HookVerifyNewAddress()).(T); ok {
 				hooks = append(hooks, h)
 			}
+		case hook.KeyNotifyPreviousAddresses:
+			cfg := &hook.NotifyPreviousAddressesConfig{}
+			if len(hookConfig.Config) > 0 {
+				if err := json.Unmarshal(hookConfig.Config, cfg); err != nil {
+					m.l.WithError(err).WithField("raw_config", string(hookConfig.Config)).Error("failed to unmarshal hook configuration, ignoring hook")
+					return nil, errors.WithStack(fmt.Errorf("failed to unmarshal notify_previous_addresses configuration for %s: %w", credentialsType, err))
+				}
+			}
+			if h, ok := any(m.HookNotifyPreviousAddresses(cfg)).(T); ok {
+				hooks = append(hooks, h)
+			}
 		default:
-			for name, m := range m.injectedSelfserviceHooks {
-				if name == h.Name {
-					if h, ok := m(h).(T); ok {
+			for name, newHook := range m.injectedSelfserviceHooks {
+				if name == hookConfig.Name {
+					if h, ok := newHook(hookConfig, m).(T); ok {
 						hooks = append(hooks, h)
 					}
 					continue allHooksLoop
@@ -113,7 +128,7 @@ allHooksLoop:
 			}
 			m.l.
 				WithField("for", credentialsType).
-				WithField("hook", h.Name).
+				WithField("hook", hookConfig.Name).
 				Warn("A configuration for a non-existing hook was found and will be ignored.")
 		}
 	}

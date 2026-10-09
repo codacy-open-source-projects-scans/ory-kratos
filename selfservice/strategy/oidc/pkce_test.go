@@ -4,7 +4,6 @@
 package oidc_test
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +21,8 @@ import (
 )
 
 func TestPKCESupport(t *testing.T) {
+	t.Parallel()
+
 	supported := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"issuer": "http://%s", "code_challenge_methods_supported":["S256"]}`, r.Host)
 	}))
@@ -31,8 +32,7 @@ func TestPKCESupport(t *testing.T) {
 	}))
 	t.Cleanup(notSupported.Close)
 
-	conf, reg := pkg.NewFastRegistryWithMocks(t)
-	_ = conf
+	_, reg := pkg.NewFastRegistryWithMocks(t)
 	strat := oidc.NewStrategy(reg)
 
 	for _, tc := range []struct {
@@ -61,13 +61,14 @@ func TestPKCESupport(t *testing.T) {
 			ID: x.NewUUID(),
 		}
 
-		stateParam, pkce, err := strat.GenerateState(context.Background(), provider, flow)
+		stateParam, pkce, err := strat.GenerateState(t.Context(), provider, flow, "https://testhost")
 		require.NoError(t, err)
 		require.NotEmpty(t, stateParam)
 
-		state, err := oidc.DecryptState(context.Background(), reg.Cipher(context.Background()), stateParam)
+		state, err := oidc.DecryptState(t.Context(), reg.Cipher(t.Context()), stateParam)
 		require.NoError(t, err)
 		assert.Equal(t, oidcv1.FlowKind_FLOW_KIND_LOGIN, state.FlowKind)
+		assert.Equal(t, "https://testhost", state.RequestBaseUrl)
 
 		if tc.pkce {
 			require.NotEmpty(t, pkce)
@@ -84,15 +85,16 @@ func TestPKCESupport(t *testing.T) {
 			oidc.NewProviderX(&oidc.Configuration{IssuerURL: supported.URL, PKCE: "never"}, reg),
 			oidc.NewProviderX(&oidc.Configuration{IssuerURL: supported.URL, PKCE: "auto"}, reg),
 		} {
-			stateParam, pkce, err := strat.GenerateState(context.Background(), provider, &registration.Flow{ID: x.NewUUID()})
+			stateParam, pkce, err := strat.GenerateState(t.Context(), provider, &registration.Flow{ID: x.NewUUID()}, "https://testhost")
 			require.NoError(t, err)
 			require.NotEmpty(t, stateParam)
 			assert.Empty(t, pkce)
 
-			state, err := oidc.DecryptState(context.Background(), reg.Cipher(context.Background()), stateParam)
+			state, err := oidc.DecryptState(t.Context(), reg.Cipher(t.Context()), stateParam)
 			require.NoError(t, err)
 			assert.Empty(t, oidc.PKCEVerifier(state))
 			assert.Equal(t, oidcv1.FlowKind_FLOW_KIND_REGISTRATION, state.FlowKind)
+			assert.Equal(t, "https://testhost", state.RequestBaseUrl)
 		}
 	})
 }

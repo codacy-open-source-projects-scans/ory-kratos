@@ -135,6 +135,7 @@ context("Settings success with email profile", () => {
           cy.get('input[name="traits.age"]').should("have.value", "90")
         })
 
+        // playwright:migrated
         it("modifies a protected trait with privileged session", () => {
           email = up(email)
           cy.disableVerification()
@@ -144,6 +145,7 @@ context("Settings success with email profile", () => {
           cy.get('input[name="traits.email"]').should("contain.value", email)
         })
 
+        // playwright:migrated
         it("is unable to log in with the old email", () => {
           cy.login({
             email: down(email),

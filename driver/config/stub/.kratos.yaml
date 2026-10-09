@@ -36,6 +36,8 @@ hashers:
     dedicated_memory: 1GB
     expected_duration: 500ms
     expected_deviation: 500ms
+  bcrypt:
+    cost: 4
 
 secrets:
   cookie:

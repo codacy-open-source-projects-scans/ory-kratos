@@ -34,19 +34,25 @@ func NewConfigurationWithDefaults(t testing.TB, opts ...configx.OptionModifier) 
 
 	configOpts := append([]configx.OptionModifier{
 		configx.WithValues(map[string]interface{}{
-			"log.level":                                      "error",
-			config.ViperKeyDSN:                               dbal.NewSQLiteTestDatabase(t),
-			config.ViperKeyHasherArgon2ConfigMemory:          16384,
-			config.ViperKeyHasherArgon2ConfigIterations:      1,
-			config.ViperKeyHasherArgon2ConfigParallelism:     1,
-			config.ViperKeyHasherArgon2ConfigSaltLength:      16,
-			config.ViperKeyHasherBcryptCost:                  4,
-			config.ViperKeyHasherArgon2ConfigKeyLength:       16,
-			config.ViperKeyCourierSMTPURL:                    "smtp://foo:bar@baz.com/",
-			config.ViperKeySelfServiceBrowserDefaultReturnTo: ts.URL,
-			config.ViperKeySecretsCipher:                     []string{"secret-thirty-two-character-long"},
-			config.ViperKeySecretsPagination:                 []string{uuid.Must(uuid.NewV4()).String()},
-			config.ViperKeySelfServiceLoginFlowStyle:         "unified",
+			"log.level":                                  "error",
+			config.ViperKeyDSN:                           dbal.NewSQLiteTestDatabase(t),
+			config.ViperKeyHasherArgon2ConfigMemory:      16384,
+			config.ViperKeyHasherArgon2ConfigIterations:  1,
+			config.ViperKeyHasherArgon2ConfigParallelism: 1,
+			config.ViperKeyHasherArgon2ConfigSaltLength:  16,
+			// The invalid-credentials login/webauthn paths sleep for
+			// RandomDelay(expected_duration, expected_deviation) to mask timing
+			// attacks. In tests this adds 0–1s per negative path; shrink it to
+			// keep the timing-defense code exercised without the wall-clock cost.
+			config.ViperKeyHasherArgon2ConfigExpectedDuration:  "1ns",
+			config.ViperKeyHasherArgon2ConfigExpectedDeviation: "1ns",
+			config.ViperKeyHasherBcryptCost:                    4,
+			config.ViperKeyHasherArgon2ConfigKeyLength:         16,
+			config.ViperKeyCourierSMTPURL:                      "smtp://foo:bar@baz.com/",
+			config.ViperKeySelfServiceBrowserDefaultReturnTo:   ts.URL,
+			config.ViperKeySecretsCipher:                       []string{"secret-thirty-two-character-long"},
+			config.ViperKeySecretsPagination:                   []string{uuid.Must(uuid.NewV4()).String()},
+			config.ViperKeySelfServiceLoginFlowStyle:           "unified",
 		}),
 		configx.SkipValidation(),
 		configx.DisableEnvLoading(),
@@ -63,8 +69,8 @@ func NewFastRegistryWithMocks(t *testing.T, opts ...configx.OptionModifier) (*co
 	conf, reg := NewRegistryDefaultWithDSN(t, "", opts...)
 	reg.WithCSRFTokenGenerator(nosurfx.FakeCSRFTokenGenerator)
 	reg.WithCSRFHandler(nosurfx.NewFakeCSRFHandler(reg))
-	reg.WithHooks(map[string]func(config.SelfServiceHook) interface{}{
-		"err": func(c config.SelfServiceHook) interface{} {
+	reg.WithHooks(map[string]driver.NewHookFn{
+		"err": func(c config.SelfServiceHook, _ driver.Registry) interface{} {
 			return &hook.Error{Config: c.Config}
 		},
 	})

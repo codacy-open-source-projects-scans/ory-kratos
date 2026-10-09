@@ -45,6 +45,7 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/pop/v6"
 	"github.com/ory/pop/v6/logging"
+	"github.com/ory/x/configx"
 	"github.com/ory/x/dbal"
 	"github.com/ory/x/popx"
 	"github.com/ory/x/sqlcon"
@@ -93,94 +94,71 @@ func pl(t testing.TB) func(lvl logging.Level, s string, args ...interface{}) {
 	}
 }
 
-func createCleanDatabases(t testing.TB) map[string]string {
-	conns := map[string]string{
-		"sqlite": dbal.NewSQLiteTestDatabase(t),
-	}
-	connsMtx := sync.Mutex{}
+var dbNames = []string{"sqlite", "postgres", "mysql", "cockroach"}
 
-	if !testing.Short() {
-		funcs := map[string]func(t testing.TB) string{
-			"postgres": func(t testing.TB) string {
-				return dockertest.RunTestPostgreSQLWithVersion(t, "16")
-			},
-			"mysql": func(t testing.TB) string {
-				return dockertest.RunTestMySQLWithVersion(t, "8.4")
-			},
-			"cockroach": newLocalTestCRDBServer,
-		}
-
-		var wg sync.WaitGroup
-		wg.Add(len(funcs))
-
-		for k, f := range funcs {
-			go func(s string, f func(t testing.TB) string) {
-				defer wg.Done()
-				db := f(t)
-				connsMtx.Lock()
-				conns[s] = db
-				connsMtx.Unlock()
-			}(k, f)
-		}
-
-		wg.Wait()
+func setupDatabase(t testing.TB, name string) string {
+	var dsn string
+	switch name {
+	case "sqlite":
+		dsn = dbal.NewSQLiteTestDatabase(t)
+	case "postgres":
+		dsn = dockertest.RunTestPostgreSQLWithVersion(t, "16")
+	case "mysql":
+		dsn = dockertest.RunTestMySQLWithVersion(t, "8.4")
+	case "cockroach":
+		dsn = newLocalTestCRDBServer(t)
+	default:
+		t.Fatalf("unknown database: %s", name)
 	}
 
-	ps := make(map[string]string, len(conns))
-	psMtx := sync.Mutex{}
-
-	var wg sync.WaitGroup
-	wg.Add(len(conns))
-	for name, dsn := range conns {
-		go func(name, dsn string) {
-			defer wg.Done()
-
-			if name != "sqlite" {
-				require.EventuallyWithT(t, func(t *assert.CollectT) {
-					c, err := pop.NewConnection(&pop.ConnectionDetails{URL: dsn})
-					require.NoError(t, err)
-					require.NoError(t, c.Open())
-					dbName := "testdb" + strings.ReplaceAll(x.NewUUID().String(), "-", "")
-					require.NoError(t, c.RawQuery("CREATE DATABASE "+dbName).Exec())
-					dsn = regexp.MustCompile(`/[a-z0-9]+\?`).ReplaceAllString(dsn, "/"+dbName+"?")
-				}, 20*time.Second, 100*time.Millisecond)
-			}
-
-			t.Logf("Connecting to %s: %s", name, dsn)
-
-			_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
-			p := reg.Persister().(*sql.Persister)
-
-			t.Logf("Applying %s migrations", name)
-			pop.SetLogger(pl(t))
-			require.NoError(t, p.MigrateUp(context.Background()))
-			t.Logf("%s migrations applied", name)
-			status, err := p.MigrationStatus(context.Background())
+	if name != "sqlite" {
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			c, err := pop.NewConnection(&pop.ConnectionDetails{URL: dsn})
 			require.NoError(t, err)
-			require.False(t, status.HasPending())
-
-			psMtx.Lock()
-			ps[name] = dsn
-			psMtx.Unlock()
-
-			t.Logf("Database %s initialized successfully", name)
-		}(name, dsn)
+			require.NoError(t, c.Open())
+			dbName := "testdb" + strings.ReplaceAll(x.NewUUID().String(), "-", "")
+			require.NoError(t, c.RawQuery("CREATE DATABASE "+dbName).Exec())
+			dsn = regexp.MustCompile(`/[a-z0-9]+\?`).ReplaceAllString(dsn, "/"+dbName+"?")
+		}, 60*time.Second, 200*time.Millisecond)
 	}
 
-	wg.Wait()
-	return ps
+	t.Logf("Connecting to %s: %s", name, dsn)
+
+	_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+	p := reg.Persister().(*sql.Persister)
+
+	t.Logf("Applying %s migrations", name)
+	pop.SetLogger(pl(t))
+	require.NoError(t, p.MigrateUp(t.Context()))
+	t.Logf("%s migrations applied", name)
+	status, err := p.MigrationStatus(t.Context())
+	require.NoError(t, err)
+	require.False(t, status.HasPending())
+
+	t.Logf("Database %s initialized successfully", name)
+	return dsn
 }
 
 func TestPersister(t *testing.T) {
 	t.Parallel()
 
-	conns := createCleanDatabases(t)
-	ctx := testhelpers.WithDefaultIdentitySchema(context.Background(), "file://./stub/identity.schema.json")
+	ctx := t.Context()
+	// Bake the default identity schema into each registry's base config below
+	// instead of layering it onto ctx. A context overlay makes
+	// TestConfigProvider.Config rebuild the whole koanf tree on every config read
+	// (the same reason identity.TestPool bakes PoolConfigValues), which the
+	// contracts here would otherwise pay on every read.
+	defaultSchema := configx.WithValues(testhelpers.DefaultIdentitySchemaConfig("file://./stub/identity.schema.json"))
 
-	for name, dsn := range conns {
+	for _, name := range dbNames {
 		t.Run(fmt.Sprintf("database=%s", name), func(t *testing.T) {
 			t.Parallel()
 
+			if name != "sqlite" && testing.Short() {
+				t.Skip("skipping non-sqlite under -short")
+			}
+
+			dsn := setupDatabase(t, name)
 			t.Logf("DSN: %s", dsn)
 
 			t.Run("racy identity creation", func(t *testing.T) {
@@ -201,7 +179,7 @@ func TestPersister(t *testing.T) {
 					go func() {
 						defer wg.Done()
 
-						_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+						_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 						_, ps := testhelpers.NewNetwork(t, ctx, reg.Persister())
 						id := ri.NewIdentity("")
 						id.SetCredentials(ri.CredentialsTypePassword, ri.Credentials{
@@ -226,10 +204,10 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				for _, ct := range []ri.CredentialsType{ri.CredentialsTypeOIDC, ri.CredentialsTypePassword} {
-					require.NoError(t, p.(*sql.Persister).Connection(context.Background()).Where("name = ?", ct).First(&ri.CredentialsTypeTable{}))
+					require.NoError(t, p.(*sql.Persister).Connection(t.Context()).Where("name = ?", ct).First(&ri.CredentialsTypeTable{}))
 				}
 			})
 
@@ -241,7 +219,11 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				// Unlike the sibling contracts (which bake only the single default
+				// identity schema via defaultSchema), this contract needs the full
+				// PoolConfigValues schema set baked into the registry's base config.
+				ctx := t.Context()
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, configx.WithValues(identity.PoolConfigValues()))
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				identity.TestPool(ctx, p, reg.IdentityManager(), name)(t)
 			})
@@ -253,7 +235,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				registration.TestFlowPersister(ctx, p)(t)
 			})
@@ -265,7 +247,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				errorx.TestPersister(ctx, p)(t)
 			})
@@ -277,7 +259,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				login.TestFlowPersister(ctx, p)(t)
 			})
@@ -289,7 +271,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				settings.TestFlowPersister(ctx, p)(t)
 			})
@@ -301,7 +283,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				session.TestPersister(ctx, reg.Config(), p)(t)
 			})
@@ -313,7 +295,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				sessiontokenexchange.TestPersister(ctx, p)(t)
 			})
@@ -325,7 +307,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				upsert, insert := sqltesthelpers.DefaultNetworkWrapper(p)
 				courier.TestPersister(ctx, upsert, insert)(t)
@@ -338,7 +320,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				verification.TestFlowPersister(ctx, p)(t)
 			})
@@ -350,7 +332,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				recovery.TestFlowPersister(ctx, p)(t)
 			})
@@ -362,7 +344,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				link.TestPersister(ctx, p)(t)
 			})
@@ -374,7 +356,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				code.TestPersister(ctx, p)(t)
 			})
@@ -386,7 +368,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				continuity.TestPersister(ctx, p)(t)
 			})
@@ -398,7 +380,7 @@ func TestPersister(t *testing.T) {
 					dsn = dbal.NewSQLiteTestDatabase(t)
 				}
 
-				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn)
+				_, reg := pkg.NewRegistryDefaultWithDSN(t, dsn, defaultSchema)
 				_, p := testhelpers.NewNetwork(t, ctx, reg.Persister())
 				batch.TestPersister(ctx, reg.Tracer(ctx), p)(t)
 			})
@@ -430,46 +412,46 @@ func TestPersister_Transaction(t *testing.T) {
 			Traits: ri.Traits(`{}`),
 		}
 		errMessage := "failing because why not"
-		err := p.Transaction(context.Background(), func(_ context.Context, connection *pop.Connection) error {
+		err := p.Transaction(t.Context(), func(_ context.Context, connection *pop.Connection) error {
 			require.NoError(t, connection.Create(i))
 			return errors.New(errMessage)
 		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), errMessage)
-		_, err = p.GetIdentity(context.Background(), i.ID, ri.ExpandNothing)
+		_, err = p.GetIdentity(t.Context(), i.ID, ri.ExpandNothing)
 		require.Error(t, err)
 		assert.Equal(t, sqlcon.ErrNoRows().Error(), err.Error())
 	})
 
 	t.Run("case=functions should use the context connection", func(t *testing.T) {
-		c := p.GetConnection(context.Background())
+		c := p.GetConnection(t.Context())
 		errMessage := "some stupid error you can't debug"
 		lr := &lf.Flow{
 			ID: x.NewUUID(),
 		}
 		err := c.Transaction(func(tx *pop.Connection) error {
-			ctx := popx.WithTransaction(context.Background(), tx)
+			ctx := popx.WithTransaction(t.Context(), tx)
 			require.NoError(t, p.CreateLoginFlow(ctx, lr), "%+v", lr)
 			require.NoError(t, getErr(p.GetLoginFlow(ctx, lr.ID)), "%+v", lr)
 			return errors.New(errMessage)
 		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), errMessage)
-		_, err = p.GetLoginFlow(context.Background(), lr.ID)
+		_, err = p.GetLoginFlow(t.Context(), lr.ID)
 		require.Error(t, err)
 		assert.Equal(t, sqlcon.ErrNoRows().Error(), err.Error())
 	})
 }
 
 func Benchmark_BatchCreateIdentities(b *testing.B) {
-	conns := createCleanDatabases(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	batchSizes := []int{1, 10, 100, 500, 800, 900, 1000, 2000, 3000}
 	parallelRequests := []int{1, 4, 8, 16}
 
-	for name, dsn := range conns {
-		_, reg := pkg.NewRegistryDefaultWithDSN(b, dsn)
+	for _, name := range dbNames {
 		b.Run(fmt.Sprintf("database=%s", name), func(b *testing.B) {
+			dsn := setupDatabase(b, name)
+			_, reg := pkg.NewRegistryDefaultWithDSN(b, dsn)
 			conf := reg.Config()
 			_, p := testhelpers.NewNetwork(b, ctx, reg.Persister())
 			multipleEmailsSchema := schema.Schema{
@@ -502,7 +484,7 @@ func Benchmark_BatchCreateIdentities(b *testing.B) {
 											identities[j] = identity.NewTestIdentity(1, prefix, j)
 										}
 
-										return p.CreateIdentities(ctx, identities...)
+										return p.CreateIdentities(ctx, identities)
 									})
 								}
 								assert.NoError(b, wg.Wait())

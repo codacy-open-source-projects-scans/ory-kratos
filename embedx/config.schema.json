@@ -100,14 +100,10 @@
       "properties": {
         "hook": {
           "enum": ["b2b_sso", "organization"]
-        },
-        "config": {
-          "type": "object",
-          "additionalProperties": true
         }
       },
-      "additionalProperties": false,
-      "required": ["hook", "config"]
+      "additionalProperties": true,
+      "required": ["hook"]
     },
     "selfServiceVerifyNewAddressHook": {
       "type": "object",
@@ -116,6 +112,28 @@
       "properties": {
         "hook": {
           "const": "verify_new_address"
+        }
+      },
+      "additionalProperties": false,
+      "required": ["hook"]
+    },
+    "selfServiceNotifyPreviousAddressesHook": {
+      "type": "object",
+      "properties": {
+        "hook": {
+          "const": "notify_previous_addresses"
+        },
+        "config": {
+          "type": "object",
+          "properties": {
+            "recipients": {
+              "type": "string",
+              "enum": ["removed", "all_verified", "all"],
+              "default": "removed",
+              "description": "Which previous addresses receive the change notification. 'removed' (default): only addresses that no longer exist after the change. 'all_verified': all addresses that were verified before the change. 'all': all addresses on the identity before the change."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false,
@@ -787,6 +805,9 @@
               },
               {
                 "$ref": "#/definitions/selfServiceVerifyNewAddressHook"
+              },
+              {
+                "$ref": "#/definitions/selfServiceNotifyPreviousAddressesHook"
               }
             ]
           },
@@ -1291,6 +1312,12 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
+                "clear_browser_data": {
+                  "type": "boolean",
+                  "title": "Clear browser data on logout",
+                  "description": "If set to true, a successful browser logout sends the `Clear-Site-Data` response header over HTTPS, instructing the browser to clear cookies, storage, and caches for the origin. This is off by default to avoid clearing data that other applications on the same origin may rely on.",
+                  "default": false
+                },
                 "after": {
                   "type": "object",
                   "additionalProperties": false,
@@ -1536,6 +1563,13 @@
                               "examples": ["my-app.com"],
                               "description": "If this domain matches the email's domain, this provider is shown."
                             }
+                          },
+                          "session_lifespan": {
+                            "title": "Session Lifespan Override",
+                            "description": "Overrides session.lifespan for sessions issued for this organization. Unset means inherit the project default.",
+                            "type": "string",
+                            "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+                            "examples": ["1h", "24h"]
                           }
                         }
                       }
@@ -1989,6 +2023,71 @@
                       },
                       "type": "object",
                       "required": ["display_name", "id"]
+                    },
+                    "authenticator_selection": {
+                      "type": "object",
+                      "title": "Authenticator Selection Criteria",
+                      "description": "Controls which authenticators are eligible for passkey registration.",
+                      "additionalProperties": false,
+                      "properties": {
+                        "attachment": {
+                          "type": "string",
+                          "title": "Authenticator Attachment",
+                          "description": "Constrains eligible authenticators to a specific attachment modality. Use 'platform' for built-in authenticators (Touch ID, Windows Hello) or 'cross-platform' for roaming authenticators (HID tokens, Yubikeys). Omit this field to let users register either type (WebAuthn 'no preference'), which is the recommended default for passkey deployments.",
+                          "enum": ["platform", "cross-platform"]
+                        },
+                        "resident_key": {
+                          "type": "string",
+                          "title": "Client-side discoverable credential requirement",
+                          "description": "Controls whether the authenticator must create a client-side discoverable credential (historically called a resident key). Maps to the WebAuthn authenticatorSelection.residentKey member, whose name the spec retains for compatibility. See https://pkg.go.dev/github.com/go-webauthn/webauthn/protocol#ResidentKeyRequirement.",
+                          "enum": ["required", "preferred", "discouraged"],
+                          "default": "required"
+                        },
+                        "user_verification": {
+                          "type": "string",
+                          "title": "User Verification Requirement",
+                          "description": "Controls whether biometrics or PIN are required for the passkey ceremony.",
+                          "enum": ["required", "preferred", "discouraged"],
+                          "default": "preferred"
+                        }
+                      }
+                    },
+                    "attestation": {
+                      "type": "object",
+                      "title": "Attestation Configuration",
+                      "description": "Controls the attestation conveyance preference sent to the authenticator during passkey registration.",
+                      "additionalProperties": false,
+                      "properties": {
+                        "preference": {
+                          "type": "string",
+                          "title": "Attestation Conveyance Preference",
+                          "description": "Tells the authenticator what attestation statement to provide. 'none' is the WebAuthn default and tells the client not to provide an attestation statement, which is what most consumer passkeys (e.g., iOS, Android) support today. Use 'direct' to request the raw attestation statement, 'indirect' to allow the client to decide, or 'enterprise' for uniquely identifying attestation.",
+                          "enum": ["none", "indirect", "direct", "enterprise"],
+                          "default": "none"
+                        }
+                      }
+                    },
+                    "timeouts": {
+                      "type": "object",
+                      "title": "Timeout Configuration",
+                      "description": "Controls timeouts for passkey registration and login ceremonies.",
+                      "additionalProperties": false,
+                      "properties": {
+                        "registration": {
+                          "type": "string",
+                          "title": "Registration Timeout",
+                          "description": "Timeout for the passkey registration ceremony. Uses Go duration format. If empty, library defaults are used (5m with user verification, 2m without).",
+                          "pattern": "^([1-9][0-9]*(ns|us|ms|s|m|h))+$",
+                          "examples": ["60s", "5m"]
+                        },
+                        "login": {
+                          "type": "string",
+                          "title": "Login Timeout",
+                          "description": "Timeout for the passkey login ceremony. Uses Go duration format. If empty, library defaults are used (5m with user verification, 2m without).",
+                          "pattern": "^([1-9][0-9]*(ns|us|ms|s|m|h))+$",
+                          "examples": ["60s", "5m"]
+                        }
+                      }
                     }
                   },
                   "additionalProperties": false
@@ -2154,6 +2253,18 @@
                     }
                   },
                   "required": ["email"]
+                }
+              }
+            },
+            "verifiable_address_changed": {
+              "additionalProperties": false,
+              "type": "object",
+              "properties": {
+                "email": {
+                  "$ref": "#/definitions/emailCourierTemplate"
+                },
+                "sms": {
+                  "$ref": "#/definitions/smsCourierTemplate"
                 }
               }
             }
@@ -3142,6 +3253,19 @@
           "description": "The node group to use for registration flows. Previously, the node group for the oidc method's profile fields was `oidc`. Going forward, it will be `default`. This switch can toggle between those two for backwards compatibility and will be removed in the future.",
           "default": false,
           "type": "boolean"
+        },
+        "legacy_allow_insecure_origins": {
+          "type": "boolean",
+          "title": "Allow legacy insecure (unbounded) wildcard origins and return URLs",
+          "description": "If true, restores legacy behavior where wildcard CORS origins and allowed return URLs are not required to be bounded at a registrable domain. Only effective in the Ory Network for grandfathered projects. Insecure and slated for removal.",
+          "deprecationMessage": "Insecure. Migrate to bounded wildcards like \"https://*.example.com\" or exact origins.",
+          "default": false
+        },
+        "refresh_login_choose_address": {
+          "type": "boolean",
+          "title": "Enable the address picker on the code refresh login screen",
+          "description": "If enabled, a code-strategy refresh (privileged re-authentication) login renders a \"Send code to <address>\" button per available code address instead of re-asking for the identifier. The identity is fixed by the active session, so re-entering the identifier is unnecessary and makes the privileged login look like a fresh login. It is safe to toggle this back and forth.",
+          "default": false
         }
       },
       "additionalProperties": false

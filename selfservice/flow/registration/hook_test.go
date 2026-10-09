@@ -7,11 +7,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	nethttptest "net/http/httptest"
 	"net/url"
 	"testing"
-	"time"
-
-	"github.com/ory/kratos/x/nosurfx"
 
 	"github.com/gobuffalo/httptest"
 	"github.com/gofrs/uuid"
@@ -29,7 +27,10 @@ import (
 	"github.com/ory/kratos/selfservice/flow/registration"
 	"github.com/ory/kratos/selfservice/hook"
 	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/ui/node"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/sqlcon"
+	"github.com/ory/x/sqlxx"
 )
 
 func TestRegistrationExecutor(t *testing.T) {
@@ -52,7 +53,7 @@ func TestRegistrationExecutor(t *testing.T) {
 
 				handleErr := testhelpers.SelfServiceHookRegistrationErrorHandler
 				router.HandleFunc("GET /registration/pre", func(w http.ResponseWriter, r *http.Request) {
-					f, err := registration.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, ft)
+					f, err := registration.NewFlow(reg, r, ft)
 					require.NoError(t, err)
 					if handleErr(t, w, r, reg.RegistrationHookExecutor().PreRegistrationHook(w, r, f)) {
 						_, _ = w.Write([]byte("ok"))
@@ -63,7 +64,7 @@ func TestRegistrationExecutor(t *testing.T) {
 					if i == nil {
 						i = testhelpers.SelfServiceHookFakeIdentity(t)
 					}
-					regFlow, err := registration.NewFlow(conf, time.Minute, nosurfx.FakeCSRFToken, r, ft)
+					regFlow, err := registration.NewFlow(reg, r, ft)
 					require.NoError(t, err)
 					regFlow.RequestURL = x.RequestURL(r).String()
 					for _, callback := range flowCallbacks {
@@ -283,6 +284,57 @@ func TestRegistrationExecutor(t *testing.T) {
 				})
 			})
 
+			t.Run("case=preserve trait values on duplicate credential error", func(t *testing.T) {
+				t.Parallel()
+				t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+
+				tosSchema := testhelpers.UseIdentitySchema(t, conf, "file://./stub/registration-tos.schema.json")
+
+				// Create an existing identity with a known email so the next registration triggers a unique violation.
+				existing := &identity.Identity{
+					SchemaID: tosSchema,
+					Traits:   identity.Traits(`{"email":"duplicate@ory.sh"}`),
+					State:    identity.StateActive,
+				}
+				existing.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+					Type:        identity.CredentialsTypePassword,
+					Identifiers: []string{"duplicate@ory.sh"},
+					Config:      []byte(`{"hashed_password":"$argon2id$v=19$m=65536,t=1,p=1$abc$def"}`),
+				})
+				require.NoError(t, reg.IdentityManager().Create(context.Background(), existing))
+
+				// Build a new identity with the same email and tos=true.
+				duplicate := testhelpers.SelfServiceHookFakeIdentity(t)
+				duplicate.SchemaID = tosSchema
+				duplicate.Traits = identity.Traits(`{"email":"duplicate@ory.sh","tos":true}`)
+				duplicate.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+					Type:        identity.CredentialsTypePassword,
+					Identifiers: []string{"duplicate@ory.sh"},
+					Config:      []byte(`{"hashed_password":"$argon2id$v=19$m=65536,t=1,p=1$abc$def"}`),
+				})
+
+				regFlow, err := registration.NewFlow(reg, nethttptest.NewRequest("GET", returnToServer.URL, nil), flow.TypeBrowser)
+				require.NoError(t, err)
+				regFlow.RequestURL = returnToServer.URL
+
+				// Add a checkbox node for traits.tos (simulating PopulateRegistrationMethod from the profile strategy).
+				regFlow.UI.Nodes.Upsert(node.NewInputField("traits.tos", false, node.DefaultGroup, node.InputAttributeTypeCheckbox))
+
+				err = reg.RegistrationHookExecutor().PostRegistrationHook(
+					nethttptest.NewRecorder(), nethttptest.NewRequest("GET", returnToServer.URL, nil),
+					regFlow, duplicate, session.AuthenticationMethod{
+						Method: identity.CredentialsTypePassword,
+						AAL:    identity.AuthenticatorAssuranceLevel1,
+					},
+				)
+				require.Error(t, err)
+
+				// The TOS checkbox node must retain the submitted value (true) from the identity traits.
+				tosNode := regFlow.UI.Nodes.Find("traits.tos")
+				require.NotNil(t, tosNode, "traits.tos node must exist in the flow UI")
+				assert.Equal(t, true, tosNode.GetValue(), "traits.tos must be true after duplicate credential error")
+			})
+
 			for _, kind := range []flow.Type{flow.TypeBrowser, flow.TypeAPI} {
 				t.Run("type="+string(kind)+"/method=PreRegistrationHook", testhelpers.TestSelfServicePreHook(
 					config.ViperKeySelfServiceRegistrationBeforeHooks,
@@ -295,4 +347,58 @@ func TestRegistrationExecutor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPostRegistrationHookAccountLinkingOnly(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
+	reg.SetHydra(hydra.NewFake())
+	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/registration.schema.json")
+	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, returnToServer.URL)
+	conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationEnabled, false)
+
+	newIdentityWithEmail := func(email string) *identity.Identity {
+		i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		i.Traits = identity.Traits(`{"email":"` + email + `"}`)
+		i.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+			Identifiers: []string{email},
+			Config:      sqlxx.JSONRawMessage(`{"hashed_password":"$2a$08$fakefakefakefakefakefa"}`),
+		})
+		return i
+	}
+
+	runPostRegistrationHook := func(t *testing.T, i *identity.Identity) error {
+		r := httptest.NewRequest("GET", "/registration/post", nil)
+		r = r.WithContext(ctx)
+		regFlow, err := registration.NewFlow(reg, r, flow.TypeAPI)
+		require.NoError(t, err)
+		registration.WithFlowAccountLinking()(regFlow)
+
+		return reg.RegistrationHookExecutor().PostRegistrationHook(httptest.NewRecorder(), r, regFlow, i, session.AuthenticationMethod{
+			Method: identity.CredentialsTypePassword,
+			AAL:    identity.AuthenticatorAssuranceLevel1,
+		})
+	}
+
+	t.Run("case=rejects a new identity when registration is disabled", func(t *testing.T) {
+		email := "linking-guard-new@ory.sh"
+		err := runPostRegistrationHook(t, newIdentityWithEmail(email))
+		require.ErrorContains(t, err, registration.ErrRegistrationDisabled().Error())
+
+		_, _, err = reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, identity.CredentialsTypePassword, email)
+		require.ErrorIs(t, err, sqlcon.ErrNoRows())
+	})
+
+	t.Run("case=proceeds into the duplicate conflict when an identity exists", func(t *testing.T) {
+		email := "linking-guard-existing@ory.sh"
+		existing := newIdentityWithEmail(email)
+		require.NoError(t, reg.IdentityManager().Create(ctx, existing))
+
+		err := runPostRegistrationHook(t, newIdentityWithEmail(email))
+		// The guard must let the create attempt happen so that the unique
+		// violation triggers the account linking conversion.
+		require.ErrorIs(t, err, sqlcon.ErrUniqueViolation())
+	})
 }

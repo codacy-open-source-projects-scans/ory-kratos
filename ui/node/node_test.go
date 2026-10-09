@@ -8,6 +8,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -138,6 +139,61 @@ func TestNodesSort(t *testing.T) {
 	}
 }
 
+func TestNodesSortStableGroups(t *testing.T) {
+	t.Parallel()
+
+	// Build count nodes in the same group, sharing an input name (as a list of
+	// remove buttons does). Insertion order is 0..count-1, recorded in each
+	// node's label; the value is the reverse, so a value tiebreak would flip the
+	// order. count exceeds Go's insertion-sort threshold (12) so the sort takes
+	// the quicksort path, where an unstable sort could otherwise reshuffle
+	// same-group nodes.
+	const count = 20
+	build := func() node.Nodes {
+		var n node.Nodes
+		for i := range count {
+			value := fmt.Sprintf("%02d", count-1-i)
+			n = append(n, node.NewInputField(node.DeviceAuthnRemove, value, node.DeviceAuthnGroup, node.InputAttributeTypeSubmit).
+				WithMetaLabel(&text.Message{Text: fmt.Sprintf("%02d", i)}))
+		}
+		return n
+	}
+
+	labels := func(n node.Nodes) []string {
+		got := make([]string, 0, len(n))
+		for _, nn := range n {
+			got = append(got, nn.Meta.Label.Text)
+		}
+		return got
+	}
+
+	insertionOrder := make([]string, count)
+	valueOrder := make([]string, count)
+	for i := range count {
+		insertionOrder[i] = fmt.Sprintf("%02d", i)
+		valueOrder[i] = fmt.Sprintf("%02d", count-1-i)
+	}
+
+	t.Run("case=stable group preserves insertion order", func(t *testing.T) {
+		t.Parallel()
+		n := build()
+		require.NoError(t, n.SortBySchema(ctx,
+			node.SortByGroups([]node.UiNodeGroup{node.DefaultGroup, node.PasswordGroup}),
+			node.SortStableGroups(node.DeviceAuthnGroup),
+		))
+		assert.Equal(t, insertionOrder, labels(n))
+	})
+
+	t.Run("case=without the option the value tiebreak reorders", func(t *testing.T) {
+		t.Parallel()
+		n := build()
+		require.NoError(t, n.SortBySchema(ctx,
+			node.SortByGroups([]node.UiNodeGroup{node.DefaultGroup, node.PasswordGroup}),
+		))
+		assert.Equal(t, valueOrder, labels(n))
+	})
+}
+
 func TestNodesUpsert(t *testing.T) {
 	var nodes node.Nodes
 	nodes.Upsert(node.NewCSRFNode("foo"))
@@ -157,6 +213,31 @@ func TestNodesRemove(t *testing.T) {
 
 	nodes.Remove("link", "unlink")
 	require.Len(t, nodes, 1)
+}
+
+func TestNodesRemoveInGroup(t *testing.T) {
+	samlLink := node.NewInputField("link", "saml-provider", node.SAMLGroup, node.InputAttributeTypeSubmit)
+	nodes := node.Nodes{
+		node.NewInputField("link", "oidc-provider", node.OpenIDConnectGroup, node.InputAttributeTypeSubmit),
+		samlLink,
+		node.NewInputField("unlink", "oidc-provider", node.OpenIDConnectGroup, node.InputAttributeTypeSubmit),
+		node.NewCSRFNode("token"),
+	}
+
+	// Remove only the OIDC group's link/unlink nodes.
+	nodes.RemoveInGroup(node.OpenIDConnectGroup, "link", "unlink")
+
+	require.Len(t, nodes, 2)
+	// The SAML link node shares the "link" name but a different group: it survives.
+	assert.Contains(t, nodes, samlLink)
+	// The CSRF node (DefaultGroup) is untouched.
+	var sawCSRF bool
+	for _, n := range nodes {
+		if n.Group == node.DefaultGroup {
+			sawCSRF = true
+		}
+	}
+	assert.True(t, sawCSRF, "CSRF node must not be removed")
 }
 
 func TestNodeJSON(t *testing.T) {

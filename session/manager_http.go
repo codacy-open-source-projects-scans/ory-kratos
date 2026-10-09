@@ -5,6 +5,7 @@ package session
 
 import (
 	"context"
+	stderrors "errors"
 	"net/http"
 	"net/url"
 	"time"
@@ -42,6 +43,7 @@ import (
 
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/transaction"
 )
 
 func ErrNoAALAvailable() *herodot.DefaultError {
@@ -58,7 +60,7 @@ type (
 		logrusx.Provider
 		nosurfx.CSRFProvider
 		otelx.Provider
-		x.TransactionPersistenceProvider
+		transaction.PersistenceProvider
 		PersistenceProvider
 		sessiontokenexchange.PersistenceProvider
 	}
@@ -161,12 +163,22 @@ func (s *ManagerHTTP) IssueCookie(ctx context.Context, w http.ResponseWriter, r 
 		cookie.Options.Path = alias.Path
 	}
 
-	old, err := s.FetchFromRequest(ctx, r)
-	if err != nil {
-		// No session was set prior -> regenerate anti-csrf token
-		_ = s.r.CSRFHandler().RegenerateToken(w, r)
-	} else if old.Identity.ID != session.Identity.ID {
-		// No session was set prior -> regenerate anti-csrf token
+	// Rotate the anti-CSRF token unless the request was already authenticated
+	// as the same identity: regenerate when there is no prior active session or
+	// when it belongs to a different identity. This decision only needs the
+	// prior session's identity ID, so we deliberately do not expand the
+	// identity. Expanding it here loads the full identity graph, which on a
+	// multi-region deployment can trigger a slow cross-region read (observed at
+	// ~2.4s on the login path) purely to read a single UUID.
+	var priorIdentityID uuid.UUID
+	hasPriorSession := false
+	if token := s.extractToken(r.WithContext(ctx)); token != "" {
+		if prior, ferr := s.r.SessionPersister().GetSessionByToken(ctx, token, ExpandNothing, identity.ExpandNothing); ferr == nil && prior.IsActive() {
+			priorIdentityID = prior.IdentityID
+			hasPriorSession = true
+		}
+	}
+	if !hasPriorSession || priorIdentityID != session.IdentityID {
 		_ = s.r.CSRFHandler().RegenerateToken(w, r)
 	}
 
@@ -177,7 +189,7 @@ func (s *ManagerHTTP) IssueCookie(ctx context.Context, w http.ResponseWriter, r 
 	cookie.Options.MaxAge = 0
 	if s.r.Config().SessionPersistentCookie(ctx) {
 		if session.ExpiresAt.IsZero() {
-			cookie.Options.MaxAge = int(s.r.Config().SessionLifespan(ctx).Seconds())
+			cookie.Options.MaxAge = int(s.r.Config().OrganizationSessionLifespan(ctx, session.OrganizationID()).Seconds())
 		} else {
 			cookie.Options.MaxAge = int(time.Until(session.ExpiresAt).Seconds())
 		}
@@ -235,33 +247,31 @@ func (s *ManagerHTTP) extractToken(r *http.Request) string {
 
 func (s *ManagerHTTP) FetchFromRequestContext(ctx context.Context, r *http.Request) (_ *Session, err error) {
 	ctx, span := s.r.Tracer(ctx).Tracer().Start(ctx, "sessions.ManagerHTTP.FetchFromRequestContext")
-	otelx.End(span, &err)
+	defer otelx.End(span, &err)
 
 	if sess, ok := ctx.Value(sessionInContextKey).(*Session); ok {
 		return sess, nil
 	}
 
-	return s.FetchFromRequest(ctx, r)
+	// Don't reduce the expansion here unless you want bad performance down the line (because we
+	// constantly are unsure if we have the full data fetched or not).
+	return s.FetchFromRequest(ctx, r, ExpandEverything, identity.ExpandEverything)
 }
 
-func (s *ManagerHTTP) FetchFromRequest(ctx context.Context, r *http.Request) (_ *Session, err error) {
-	ctx, span := s.r.Tracer(ctx).Tracer().Start(ctx, "sessions.ManagerHTTP.FetchFromRequest")
-	defer func() {
-		if e := new(ErrNoActiveSessionFound); errors.As(err, &e) {
-			span.End()
-		} else {
-			otelx.End(span, &err)
-		}
-	}()
+func (s *ManagerHTTP) FetchFromRequest(ctx context.Context, r *http.Request, sessionExpand Expandables, identityExpand identity.Expandables) (_ *Session, err error) {
+	ctx, span := s.r.Tracer(ctx).Tracer().Start(ctx, "sessions.ManagerHTTP.FetchFromRequest",
+		trace.WithAttributes(
+			attribute.StringSlice("session.expand", sessionExpand.ToEager()),
+			attribute.StringSlice("identity.expand", identityExpand.ToEager()),
+		))
+	defer endSpanIgnoreNoActiveSession(span, &err)
 
 	token := s.extractToken(r.WithContext(ctx))
 	if token == "" {
 		return nil, errors.WithStack(NewErrNoCredentialsForSession())
 	}
 
-	se, err := s.r.SessionPersister().GetSessionByToken(ctx, token,
-		// Don't change this unless you want bad performance down the line (because we constantly are unsure if we have the full data fetched or not).
-		ExpandEverything, identity.ExpandEverything)
+	se, err := s.r.SessionPersister().GetSessionByToken(ctx, token, sessionExpand, identityExpand)
 	if err != nil {
 		if errors.Is(err, herodot.ErrNotFound()) || errors.Is(err, sqlcon.ErrNoRows()) {
 			return nil, errors.WithStack(NewErrNoActiveSessionFound())
@@ -278,12 +288,33 @@ func (s *ManagerHTTP) FetchFromRequest(ctx context.Context, r *http.Request) (_ 
 	return se, nil
 }
 
+// endSpanIgnoreNoActiveSession ends the span without recording ErrNoActiveSessionFound as a span
+// error, because a request without an active session is an expected condition on these paths.
+func endSpanIgnoreNoActiveSession(span trace.Span, err *error) {
+	if _, ok := stderrors.AsType[*ErrNoActiveSessionFound](*err); ok {
+		span.End()
+	} else {
+		otelx.End(span, err)
+	}
+}
+
+// SessionActiveForRequest reports whether the request carries a token for an
+// active session, without loading the identity. It returns nil when an active
+// session exists and the same errors as FetchFromRequest otherwise, so callers
+// that only branch on the error keep identical behavior while skipping the
+// cross-region identity load.
+func (s *ManagerHTTP) SessionActiveForRequest(ctx context.Context, r *http.Request) error {
+	_, err := s.FetchFromRequest(ctx, r, ExpandNothing, identity.ExpandNothing)
+	return err
+}
+
 func (s *ManagerHTTP) PurgeFromRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) (err error) {
 	ctx, span := s.r.Tracer(ctx).Tracer().Start(ctx, "sessions.ManagerHTTP.PurgeFromRequest")
 	defer otelx.End(span, &err)
 
 	if token, ok := bearerTokenFromRequest(r); ok {
-		return errors.WithStack(s.r.SessionPersister().RevokeSessionByToken(ctx, token))
+		_, err := s.r.SessionPersister().RevokeSessionByToken(ctx, token)
+		return errors.WithStack(err)
 	}
 
 	cookie, _ := s.r.CookieManager(r.Context()).Get(r, s.cookieName(ctx))
@@ -292,7 +323,7 @@ func (s *ManagerHTTP) PurgeFromRequest(ctx context.Context, w http.ResponseWrite
 		return nil
 	}
 
-	if err := s.r.SessionPersister().RevokeSessionByToken(ctx, token); err != nil {
+	if _, err := s.r.SessionPersister().RevokeSessionByToken(ctx, token); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -416,6 +447,10 @@ func (s *ManagerHTTP) SessionAddAuthenticationMethods(ctx context.Context, sid u
 	for _, m := range ams {
 		sess.CompletedLoginForMethod(m)
 	}
+	// Completing an authentication method is an authentication event, so the
+	// session's authenticated_at is refreshed as well. This matches login
+	// flows, which set authenticated_at when a second factor completes.
+	sess.AuthenticatedAt = time.Now().UTC()
 	sess.SetAuthenticatorAssuranceLevel()
 	return s.r.SessionPersister().UpsertSession(ctx, sess)
 }
@@ -441,7 +476,7 @@ func (s *ManagerHTTP) MaybeRedirectAPICodeFlow(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	if err = s.r.SessionTokenExchangePersister().UpdateSessionOnExchanger(r.Context(), f.GetID(), sessionID); err != nil {
+	if err = s.r.SessionTokenExchangePersister().UpdateSessionOnExchanger(ctx, f.GetID(), sessionID); err != nil {
 		return false, errors.WithStack(err)
 	}
 
@@ -478,7 +513,7 @@ func (s *ManagerHTTP) ActivateSession(r *http.Request, session *Session, i *iden
 
 	session.Active = true
 	session.IssuedAt = authenticatedAt
-	session.ExpiresAt = authenticatedAt.Add(s.r.Config().SessionLifespan(ctx))
+	session.ExpiresAt = authenticatedAt.Add(s.r.Config().OrganizationSessionLifespan(ctx, session.OrganizationID()))
 	session.AuthenticatedAt = authenticatedAt
 
 	session.SetSessionDeviceInformation(r.WithContext(ctx))

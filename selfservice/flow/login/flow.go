@@ -6,6 +6,7 @@ package login
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -24,8 +25,10 @@ import (
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/pop/v6"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -154,6 +157,23 @@ type Flow struct {
 	// for this flow. This value can be set by the user when creating the flow and
 	// should be retained when the flow is saved or converted to another flow.
 	IdentitySchema flow.IdentitySchema `json:"identity_schema,omitempty" faker:"-" db:"identity_schema_id"`
+
+	// TestFlow marks this flow as an admin-created dry-run OIDC test. Test
+	// flows short-circuit the OIDC callback: no identity is persisted and no
+	// session is issued. The captured debug data is returned via the derived
+	// TestContext field below.
+	//
+	// Nullable so that existing rows created before the column was added read
+	// as a SQL NULL (effectively false); see IsTest.
+	TestFlow sql.NullBool `json:"-" faker:"-" db:"test_flow"`
+
+	// TestContext is the derived API view of test-mode data. It is populated
+	// from InternalContext["test"] during marshal and is nil for regular
+	// login flows. See test_context.go.
+	//
+	// required: false
+	// readOnly: true
+	TestContext *TestContext `json:"test_context,omitempty" faker:"-" db:"-"`
 }
 
 var (
@@ -161,8 +181,19 @@ var (
 	_ flow.FlowWithContinueWith = (*Flow)(nil)
 )
 
-func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Request, flowType flow.Type) (*Flow, error) {
-	now := time.Now().UTC()
+// flowDependencies are the dependencies NewFlow needs to construct a login
+// flow: the configuration (for the lifespan and return-to validation), the
+// clock, and the CSRF token generator.
+type flowDependencies interface {
+	config.Provider
+	clock.Provider
+	nosurfx.CSRFTokenGeneratorProvider
+}
+
+func NewFlow(reg flowDependencies, r *http.Request, flowType flow.Type) (*Flow, error) {
+	conf := reg.Config()
+	now := reg.Clock().Now().UTC()
+	exp := conf.SelfServiceFlowLoginRequestLifespan(r.Context())
 	id := x.NewUUID()
 	requestURL := x.RequestURL(r).String()
 
@@ -184,7 +215,7 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 
 	refresh, _ := strconv.ParseBool(r.URL.Query().Get("refresh"))
 
-	return &Flow{
+	f := &Flow{
 		ID:                   id,
 		OAuth2LoginChallenge: hydraLoginChallenge,
 		ExpiresAt:            now.Add(exp),
@@ -194,7 +225,7 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 			Action: flow.AppendFlowTo(urlx.AppendPaths(conf.SelfPublicURL(r.Context()), RouteSubmitFlow), id).String(),
 		},
 		RequestURL: requestURL,
-		CSRFToken:  csrf,
+		CSRFToken:  reg.GenerateCSRFToken(r),
 		Type:       flowType,
 		Refresh:    refresh,
 		RequestedAAL: identity.AuthenticatorAssuranceLevel(strings.ToLower(cmp.Or(
@@ -202,32 +233,37 @@ func NewFlow(conf *config.Config, exp time.Duration, csrf string, r *http.Reques
 			string(identity.AuthenticatorAssuranceLevel1)))),
 		InternalContext: []byte("{}"),
 		State:           flow.StateChooseMethod,
-	}, nil
+	}
+	if err := flow.SetRequestBaseURL(f, x.BaseURLStringFromContext(r.Context())); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
-func (f *Flow) GetType() flow.Type                            { return f.Type }
-func (f *Flow) GetRequestURL() string                         { return f.RequestURL }
-func (f *Flow) GetID() uuid.UUID                              { return f.ID }
-func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage      { return f.InternalContext }
-func (f *Flow) SetInternalContext(bytes sqlxx.JSONRawMessage) { f.InternalContext = bytes }
-func (f *Flow) GetUI() *container.Container                   { return f.UI }
-func (f *Flow) GetState() flow.State                          { return f.State }
-func (Flow) GetFlowName() flow.FlowName                       { return flow.LoginFlow }
-func (Flow) TableName() string                                { return "selfservice_login_flows" }
-func (f *Flow) ContinueWith() []flow.ContinueWith             { return f.ContinueWithItems }
-func (f *Flow) SetReturnToVerification(to string)             { f.ReturnToVerification = to }
-func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString     { return f.OAuth2LoginChallenge }
-func (f *Flow) AppendTo(src *url.URL) *url.URL                { return flow.AppendFlowTo(src, f.ID) }
-func (f *Flow) SetState(state flow.State)                     { f.State = state }
-func (f *Flow) GetTransientPayload() json.RawMessage          { return f.TransientPayload }
+func (f *Flow) GetType() flow.Type                                      { return f.Type }
+func (f *Flow) GetRequestURL() string                                   { return f.RequestURL }
+func (f *Flow) GetID() uuid.UUID                                        { return f.ID }
+func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage                { return f.InternalContext }
+func (f *Flow) SetInternalContext(bytes sqlxx.JSONRawMessage)           { f.InternalContext = bytes }
+func (f *Flow) GetUI() *container.Container                             { return f.UI }
+func (f *Flow) GetState() flow.State                                    { return f.State }
+func (Flow) GetFlowName() flow.FlowName                                 { return flow.LoginFlow }
+func (Flow) TableName() string                                          { return "selfservice_login_flows" }
+func (f *Flow) ContinueWith() []flow.ContinueWith                       { return f.ContinueWithItems }
+func (f *Flow) SetReturnToVerification(to string)                       { f.ReturnToVerification = to }
+func (f *Flow) GetOAuth2LoginChallenge() sqlxx.NullString               { return f.OAuth2LoginChallenge }
+func (f *Flow) GetHydraLoginRequest() *hydraclientgo.OAuth2LoginRequest { return f.HydraLoginRequest }
+func (f *Flow) AppendTo(src *url.URL) *url.URL                          { return flow.AppendFlowTo(src, f.ID) }
+func (f *Flow) SetState(state flow.State)                               { f.State = state }
+func (f *Flow) GetTransientPayload() json.RawMessage                    { return f.TransientPayload }
 
 // IsRefresh returns true if the login flow was triggered to re-authenticate the user.
 // This is the case if the refresh query parameter is set to true.
 func (f *Flow) IsRefresh() bool { return f.Refresh }
 
-func (f *Flow) Valid() error {
-	if f.ExpiresAt.Before(time.Now()) {
-		return errors.WithStack(flow.NewFlowExpiredError(f.ExpiresAt))
+func (f *Flow) Valid(c clock.Clock) error {
+	if f.ExpiresAt.Before(c.Now()) {
+		return errors.WithStack(flow.NewFlowExpiredError(c, f.ExpiresAt))
 	}
 	return nil
 }
@@ -241,7 +277,24 @@ func (f *Flow) EnsureInternalContext() {
 func (f Flow) MarshalJSON() ([]byte, error) {
 	type local Flow
 	f.SetReturnTo()
+	// Populate the derived TestContext field for test-mode flows so the
+	// admin UI sees provider_id and (once captured) debug_payload.
+	if err := (&f).LoadTestContext(); err != nil {
+		return nil, err
+	}
 	return json.Marshal(local(f))
+}
+
+// UnmarshalJSON drops any incoming test_context. The field is derived from
+// InternalContext and must only be set via LoadTestContext, otherwise a caller
+// submitting a Flow blob could forge a debug payload.
+func (f *Flow) UnmarshalJSON(data []byte) error {
+	type local Flow
+	if err := json.Unmarshal(data, (*local)(f)); err != nil {
+		return err
+	}
+	f.TestContext = nil
+	return nil
 }
 
 func (f *Flow) SetReturnTo() {

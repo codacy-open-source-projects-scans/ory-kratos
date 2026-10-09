@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
@@ -291,7 +292,12 @@ func TestWebHooks(t *testing.T) {
 			uc:         "Post Settings Hook",
 			createFlow: func() flow.Flow { return &settings.Flow{ID: x.NewUUID(), TransientPayload: transientPayload} },
 			callWebHook: func(wh *hook.WebHook, req *http.Request, f flow.Flow, s *session.Session) error {
-				return wh.ExecuteSettingsPostPersistHook(nil, req, f.(*settings.Flow), s.Identity, s)
+				return wh.ExecuteSettingsPostPersistHook(nil, req, settings.PostHookPostPersistExecutorParams{
+					Flow:     f.(*settings.Flow),
+					Updated:  s.Identity,
+					Previous: s.Identity,
+					Session:  s,
+				})
 			},
 			expectedBody: func(req *http.Request, f flow.Flow, s *session.Session) string {
 				return bodyWithFlowAndIdentityAndSessionAndTransientPayload(req, f, s, transientPayload)
@@ -606,7 +612,12 @@ func TestWebHooks(t *testing.T) {
 			uc:         "Post Settings Hook - no block",
 			createFlow: func() flow.Flow { return &settings.Flow{ID: x.NewUUID()} },
 			callWebHook: func(wh *hook.WebHook, req *http.Request, f flow.Flow, s *session.Session) error {
-				return wh.ExecuteSettingsPostPersistHook(nil, req, f.(*settings.Flow), s.Identity, s)
+				return wh.ExecuteSettingsPostPersistHook(nil, req, settings.PostHookPostPersistExecutorParams{
+					Flow:     f.(*settings.Flow),
+					Updated:  s.Identity,
+					Previous: s.Identity,
+					Session:  s,
+				})
 			},
 			webHookResponse: func() (int, []byte) {
 				return http.StatusOK, []byte{}
@@ -617,7 +628,11 @@ func TestWebHooks(t *testing.T) {
 			uc:         "Post Settings Hook Pre Persist - block",
 			createFlow: func() flow.Flow { return &settings.Flow{ID: x.NewUUID()} },
 			callWebHook: func(wh *hook.WebHook, req *http.Request, f flow.Flow, s *session.Session) error {
-				return wh.ExecuteSettingsPrePersistHook(nil, req, f.(*settings.Flow), s.Identity, s)
+				return wh.ExecuteSettingsPrePersistHook(nil, req, settings.PostHookPrePersistExecutorParams{
+					Flow:     f.(*settings.Flow),
+					Identity: s.Identity,
+					Session:  s,
+				})
 			},
 			webHookResponse: func() (int, []byte) {
 				return http.StatusBadRequest, webHookResponse
@@ -628,7 +643,12 @@ func TestWebHooks(t *testing.T) {
 			uc:         "Post Settings Hook Post Persist - block has no effect",
 			createFlow: func() flow.Flow { return &settings.Flow{ID: x.NewUUID()} },
 			callWebHook: func(wh *hook.WebHook, req *http.Request, f flow.Flow, s *session.Session) error {
-				return wh.ExecuteSettingsPostPersistHook(nil, req, f.(*settings.Flow), s.Identity, s)
+				return wh.ExecuteSettingsPostPersistHook(nil, req, settings.PostHookPostPersistExecutorParams{
+					Flow:     f.(*settings.Flow),
+					Updated:  s.Identity,
+					Previous: s.Identity,
+					Session:  s,
+				})
 			},
 			webHookResponse: func() (int, []byte) {
 				return http.StatusBadRequest, webHookResponse
@@ -850,11 +870,20 @@ func TestWebHooks(t *testing.T) {
 			in := &identity.Identity{ID: uuid}
 			s := &session.Session{ID: x.NewUUID(), Identity: in}
 
-			postPersistErr := wh.ExecuteSettingsPostPersistHook(nil, req, f, in, s)
+			postPersistErr := wh.ExecuteSettingsPostPersistHook(nil, req, settings.PostHookPostPersistExecutorParams{
+				Flow:     f,
+				Updated:  in,
+				Previous: in,
+				Session:  s,
+			})
 			assert.NoError(t, postPersistErr)
 			assert.Equal(t, in, &identity.Identity{ID: uuid})
 
-			prePersistErr := wh.ExecuteSettingsPrePersistHook(nil, req, f, in, s)
+			prePersistErr := wh.ExecuteSettingsPrePersistHook(nil, req, settings.PostHookPrePersistExecutorParams{
+				Flow:     f,
+				Identity: in,
+				Session:  s,
+			})
 			assert.NoError(t, prePersistErr)
 			if tc.parse == true {
 				assert.Equal(t, in, &identity.Identity{ID: uuid, Traits: identity.Traits(`{"email":"some@other-example.org"}`)})
@@ -1394,6 +1423,60 @@ func TestWebhookEvents(t *testing.T) {
 		})
 		require.Equal(t, i, -1)
 	})
+}
+
+func TestWebhookHTTPClientSpan(t *testing.T) {
+	t.Parallel()
+	_, reg := pkg.NewFastRegistryWithMocks(t)
+	logger := logrusx.New("kratos", "test")
+	whDeps := newWebHookDeps(t, logger, reg)
+
+	webhookReceiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(webhookReceiver.Close)
+
+	wh := hook.NewWebHook(whDeps, &request.Config{
+		ID:          x.NewUUID().String(),
+		URL:         webhookReceiver.URL,
+		Method:      "GET",
+		TemplateURI: "file://stub/test_body.jsonnet",
+	})
+
+	recorder := tracetest.NewSpanRecorder()
+	tracer := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)).Tracer("test")
+	ctx, span := tracer.Start(t.Context(), "parent")
+	defer span.End()
+
+	req := &http.Request{
+		Header: map[string][]string{"Some-Header": {"Some-Value"}},
+		Host:   "www.ory.com",
+		TLS:    new(tls.ConnectionState),
+		URL:    &url.URL{Path: "/some_end_point"},
+		Method: http.MethodPost,
+	}
+	f := &login.Flow{ID: x.NewUUID()}
+
+	require.NoError(t, wh.ExecuteLoginPreHook(nil, req.Clone(ctx), f))
+
+	ended := recorder.Ended()
+
+	i := slices.IndexFunc(ended, func(sp sdktrace.ReadOnlySpan) bool { return sp.Name() == "selfservice.webhook" })
+	require.GreaterOrEqual(t, i, 0)
+	webhookSpan := ended[i]
+
+	spanNames := make([]string, len(ended))
+	for i, sp := range ended {
+		spanNames[i] = sp.Name()
+	}
+
+	i = slices.IndexFunc(ended, func(sp sdktrace.ReadOnlySpan) bool { return sp.SpanKind() == trace.SpanKindClient })
+	require.GreaterOrEqual(t, i, 0, "expected the HTTP client span of the webhook request to be ended and recorded, got only %v", spanNames)
+	clientSpan := ended[i]
+
+	assert.Equal(t, webhookSpan.SpanContext().TraceID(), clientSpan.SpanContext().TraceID(), "the HTTP client span must belong to the same trace as the selfservice.webhook span")
+	assert.Equal(t, webhookSpan.SpanContext().SpanID(), clientSpan.Parent().SpanID(), "the HTTP client span must be a direct child of the selfservice.webhook span")
 }
 
 func TestRemoveDisallowedHeaders(t *testing.T) {

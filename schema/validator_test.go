@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3/httploader"
@@ -174,71 +173,6 @@ func TestSchemaValidator_FileRefExfiltration(t *testing.T) {
 	})
 }
 
-// TestSchemaValidator_BoundedNestingDepth asserts that an identity schema with
-// pathological `properties.x.properties.x...` nesting is rejected with a
-// bounded error rather than driving the upstream compiler into deep
-// recursion.
-//
-// Background: github.com/ory/jsonschema/v3 compiler.go:218 (compileMap)
-// recurses through every level of `properties`, `allOf`, `anyOf`, `oneOf`,
-// `items`, etc., with no depth cap. A customer-uploaded schema therefore
-// allocates one *Schema node per level. Go stdlib's encoding/json caps
-// nesting at 10000 (Go 1.21+), which bounds the absolute worst case but
-// still permits ~5000 levels of kratos compile-time recursion before that
-// limit kicks in — far above any realistic identity schema (≤10 levels).
-//
-// Currently this test fails: Validate compiles a 1024-deep schema silently
-// and returns nil. After a kratos-side pre-parse gate in
-// kratos-oss/schema/ is added, this test must pass: schemas exceeding a
-// sensible nesting limit (suggest 32) are rejected before compile runs.
-func TestSchemaValidator_BoundedNestingDepth(t *testing.T) {
-	t.Parallel()
-
-	// Depth chosen well above any realistic identity schema (5-10 levels in
-	// practice) and well above the suggested kratos-side cap (32), but well
-	// below Go stdlib's JSON nesting cap (10000) so we exercise the kratos
-	// path, not the stdlib safety net.
-	const depth = 1024
-
-	var sb strings.Builder
-	sb.WriteString(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"traits":`)
-	for range depth {
-		sb.WriteString(`{"type":"object","properties":{"x":`)
-	}
-	sb.WriteString(`{"type":"string"}`)
-	for range depth {
-		sb.WriteString(`}}`)
-	}
-	sb.WriteString(`}}`)
-
-	schemaURL := "base64://" + base64.StdEncoding.EncodeToString([]byte(sb.String()))
-
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	ctx = context.WithValue(ctx, httploader.ContextKey, httpx.NewResilientClient())
-
-	// Document is intentionally trivial — we are testing the schema compile
-	// path, not document validation. A well-formed empty traits object should
-	// be accepted by a sane schema; a deep-but-otherwise-valid schema must be
-	// rejected at the kratos boundary, not silently compiled.
-	err := NewValidator().Validate(ctx, schemaURL,
-		json.RawMessage(`{"traits":{}}`),
-		WithDisallowRefs(true))
-
-	require.Error(t, err,
-		"identity schema with %d levels of properties.x nesting must be rejected; "+
-			"the upstream jsonschema compiler has no depth cap and will recurse until OOM",
-		depth)
-
-	// After fix, the rejection should be attributable to the depth limit.
-	// herodot wraps the cause behind a surface "Invalid configuration"
-	// message — inspect the full chain via %+v.
-	full := strings.ToLower(fmt.Sprintf("%+v", err))
-	assert.True(t,
-		strings.Contains(full, "depth") || strings.Contains(full, "nest"),
-		"error should indicate the depth/nesting limit, got: %s", full)
-}
-
 // TestSchemaValidator_RejectsSelfReferentialRef asserts that an identity
 // schema whose `$ref` resolves back to the same schema (e.g. `{"$ref":"#"}`)
 // is rejected at compile time.
@@ -260,10 +194,6 @@ func TestSchemaValidator_BoundedNestingDepth(t *testing.T) {
 // walks the parsed schema tree, resolves each `$ref`, and rejects refs whose
 // target is the same schema (or any schema ancestor that produces an
 // equivalent self-cycle).
-//
-// Currently this test fails: the upstream compiler accepts {"$ref":"#"} and
-// returns nil error. After adding the kratos-side gate, this test must pass
-// with a 4xx-class error before any *Schema with a self-pointer is built.
 func TestSchemaValidator_RejectsSelfReferentialRef(t *testing.T) {
 	t.Parallel()
 
@@ -295,8 +225,14 @@ func TestSchemaValidator_RejectsSelfReferentialRef(t *testing.T) {
 
 // TestSchemaValidator_PreValidate exercises the kratos-side pre-parse gate
 // for identity schemas. Each subtest constructs a schema that hits one of
-// the documented limits in prevalidate.go and asserts that NewValidator()
+// the documented checks in prevalidate.go and asserts that NewValidator()
 // rejects it before the upstream compiler runs.
+//
+// The gate enforces $ref-cycle detection and pattern-regex pre-compilation
+// only. Structural counters (nesting depth, key count, array arity, total
+// nodes) are intentionally not enforced here — realistic identity schemas
+// vary widely and any limit would either be too tight for legitimate
+// documents or too loose to add value above Go stdlib's JSON depth cap.
 func TestSchemaValidator_PreValidate(t *testing.T) {
 	t.Parallel()
 
@@ -310,56 +246,6 @@ func TestSchemaValidator_PreValidate(t *testing.T) {
 		schemaJSON  string
 		errFragment string
 	}{
-		{
-			name: "deeply nested object",
-			schemaJSON: func() string {
-				var sb strings.Builder
-				sb.WriteString(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"traits":`)
-				const depth = MaxSchemaNestingDepth + 4
-				for range depth {
-					sb.WriteString(`{"type":"object","properties":{"x":`)
-				}
-				sb.WriteString(`{"type":"string"}`)
-				for range depth {
-					sb.WriteString(`}}`)
-				}
-				sb.WriteString(`}}`)
-				return sb.String()
-			}(),
-			errFragment: "nesting depth",
-		},
-		{
-			name: "object with too many properties",
-			schemaJSON: func() string {
-				var sb strings.Builder
-				sb.WriteString(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{`)
-				for i := range MaxSchemaObjectKeys + 5 {
-					if i > 0 {
-						sb.WriteString(",")
-					}
-					fmt.Fprintf(&sb, `"p%d":{"type":"string"}`, i)
-				}
-				sb.WriteString(`}}`)
-				return sb.String()
-			}(),
-			errFragment: "object key count",
-		},
-		{
-			name: "anyOf array arity",
-			schemaJSON: func() string {
-				var sb strings.Builder
-				sb.WriteString(`{"$schema":"http://json-schema.org/draft-07/schema#","anyOf":[`)
-				for i := range MaxSchemaArrayElements + 5 {
-					if i > 0 {
-						sb.WriteString(",")
-					}
-					sb.WriteString(`{"type":"string"}`)
-				}
-				sb.WriteString(`]}`)
-				return sb.String()
-			}(),
-			errFragment: "array element count",
-		},
 		{
 			name:        "self-referential $ref to root",
 			schemaJSON:  `{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"#"}`,
@@ -419,10 +305,40 @@ func TestSchemaValidator_PreValidate(t *testing.T) {
 	}
 }
 
+// TestSchemaValidator_AcceptsRealisticDeepSchema asserts that a schema with
+// realistic structural complexity is accepted. Earlier hardening rejected
+// documents above 32 nesting levels / 1024 keys / 128 array elements; that
+// proved too tight for legitimate operator schemas. This test pins the
+// looser policy: the gate must allow these dimensions, and only fail on
+// the targeted unsafe shapes (cycles, invalid regex).
+func TestSchemaValidator_AcceptsRealisticDeepSchema(t *testing.T) {
+	t.Parallel()
+
+	const depth = 64
+	var sb strings.Builder
+	sb.WriteString(`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"traits":`)
+	for range depth {
+		sb.WriteString(`{"type":"object","properties":{"x":`)
+	}
+	sb.WriteString(`{"type":"string"}`)
+	for range depth {
+		sb.WriteString(`}}`)
+	}
+	sb.WriteString(`}}`)
+
+	schemaURL := "base64://" + base64.StdEncoding.EncodeToString([]byte(sb.String()))
+	ctx := context.WithValue(t.Context(), httploader.ContextKey, httpx.NewResilientClient())
+
+	_, err := NewCompilerWithURL(ctx, schemaURL, true)
+	require.NoError(t, err,
+		"schema with %d nesting levels must be accepted; the prevalidate gate "+
+			"intentionally does not enforce a depth cap", depth)
+}
+
 // TestSchemaValidator_BodyTooLarge asserts that a schema URL whose response
 // body exceeds MaxSchemaBodyBytes is rejected before any parse or compile
 // runs. This guards against memory exhaustion when a customer-controlled
-// URL serves a multi-megabyte (or larger) body. See F3.
+// URL serves a multi-megabyte (or larger) body.
 func TestSchemaValidator_BodyTooLarge(t *testing.T) {
 	t.Parallel()
 
@@ -447,10 +363,9 @@ func TestSchemaValidator_BodyTooLarge(t *testing.T) {
 	assert.Contains(t, fmt.Sprintf("%+v", err), "body exceeds")
 }
 
-// TestLoadRefURL pins the actual scheme allowlist enforced by loadRefURL,
-// resolving the F4 doc-comment drift. The earlier comment claimed
-// http/https/base64 were permitted; the implementation has only ever
-// accepted base64. Any future relaxation must update this test.
+// TestLoadRefURL pins the actual scheme allowlist enforced by loadRefURL.
+// The implementation only accepts base64. Any future relaxation must
+// update this test.
 func TestLoadRefURL(t *testing.T) {
 	t.Parallel()
 
@@ -479,7 +394,7 @@ func TestLoadRefURL(t *testing.T) {
 // without an attached HTTP client gets a default SSRF-guarded one when
 // passed to NewCompilerWithURL. A schema URL pointing at httptest's
 // loopback listener (127.0.0.1) must be rejected by the dialer before any
-// HTTP request hits the test server. See F1.
+// HTTP request hits the test server.
 func TestEnsureGuardedHTTPClient_PrivateIPRejected(t *testing.T) {
 	t.Parallel()
 

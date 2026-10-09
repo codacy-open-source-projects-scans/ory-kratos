@@ -33,6 +33,7 @@ import (
 	"github.com/ory/x/decoderx"
 	"github.com/ory/x/fetcher"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/region"
 	"github.com/ory/x/sqlxx"
 )
 
@@ -99,7 +100,6 @@ type UpdateRegistrationFlowWithOidcMethod struct {
 	//
 	// These parameters are optional and depend on what the upstream identity provider supports.
 	// Supported parameters are:
-	// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
 	// - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
 	// - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
 	// - `acr_values` (string): The `acr_values` specifies the Authentication Context Class Reference values for the authorization request.
@@ -230,7 +230,7 @@ func (s *Strategy) Register(w http.ResponseWriter, r *http.Request, f *registrat
 		return errors.WithStack(flow.ErrCompletedByStrategy)
 	}
 
-	state, pkce, err := s.GenerateState(ctx, provider, f)
+	state, pkce, err := s.GenerateState(ctx, provider, f, x.RequestBaseURL(r))
 	if err != nil {
 		return s.HandleError(ctx, w, r, f, pid, nil, err)
 	}
@@ -474,6 +474,10 @@ func (s *Strategy) newIdentityFromClaims(ctx context.Context, claims *Claims, pr
 		return nil, nil, err
 	}
 
+	if err = setRegion(evaluated, i); err != nil {
+		return nil, nil, err
+	}
+
 	va, err := s.extractVerifiedAddresses(evaluated)
 	if err != nil {
 		return nil, nil, err
@@ -534,6 +538,24 @@ func (s *Strategy) setMetadata(evaluated string, i *identity.Identity, m Metadat
 		i.MetadataAdmin = []byte(metadata.Raw)
 	}
 
+	return nil
+}
+
+// setRegion applies identity.region from the Jsonnet mapper to i. Absent
+// or empty leaves Region unchanged so the persister's fallback chain runs.
+func setRegion(evaluated string, ident *identity.Identity) error {
+	r := gjson.Get(evaluated, "identity.region")
+	if !r.Exists() {
+		return nil
+	}
+	if r.Type != gjson.String {
+		return errors.WithStack(herodot.ErrMisconfiguration().WithReasonf("OpenID Connect Jsonnet mapper did not return a string for key identity.region. Please check your Jsonnet code!"))
+	}
+	candidate := region.Region(r.String())
+	if !candidate.Valid() {
+		return errors.WithStack(region.NewErrInvalid())
+	}
+	ident.Region = candidate
 	return nil
 }
 

@@ -14,11 +14,13 @@ import (
 
 	"github.com/tidwall/gjson"
 
+	"github.com/ory/x/clock"
 	"github.com/ory/x/jsonx"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/pkg"
 	"github.com/ory/kratos/selfservice/flow/verification"
+	"github.com/ory/kratos/x"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,7 +33,7 @@ import (
 
 func TestFlow(t *testing.T) {
 	ctx := context.Background()
-	conf, _ := pkg.NewFastRegistryWithMocks(t)
+	conf, reg := pkg.NewFastRegistryWithMocks(t)
 
 	must := func(r *verification.Flow, err error) *verification.Flow {
 		require.NoError(t, err)
@@ -43,11 +45,11 @@ func TestFlow(t *testing.T) {
 		r         *verification.Flow
 		expectErr bool
 	}{
-		{r: must(verification.NewFlow(conf, time.Hour, "", u, nil, flow.TypeBrowser))},
-		{r: must(verification.NewFlow(conf, -time.Hour, "", u, nil, flow.TypeBrowser)), expectErr: true},
+		{r: must(verification.NewFlow(reg, time.Hour, "", u, nil, flow.TypeBrowser))},
+		{r: must(verification.NewFlow(reg, -time.Hour, "", u, nil, flow.TypeBrowser)), expectErr: true},
 	} {
 		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-			err := tc.r.Valid()
+			err := tc.r.Valid(clock.New())
 			if tc.expectErr {
 				require.Error(t, err)
 				return
@@ -58,15 +60,15 @@ func TestFlow(t *testing.T) {
 	}
 
 	t.Run("type=return_to", func(t *testing.T) {
-		_, err := verification.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=https://not-allowed/foobar"}, Host: "ory.sh"}, nil, flow.TypeBrowser)
+		_, err := verification.NewFlow(reg, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=https://not-allowed/foobar"}, Host: "ory.sh"}, nil, flow.TypeBrowser)
 		require.Error(t, err)
 
-		_, err = verification.NewFlow(conf, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=" + urlx.AppendPaths(conf.SelfPublicURL(ctx), "/self-service/login/browser").String()}, Host: "ory.sh"}, nil, flow.TypeBrowser)
+		_, err = verification.NewFlow(reg, 0, "csrf", &http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=" + urlx.AppendPaths(conf.SelfPublicURL(ctx), "/self-service/login/browser").String()}, Host: "ory.sh"}, nil, flow.TypeBrowser)
 		require.NoError(t, err)
 	})
 
 	assert.EqualValues(t, flow.StateChooseMethod,
-		must(verification.NewFlow(conf, time.Hour, "", u, nil, flow.TypeBrowser)).State)
+		must(verification.NewFlow(reg, time.Hour, "", u, nil, flow.TypeBrowser)).State)
 }
 
 func TestGetType(t *testing.T) {
@@ -87,15 +89,44 @@ func TestGetRequestURL(t *testing.T) {
 	assert.Equal(t, expectedURL, f.GetRequestURL())
 }
 
+func TestNewFlow_capturesCourierBaseURL(t *testing.T) {
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
+
+	t.Run("nothing in context", func(t *testing.T) {
+		r := &http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}
+		f, err := verification.NewFlow(reg, time.Hour, "", r, nil, flow.TypeBrowser)
+		require.NoError(t, err)
+		assert.Equal(t, "", f.GetCourierBaseURL())
+	})
+
+	t.Run("BaseURL in request context is copied onto flow", func(t *testing.T) {
+		base := urlx.ParseOrPanic("https://customer.example.com/")
+		r := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+			WithContext(x.WithBaseURL(context.Background(), base))
+		f, err := verification.NewFlow(reg, time.Hour, "", r, nil, flow.TypeBrowser)
+		require.NoError(t, err)
+		assert.Equal(t, base.String(), f.GetCourierBaseURL())
+	})
+
+	t.Run("http scheme is preserved (not coerced to https)", func(t *testing.T) {
+		base := urlx.ParseOrPanic("http://localhost:4000")
+		r := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+			WithContext(x.WithBaseURL(context.Background(), base))
+		f, err := verification.NewFlow(reg, time.Hour, "", r, nil, flow.TypeBrowser)
+		require.NoError(t, err)
+		assert.Equal(t, "http://localhost:4000", f.GetCourierBaseURL())
+	})
+}
+
 func TestNewPostHookFlow(t *testing.T) {
-	conf := pkg.NewConfigurationWithDefaults(t)
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 	u := &http.Request{URL: urlx.ParseOrPanic("http://foo/bar/baz"), Host: "foo"}
 	expectReturnTo := func(t *testing.T, originalFlowRequestQueryParams url.Values, expectedReturnTo string) {
 		originalFlow := registration.Flow{
 			RequestURL: "http://foo.com/bar?" + originalFlowRequestQueryParams.Encode(),
 		}
 		t.Log(originalFlow.RequestURL)
-		f, err := verification.NewPostHookFlow(conf, time.Second, "", u, nil, &originalFlow)
+		f, err := verification.NewPostHookFlow(reg, time.Second, "", u, nil, &originalFlow)
 		require.NoError(t, err)
 		u, err := urlx.Parse(f.RequestURL)
 		require.NoError(t, err)
@@ -128,18 +159,102 @@ func TestFlowEncodeJSON(t *testing.T) {
 	assert.EqualValues(t, "/bar", gjson.Get(jsonx.TestMarshalJSONString(t, verification.Flow{RequestURL: "https://foo.bar?return_to=/bar"}), "return_to").String())
 }
 
+func TestFromOldFlow_capturesCourierBaseURL(t *testing.T) {
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
+
+	t.Run("uses the new request's context, not the old flow's value", func(t *testing.T) {
+		oldR := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+			WithContext(x.WithBaseURL(context.Background(), urlx.ParseOrPanic("https://customer.example.com/")))
+		oldF, err := verification.NewFlow(reg, time.Hour, "csrf", oldR, nil, flow.TypeBrowser)
+		require.NoError(t, err)
+		require.Equal(t, "https://customer.example.com/", oldF.GetCourierBaseURL())
+
+		newR := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+			WithContext(x.WithBaseURL(context.Background(), urlx.ParseOrPanic("http://localhost:4000")))
+		newF, err := verification.FromOldFlow(reg, time.Hour, oldF.CSRFToken, newR, nil, oldF)
+		require.NoError(t, err)
+		assert.Equal(t, "http://localhost:4000", newF.GetCourierBaseURL())
+	})
+
+	t.Run("empty when neither old nor new have a base URL", func(t *testing.T) {
+		r := &http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}
+		oldF, err := verification.NewFlow(reg, time.Hour, "csrf", r, nil, flow.TypeBrowser)
+		require.NoError(t, err)
+		newF, err := verification.FromOldFlow(reg, time.Hour, oldF.CSRFToken, r, nil, oldF)
+		require.NoError(t, err)
+		assert.Equal(t, "", newF.GetCourierBaseURL())
+	})
+}
+
+func TestNewPostHookFlow_capturesCourierBaseURL(t *testing.T) {
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
+
+	// NewPostHookFlow is what the registration → auto-verification chain
+	// calls during the registration submit handler. The verification flow
+	// it creates needs CourierBaseURL captured from the *triggering*
+	// request's context (the registration submit, with the CNAME-aware
+	// X-Ory-Original-Host set by the cloud middleware) — not from the
+	// original flow's RequestURL.
+	t.Run("captures from triggering request context, ignoring original flow's URL", func(t *testing.T) {
+		original := registration.Flow{
+			RequestURL: "https://" + "different.host/bar?return_to=https://elsewhere/path",
+		}
+		r := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+			WithContext(x.WithBaseURL(context.Background(), urlx.ParseOrPanic("https://customer.example.com/")))
+		f, err := verification.NewPostHookFlow(reg, time.Hour, "csrf", r, nil, &original)
+		require.NoError(t, err)
+		assert.Equal(t, "https://customer.example.com/", f.GetCourierBaseURL())
+	})
+
+	t.Run("preserves http scheme through the post-hook chain", func(t *testing.T) {
+		// Regression test for x.WithBaseURL no longer coercing scheme to
+		// https. The Ory CLI / NextJS proxy case carries http://localhost.
+		original := registration.Flow{RequestURL: "http://foo.com/bar"}
+		r := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+			WithContext(x.WithBaseURL(context.Background(), urlx.ParseOrPanic("http://localhost:4000")))
+		f, err := verification.NewPostHookFlow(reg, time.Hour, "csrf", r, nil, &original)
+		require.NoError(t, err)
+		assert.Equal(t, "http://localhost:4000", f.GetCourierBaseURL())
+	})
+
+	t.Run("empty when triggering request has no base URL", func(t *testing.T) {
+		original := registration.Flow{RequestURL: "http://foo.com/bar"}
+		r := &http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}
+		f, err := verification.NewPostHookFlow(reg, time.Hour, "csrf", r, nil, &original)
+		require.NoError(t, err)
+		assert.Equal(t, "", f.GetCourierBaseURL())
+	})
+}
+
+// TestCourierBaseURLStoredInInternalContext locks down the storage
+// location: the captured base URL must land in InternalContext under
+// flow.InternalContextKeyCourierBaseURL, not in a dedicated column. If a
+// future refactor moves it elsewhere, this fails — separately from the
+// getter contract.
+func TestCourierBaseURLStoredInInternalContext(t *testing.T) {
+	_, reg := pkg.NewVeryFastRegistryWithoutDB(t)
+
+	r := (&http.Request{URL: urlx.ParseOrPanic("http://foo/bar"), Host: "foo"}).
+		WithContext(x.WithBaseURL(context.Background(), urlx.ParseOrPanic("https://customer.example.com/")))
+	f, err := verification.NewFlow(reg, time.Hour, "csrf", r, nil, flow.TypeBrowser)
+	require.NoError(t, err)
+
+	got := gjson.GetBytes(f.InternalContext, flow.InternalContextKeyCourierBaseURL).String()
+	assert.Equal(t, "https://customer.example.com/", got)
+}
+
 func TestFromOldFlow(t *testing.T) {
 	ctx := context.Background()
-	conf := pkg.NewConfigurationWithDefaults(t)
+	conf, reg := pkg.NewVeryFastRegistryWithoutDB(t)
 	r := http.Request{URL: &url.URL{Path: "/", RawQuery: "return_to=" + urlx.AppendPaths(conf.SelfPublicURL(ctx), "/self-service/login/browser").String()}, Host: "ory.sh"}
 	for _, ft := range []flow.Type{
 		flow.TypeAPI,
 		flow.TypeBrowser,
 	} {
 		t.Run(fmt.Sprintf("case=original flow is %s", ft), func(t *testing.T) {
-			f, err := verification.NewFlow(conf, 0, "csrf", &r, nil, ft)
+			f, err := verification.NewFlow(reg, 0, "csrf", &r, nil, ft)
 			require.NoError(t, err)
-			nf, err := verification.FromOldFlow(conf, time.Duration(time.Hour), f.CSRFToken, &r, nil, f)
+			nf, err := verification.FromOldFlow(reg, time.Duration(time.Hour), f.CSRFToken, &r, nil, f)
 			require.NoError(t, err)
 			require.Equal(t, flow.TypeBrowser, nf.Type)
 		})

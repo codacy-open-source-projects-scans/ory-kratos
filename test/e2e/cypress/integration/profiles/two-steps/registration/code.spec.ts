@@ -175,6 +175,7 @@ context("Registration success with code method", () => {
         })
       })
 
+      // playwright:migrated
       it("should sign up and be logged in with session hook", () => {
         if (app === "react") {
           // This test is flaky on React, so we skip it for now.
@@ -223,6 +224,7 @@ context("Registration success with code method", () => {
         })
       })
 
+      // playwright:migrated
       it("should be able to sign up without session hook", () => {
         if (app === "react") {
           // This test is flaky on React, so we skip it for now.

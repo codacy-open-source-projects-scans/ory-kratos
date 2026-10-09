@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
 
 	"github.com/ory/kratos/persistence/sql/update"
 	"github.com/ory/kratos/selfservice/flow/login"
@@ -65,6 +66,27 @@ func (p *Persister) ForceLoginFlow(ctx context.Context, id uuid.UUID) (err error
 		lr.Refresh = true
 		return tx.Save(lr, "nid")
 	})
+}
+
+func (p *Persister) DeleteTestLoginFlow(ctx context.Context, id uuid.UUID) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.DeleteTestLoginFlow")
+	defer otelx.End(span, &err)
+
+	count, err := p.GetConnection(ctx).RawQuery(`
+		DELETE FROM selfservice_login_flows
+		WHERE id = ?
+		  AND nid = ?
+		  AND test_flow = true`,
+		id,
+		p.NetworkID(ctx),
+	).ExecWithCount()
+	if err != nil {
+		return sqlcon.HandleError(err)
+	}
+	if count == 0 {
+		return errors.WithStack(sqlcon.ErrNoRows())
+	}
+	return nil
 }
 
 func (p *Persister) DeleteExpiredLoginFlows(ctx context.Context, expiresAt time.Time, limit int) (err error) {

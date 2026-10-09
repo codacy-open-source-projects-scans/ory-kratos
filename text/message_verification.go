@@ -6,12 +6,14 @@ package text
 import (
 	"fmt"
 	"time"
+
+	"github.com/ory/x/clock"
 )
 
-func NewErrorValidationVerificationFlowExpired(expiredAt time.Time) *Message {
+func NewErrorValidationVerificationFlowExpired(c clock.Clock, expiredAt time.Time) *Message {
 	return &Message{
 		ID:   ErrorValidationVerificationFlowExpired,
-		Text: fmt.Sprintf("The verification flow expired %.2f minutes ago, please try again.", Since(expiredAt).Minutes()),
+		Text: fmt.Sprintf("The verification flow expired %.2f minutes ago, please try again.", c.Now().Sub(expiredAt).Minutes()),
 		Type: Error,
 		Context: context(map[string]any{
 			"expired_at":      expiredAt,
@@ -90,4 +92,14 @@ func NewVerificationPhoneWithCodeSent() *Message {
 		Type: Info,
 		Text: "A text message containing a verification code has been sent to the phone number you provided. If you have not received a text message, check the spelling of the number and make sure to use the number you registered with.",
 	}
+}
+
+// VerificationCodeSentMessage returns the "code has been sent" message for the
+// channel the code was delivered over. SMS verifications get the phone wording;
+// every other channel falls back to the email wording.
+func VerificationCodeSentMessage(via string) *Message {
+	if via == "sms" {
+		return NewVerificationPhoneWithCodeSent()
+	}
+	return NewVerificationEmailWithCodeSent()
 }

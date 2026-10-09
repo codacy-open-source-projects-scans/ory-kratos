@@ -7,24 +7,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	stderrors "errors"
 
 	"github.com/gofrs/uuid"
 	"github.com/mohae/deepcopy"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/herodot"
 	"github.com/ory/jsonschema/v3"
 	"github.com/ory/kratos/courier"
+	"github.com/ory/kratos/courier/template"
+	"github.com/ory/kratos/courier/template/email"
+	"github.com/ory/kratos/courier/template/sms"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/x"
+	"github.com/ory/kratos/x/transaction"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx"
+	"github.com/ory/x/popx"
 	"github.com/ory/x/sqlcon"
 )
 
@@ -43,8 +51,9 @@ type (
 		ValidationProvider
 		ActiveCredentialsCounterStrategyProvider
 		logrusx.Provider
-		x.TransactionPersistenceProvider
+		transaction.PersistenceProvider
 		PendingTraitsChangePersistenceProvider
+		template.Dependencies
 	}
 	ManagementProvider interface {
 		IdentityManager() *Manager
@@ -56,6 +65,7 @@ type (
 	ManagerOptions struct {
 		ExposeValidationErrors    bool
 		AllowWriteProtectedTraits bool
+		ExcludedCredentialTypes   []CredentialsType
 	}
 
 	ManagerOption func(*ManagerOptions)
@@ -71,6 +81,17 @@ func ManagerExposeValidationErrorsForInternalTypeAssertion(options *ManagerOptio
 
 func ManagerAllowWriteProtectedTraits(options *ManagerOptions) {
 	options.AllowWriteProtectedTraits = true
+}
+
+// ManagerWithoutCredentialTypes excludes the given credential types from the
+// identity persist: Update leaves their rows untouched. Strategies that
+// persist those credentials themselves (e.g. through the locked
+// UpdateCredentialsConfig path) set this so the persist cannot clobber a
+// concurrent locked write.
+func ManagerWithoutCredentialTypes(cts ...CredentialsType) ManagerOption {
+	return func(options *ManagerOptions) {
+		options.ExcludedCredentialTypes = append(options.ExcludedCredentialTypes, cts...)
+	}
 }
 
 func newManagerOptions(opts []ManagerOption) *ManagerOptions {
@@ -104,60 +125,137 @@ func (m *Manager) Create(ctx context.Context, i *Identity, opts ...ManagerOption
 	return nil
 }
 
-func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *Identity, foundConflictAddress string, conflictAddressType string, err error) {
-	for ct, cred := range i.Credentials {
-		for _, id := range cred.Identifiers {
-			found, _, err = m.r.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, ct, id)
-			if err != nil {
+// maxParallelConflictLookups bounds how many conflict lookups run against the
+// database concurrently.
+const maxParallelConflictLookups = 8
+
+// A match either carries the conflicting identity directly (credential lookup)
+// or just its ID (address lookup).
+type conflictMatch struct {
+	found       *Identity
+	identityID  uuid.UUID
+	address     string
+	addressType string
+}
+
+type conflictLookup func(ctx context.Context) (*conflictMatch, error)
+
+// findFirstConflict returns the match of the lowest-index lookup, or
+// sqlcon.ErrNoRows if no lookup matches. Outside a transaction all lookups run
+// concurrently, bounded by maxParallelConflictLookups.
+func findFirstConflict(ctx context.Context, lookups []conflictLookup) (*conflictMatch, error) {
+	// Inside a transaction the single connection must not run concurrent queries, so the lookups run
+	// sequentially and stop at the first match.
+	if popx.InTransaction(ctx) {
+		for _, lookup := range lookups {
+			match, err := lookup(ctx)
+			if errors.Is(err, sqlcon.ErrNoRows()) {
+				continue
+			} else if err != nil {
+				return nil, err
+			} else if match == nil {
 				continue
 			}
+			return match, nil
+		}
+		return nil, sqlcon.ErrNoRows()
+	}
 
-			// FindByCredentialsIdentifier does not expand identity credentials.
-			if err = m.r.PrivilegedIdentityPool().HydrateIdentityAssociations(ctx, found, ExpandCredentials); err != nil {
-				return nil, "", "", err
+	// Each goroutine records its own outcome (match and error) into a distinct
+	// slice element, then always returns nil so the group never cancels a
+	// still-running higher-priority lookup. After Wait the outcomes are resolved
+	// in priority order, matching the sequential path: a lower-priority error
+	// can neither mask a higher-priority match nor be returned
+	// non-deterministically.
+	type outcome struct {
+		match *conflictMatch
+		err   error
+	}
+	results := make([]outcome, len(lookups))
+	eg := new(errgroup.Group)
+	eg.SetLimit(maxParallelConflictLookups)
+	for i, lookup := range lookups {
+		eg.Go(func() error {
+			match, err := lookup(ctx)
+			if errors.Is(err, sqlcon.ErrNoRows()) {
+				return nil
 			}
-
-			return found, id, ct.String(), nil
+			results[i] = outcome{match: match, err: err}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		if r.match != nil {
+			return r.match, nil
 		}
 	}
+	return nil, sqlcon.ErrNoRows()
+}
 
-	// If the conflict is not in the identifiers table, it is coming from the verifiable or recovery address.
+func (m *Manager) ConflictingIdentity(ctx context.Context, i *Identity) (found *Identity, foundConflictAddress string, conflictAddressType string, err error) {
+	ctx, span := m.r.Tracer(ctx).Tracer().Start(ctx, "identity.Manager.ConflictingIdentity")
+	defer otelx.End(span, &err)
+
+	// Lookups are ordered by priority: credential identifiers first, then
+	// verifiable addresses, then recovery addresses. The lowest-index match
+	// wins, so the reported conflict is deterministic.
+	var lookups []conflictLookup
+	for _, ct := range slices.Sorted(maps.Keys(i.Credentials)) {
+		for _, identifier := range i.Credentials[ct].Identifiers {
+			lookups = append(lookups, func(ctx context.Context) (*conflictMatch, error) {
+				conflicting, _, err := m.r.PrivilegedIdentityPool().FindByCredentialsIdentifier(ctx, ct, identifier)
+				if err != nil {
+					return nil, err
+				}
+				return &conflictMatch{found: conflicting, address: identifier, addressType: ct.String()}, nil
+			})
+		}
+	}
 	for _, va := range i.VerifiableAddresses {
-		conflictingAddress, err := m.r.PrivilegedIdentityPool().FindVerifiableAddressByValue(ctx, va.Via, va.Value)
-		if errors.Is(err, sqlcon.ErrNoRows()) {
-			continue
-		} else if err != nil {
-			return nil, "", "", err
-		}
-
-		foundConflictAddress = conflictingAddress.Value
-		found, err = m.r.PrivilegedIdentityPool().GetIdentity(ctx, conflictingAddress.IdentityID, ExpandCredentials)
-		if err != nil {
-			return nil, "", "", err
-		}
-
-		return found, foundConflictAddress, va.Via, nil
+		lookups = append(lookups, func(ctx context.Context) (*conflictMatch, error) {
+			conflictingAddress, err := m.r.PrivilegedIdentityPool().FindVerifiableAddressByValue(ctx, va.Via, va.Value)
+			if err != nil {
+				return nil, err
+			}
+			return &conflictMatch{identityID: conflictingAddress.IdentityID, address: conflictingAddress.Value, addressType: va.Via}, nil
+		})
+	}
+	for _, ra := range i.RecoveryAddresses {
+		lookups = append(lookups, func(ctx context.Context) (*conflictMatch, error) {
+			conflictingAddress, err := m.r.PrivilegedIdentityPool().FindRecoveryAddressByValue(ctx, ra.Via, ra.Value)
+			if err != nil {
+				return nil, err
+			}
+			return &conflictMatch{identityID: conflictingAddress.IdentityID, address: conflictingAddress.Value, addressType: ra.Via}, nil
+		})
 	}
 
-	// Last option: check the recovery address
-	for _, va := range i.RecoveryAddresses {
-		conflictingAddress, err := m.r.PrivilegedIdentityPool().FindRecoveryAddressByValue(ctx, va.Via, va.Value)
-		if errors.Is(err, sqlcon.ErrNoRows()) {
-			continue
-		} else if err != nil {
-			return nil, "", "", err
-		}
-
-		foundConflictAddress = conflictingAddress.Value
-		found, err = m.r.PrivilegedIdentityPool().GetIdentity(ctx, conflictingAddress.IdentityID, ExpandCredentials)
-		if err != nil {
-			return nil, "", "", err
-		}
-
-		return found, foundConflictAddress, string(va.Via), nil
+	// Fanning out separate lookups (instead of a single UNION query in the
+	// persister) composes with both the OSS and the multi-region persister,
+	// which overrides FindByCredentialsIdentifier with region-aware logic.
+	match, err := findFirstConflict(ctx, lookups)
+	if err != nil {
+		return nil, "", "", err
 	}
 
-	return nil, "", "", sqlcon.ErrNoRows()
+	if match.found != nil {
+		// FindByCredentialsIdentifier does not expand identity credentials.
+		if err := m.r.PrivilegedIdentityPool().HydrateIdentityAssociations(ctx, match.found, ExpandCredentials); err != nil {
+			return nil, "", "", err
+		}
+		return match.found, match.address, match.addressType, nil
+	}
+	conflicting, err := m.r.PrivilegedIdentityPool().GetIdentity(ctx, match.identityID, ExpandCredentials)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return conflicting, match.address, match.addressType, nil
 }
 
 func (m *Manager) findExistingAuthMethod(ctx context.Context, e error, i *Identity) (err error) {
@@ -412,7 +510,7 @@ func (m *Manager) CreateIdentities(ctx context.Context, identities []*Identity, 
 		validIdentities = append(validIdentities, ident)
 	}
 
-	if err := m.r.PrivilegedIdentityPool().CreateIdentities(ctx, validIdentities...); err != nil {
+	if err := m.r.PrivilegedIdentityPool().CreateIdentities(ctx, validIdentities); err != nil {
 		if partialErr := new(CreateIdentitiesError); errors.As(err, &partialErr) {
 			createIdentitiesError.Merge(partialErr)
 		} else {
@@ -432,7 +530,8 @@ func (m *Manager) requiresPrivilegedAccess(ctx context.Context, original, update
 		return nil
 
 	case !CredentialsEqual(updated.Credentials, original.Credentials),
-		!VerifiableAddressesEqual(updated.VerifiableAddresses, original.VerifiableAddresses):
+		!VerifiableAddressesEqual(updated.VerifiableAddresses, original.VerifiableAddresses),
+		!RecoveryAddressesEqual(updated.RecoveryAddresses, original.RecoveryAddresses):
 		// reset the identity
 		*updated = *original
 		return errors.WithStack(ErrProtectedFieldModified())
@@ -459,7 +558,11 @@ func (m *Manager) Update(ctx context.Context, updated *Identity, opts ...Manager
 		return err
 	}
 
-	return m.r.PrivilegedIdentityPool().UpdateIdentity(ctx, updated, DiffAgainst(original))
+	mods := []UpdateIdentityModifier{DiffAgainst(original)}
+	if len(o.ExcludedCredentialTypes) > 0 {
+		mods = append(mods, WithoutCredentialTypes(o.ExcludedCredentialTypes...))
+	}
+	return m.r.PrivilegedIdentityPool().UpdateIdentity(ctx, updated, mods...)
 }
 
 func (m *Manager) UpdateSchemaID(ctx context.Context, id uuid.UUID, schemaID string, opts ...ManagerOption) (err error) {
@@ -545,6 +648,16 @@ func (m *Manager) UpdateTraits(ctx context.Context, id uuid.UUID, traits Traits,
 }
 
 func (m *Manager) ValidateIdentity(ctx context.Context, i *Identity, o *ManagerOptions) (err error) {
+	// Safeguard against callers that write to i.Credentials directly with a
+	// Type field that does not match its map key. Must run before
+	// IdentityValidator.Validate, because the schema-extension pass calls
+	// SetCredentials and would silently repair Type — masking the bug
+	// while still allowing the malformed Config to overwrite the existing
+	// credential row.
+	if err := ValidateCredentialsIntegrity(i.Credentials); err != nil {
+		return err
+	}
+
 	if err := m.r.IdentityValidator().Validate(ctx, i); err != nil {
 		var validationErr *jsonschema.ValidationError
 		if errors.As(err, &validationErr) && !o.ExposeValidationErrors {
@@ -593,3 +706,105 @@ func (m *Manager) CountActiveMultiFactorCredentials(ctx context.Context, i *Iden
 }
 
 var ErrConcurrentModification = stderrors.New("concurrent modification detected")
+
+// AddressRef identifies a verifiable address by its value and channel.
+// Used by the notify_previous_addresses hook to persist the set of
+// addresses that should receive a change notification.
+type AddressRef struct {
+	Value string `json:"value"`
+	Via   string `json:"via"`
+}
+
+// sendIdentityNotifications queues a notification template to each target via
+// the appropriate courier channel, sharing the courier, identity-model, and
+// error-collection plumbing across the concrete notification types. buildEmail
+// and buildSMS construct the channel-specific template for a single recipient
+// from the identity model and a shared RFC3339 timestamp. Errors from individual
+// targets are collected and returned as a joined error but do not short-circuit
+// the batch — a failure to notify one recipient must not prevent others from
+// being notified.
+func (m *Manager) sendIdentityNotifications(
+	ctx context.Context,
+	spanName string,
+	targets []AddressRef,
+	i *Identity,
+	buildEmail func(to string, identity map[string]any, at string) courier.EmailTemplate,
+	buildSMS func(to string, identity map[string]any, at string) courier.SMSTemplate,
+) (err error) {
+	ctx, span := m.r.Tracer(ctx).Tracer().Start(ctx, spanName)
+	defer otelx.End(span, &err)
+
+	if len(targets) == 0 {
+		return nil
+	}
+
+	c, err := m.r.Courier(ctx)
+	if err != nil {
+		return err
+	}
+
+	model, err := x.StructToMap(i)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	at := time.Now().UTC().Format(time.RFC3339)
+
+	var errs []error
+	for _, t := range targets {
+		switch t.Via {
+		case AddressTypeEmail:
+			if _, qerr := c.QueueEmail(ctx, buildEmail(t.Value, model, at)); qerr != nil {
+				m.r.Logger().WithError(qerr).
+					WithField("via", t.Via).
+					Warn("Failed to queue identity notification email.")
+				errs = append(errs, qerr)
+			}
+		case AddressTypeSMS:
+			if _, qerr := c.QueueSMS(ctx, buildSMS(t.Value, model, at)); qerr != nil {
+				m.r.Logger().WithError(qerr).
+					WithField("via", t.Via).
+					Warn("Failed to queue identity notification SMS.")
+				errs = append(errs, qerr)
+			}
+		default:
+			m.r.Logger().
+				WithField("via", t.Via).
+				Warn("Skipping identity notification target with unsupported Via.")
+		}
+	}
+
+	return stderrors.Join(errs...)
+}
+
+// SendVerifiableAddressChangedNotifications queues a change notification to
+// each target via the appropriate courier channel. Errors from individual
+// targets are collected and returned as a joined error but do not
+// short-circuit the batch — a failure to notify one recipient should not
+// prevent others from receiving their notification.
+func (m *Manager) SendVerifiableAddressChangedNotifications(ctx context.Context, targets []AddressRef, i *Identity) error {
+	return m.sendIdentityNotifications(ctx, "identity.Manager.SendVerifiableAddressChangedNotifications", targets, i,
+		func(to string, identity map[string]any, at string) courier.EmailTemplate {
+			return email.NewVerifiableAddressChanged(m.r, &email.VerifiableAddressChangedModel{To: to, Identity: identity, ChangedAt: at})
+		},
+		func(to string, identity map[string]any, at string) courier.SMSTemplate {
+			return sms.NewVerifiableAddressChanged(m.r, &sms.VerifiableAddressChangedModel{To: to, Identity: identity, ChangedAt: at})
+		},
+	)
+}
+
+// SendAuthenticatorKeyAddedNotifications queues a security notification to each
+// target via the appropriate courier channel after a new authenticator key was
+// enrolled or an existing key's secret was rotated. Errors from individual
+// targets are collected and returned as a joined error but do not short-circuit
+// the batch — callers must never fail the enrollment/rotate flow on a courier
+// error; they should log and continue.
+func (m *Manager) SendAuthenticatorKeyAddedNotifications(ctx context.Context, targets []AddressRef, i *Identity) error {
+	return m.sendIdentityNotifications(ctx, "identity.Manager.SendAuthenticatorKeyAddedNotifications", targets, i,
+		func(to string, identity map[string]any, at string) courier.EmailTemplate {
+			return email.NewAuthenticatorKeyAdded(m.r, &email.AuthenticatorKeyAddedModel{To: to, Identity: identity, AddedAt: at})
+		},
+		func(to string, identity map[string]any, at string) courier.SMSTemplate {
+			return sms.NewAuthenticatorKeyAdded(m.r, &sms.AuthenticatorKeyAddedModel{To: to, Identity: identity, AddedAt: at})
+		},
+	)
+}

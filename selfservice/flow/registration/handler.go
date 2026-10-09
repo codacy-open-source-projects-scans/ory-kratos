@@ -6,7 +6,6 @@ package registration
 import (
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
@@ -29,10 +28,12 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/logrusx"
 	"github.com/ory/x/otelx/semconv"
+	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -48,6 +49,7 @@ const (
 
 type (
 	handlerDependencies interface {
+		clock.Provider
 		config.Provider
 		errorx.ManagementProvider
 		hydra.Provider
@@ -118,17 +120,32 @@ func WithFlowOAuth2LoginChallenge(loginChallenge string) FlowOption {
 	}
 }
 
-func (h *Handler) NewRegistrationFlow(w http.ResponseWriter, r *http.Request, ft flow.Type, opts ...FlowOption) (*Flow, error) {
-	if !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) {
-		return nil, errors.WithStack(ErrRegistrationDisabled())
+func WithFlowIdentitySchema(schema string) FlowOption {
+	return func(f *Flow) {
+		f.IdentitySchema = flow.IdentitySchema(schema)
 	}
+}
 
-	f, err := NewFlow(h.d.Config(), h.d.Config().SelfServiceFlowRegistrationRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, ft)
+func WithFlowAccountLinking() FlowOption {
+	return func(f *Flow) {
+		f.MarkAsAccountLinking()
+	}
+}
+
+func (h *Handler) NewRegistrationFlow(w http.ResponseWriter, r *http.Request, ft flow.Type, opts ...FlowOption) (*Flow, error) {
+	f, err := NewFlow(h.d, r, ft)
 	if err != nil {
 		return nil, err
 	}
 	for _, o := range opts {
 		o(f)
+	}
+
+	// Flows that were converted from a login flow for account linking may be
+	// created even when registration is disabled. PostRegistrationHook
+	// guarantees they can only link to an existing identity, never create one.
+	if !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) && !f.IsAccountLinking() {
+		return nil, errors.WithStack(ErrRegistrationDisabled())
 	}
 
 	if ft == flow.TypeAPI && r.URL.Query().Get("return_session_token_exchange_code") == "true" {
@@ -395,7 +412,9 @@ func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	if sess, err := h.d.SessionManager().FetchFromRequest(ctx, r); err == nil {
+	// Only session columns (identity ID, session ID, AMR) are read below, so skip loading the
+	// devices and the identity.
+	if sess, err := h.d.SessionManager().FetchFromRequest(ctx, r, session.ExpandNothing, identity.ExpandNothing); err == nil {
 		if hydraLoginRequest != nil {
 			if hydraLoginRequest.GetSkip() {
 				rt, err := h.d.Hydra().AcceptLoginRequest(r.Context(),
@@ -437,7 +456,8 @@ func (h *Handler) createBrowserRegistrationFlow(w http.ResponseWriter, r *http.R
 			return
 		}
 
-		returnTo, redirErr := redir.SecureRedirectTo(r, h.d.Config().SelfServiceBrowserDefaultReturnTo(ctx),
+		returnTo, redirErr := redir.SecureRedirectTo(
+			r, h.d.Config().SelfServiceBrowserDefaultReturnTo(ctx),
 			redir.SecureRedirectAllowSelfServiceURLs(h.d.Config().SelfPublicURL(ctx)),
 			redir.SecureRedirectAllowURLs(h.d.Config().SelfServiceBrowserAllowedReturnToDomains(ctx)),
 		)
@@ -523,14 +543,25 @@ type getRegistrationFlow struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: kratos-public-high
 func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request) {
-	if !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) {
-		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(ErrRegistrationDisabled()))
+	ar, err := h.d.RegistrationFlowPersister().GetRegistrationFlow(r.Context(), x.ParseUUID(r.URL.Query().Get("id")))
+	if err != nil {
+		// A flow that does not exist reports a disabled registration to not
+		// leak flow existence. Any other error is returned as-is, so that an
+		// infrastructure failure is not misreported as a disabled
+		// registration.
+		if errors.Is(err, sqlcon.ErrNoRows()) && !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) {
+			h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(ErrRegistrationDisabled()))
+			return
+		}
+
+		h.d.Writer().WriteError(w, r, err)
 		return
 	}
 
-	ar, err := h.d.RegistrationFlowPersister().GetRegistrationFlow(r.Context(), x.ParseUUID(r.URL.Query().Get("id")))
-	if err != nil {
-		h.d.Writer().WriteError(w, r, err)
+	// When registration is disabled, only flows that were converted from a
+	// login flow for account linking may be fetched.
+	if !ar.IsAccountLinking() && !h.d.Config().SelfServiceFlowRegistrationEnabled(r.Context()) {
+		h.d.SelfServiceErrorManager().Forward(r.Context(), w, r, errors.WithStack(ErrRegistrationDisabled()))
 		return
 	}
 
@@ -542,7 +573,7 @@ func (h *Handler) getRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ar.ExpiresAt.Before(time.Now()) {
+	if ar.ExpiresAt.Before(h.d.Clock().Now()) {
 		if ar.Type == flow.TypeBrowser {
 			redirectURL := flow.GetFlowExpiredRedirectURL(r.Context(), h.d.Config(), RouteInitBrowserFlow, ar.ReturnTo)
 
@@ -664,7 +695,8 @@ type updateRegistrationFlowBody struct{}
 //	  x-ory-ratelimit-bucket: kratos-public-low
 func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = semconv.ContextWithAttributes(ctx,
+	ctx = semconv.ContextWithAttributes(
+		ctx,
 		attribute.String(events.AttributeKeySelfServiceStrategyUsed.String(), "registration"),
 		attribute.String(events.AttributeKeySelfServiceFlowName.String(), "registration"),
 	)
@@ -682,7 +714,7 @@ func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if _, err := h.d.SessionManager().FetchFromRequest(r.Context(), r); err == nil {
+	if err := h.d.SessionManager().SessionActiveForRequest(r.Context(), r); err == nil {
 		if f.Type == flow.TypeBrowser {
 			http.Redirect(w, r, h.d.Config().SelfServiceBrowserDefaultReturnTo(r.Context()).String(), http.StatusSeeOther)
 			return
@@ -692,7 +724,7 @@ func (h *Handler) updateRegistrationFlow(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := f.Valid(); err != nil {
+	if err := f.Valid(h.d.Clock()); err != nil {
 		h.d.RegistrationFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/pop/v6"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
 )
@@ -103,8 +104,9 @@ type Flow struct {
 	// CreatedAt is a helper struct field for gobuffalo.pop.
 	CreatedAt time.Time `json:"-" faker:"-" db:"created_at"`
 	// UpdatedAt is a helper struct field for gobuffalo.pop.
-	UpdatedAt time.Time `json:"-" faker:"-" db:"updated_at"`
-	NID       uuid.UUID `json:"-" faker:"-" db:"nid"`
+	UpdatedAt      time.Time     `json:"-" faker:"-" db:"updated_at"`
+	NID            uuid.UUID     `json:"-" faker:"-" db:"nid"`
+	OrganizationID uuid.NullUUID `json:"organization_id,omitempty" faker:"-" db:"organization_id"`
 
 	// Contains a list of actions, that could follow this flow
 	//
@@ -125,16 +127,26 @@ var (
 	_ flow.InternalContexter = (*Flow)(nil)
 )
 
-func MustNewFlow(conf *config.Config, exp time.Duration, r *http.Request, i *identity.Identity, ft flow.Type) *Flow {
-	f, err := NewFlow(conf, exp, r, i, ft)
+// flowDependencies are the dependencies NewFlow needs to construct a settings
+// flow: the configuration (for the lifespan and return-to validation) and the
+// clock.
+type flowDependencies interface {
+	config.Provider
+	clock.Provider
+}
+
+func MustNewFlow(reg flowDependencies, r *http.Request, i *identity.Identity, ft flow.Type) *Flow {
+	f, err := NewFlow(reg, r, i, ft)
 	if err != nil {
 		panic(err)
 	}
 	return f
 }
 
-func NewFlow(conf *config.Config, exp time.Duration, r *http.Request, i *identity.Identity, ft flow.Type) (*Flow, error) {
-	now := time.Now().UTC()
+func NewFlow(reg flowDependencies, r *http.Request, i *identity.Identity, ft flow.Type) (*Flow, error) {
+	conf := reg.Config()
+	now := reg.Clock().Now().UTC()
+	exp := conf.SelfServiceFlowSettingsFlowLifespan(r.Context())
 	id := x.NewUUID()
 
 	// Pre-validate the return to URL which is contained in the HTTP request.
@@ -149,7 +161,7 @@ func NewFlow(conf *config.Config, exp time.Duration, r *http.Request, i *identit
 		return nil, err
 	}
 
-	return &Flow{
+	f := &Flow{
 		ID:         id,
 		ExpiresAt:  now.Add(exp),
 		IssuedAt:   now,
@@ -163,7 +175,11 @@ func NewFlow(conf *config.Config, exp time.Duration, r *http.Request, i *identit
 			Action: flow.AppendFlowTo(urlx.AppendPaths(conf.SelfPublicURL(r.Context()), RouteSubmitFlow), id).String(),
 		},
 		InternalContext: []byte("{}"),
-	}, nil
+	}
+	if err := flow.SetRequestBaseURL(f, x.BaseURLStringFromContext(r.Context())); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 func (f *Flow) GetInternalContext() sqlxx.JSONRawMessage        { return f.InternalContext }
@@ -180,9 +196,9 @@ func (Flow) GetFlowName() flow.FlowName                         { return flow.Se
 func (f *Flow) SetState(state State)                            { f.State = state }
 func (f *Flow) GetTransientPayload() json.RawMessage            { return f.TransientPayload }
 
-func (f *Flow) Valid(s *session.Session) error {
-	if f.ExpiresAt.Before(time.Now().UTC()) {
-		return errors.WithStack(flow.NewFlowExpiredError(f.ExpiresAt))
+func (f *Flow) Valid(c clock.Clock, s *session.Session) error {
+	if f.ExpiresAt.Before(c.Now().UTC()) {
+		return errors.WithStack(flow.NewFlowExpiredError(c, f.ExpiresAt))
 	}
 
 	if f.IdentityID != s.Identity.ID {

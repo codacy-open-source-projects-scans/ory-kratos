@@ -36,6 +36,7 @@ context("Social Sign Out Successes", () => {
         cy.registerOidc({ app, email, website, route: registration })
       })
 
+      // playwright:migrated
       it("should sign out and be able to sign in again", () => {
         if (app === "express") {
           cy.get(

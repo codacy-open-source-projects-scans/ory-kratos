@@ -410,19 +410,45 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 
 			t.Run("on another network", func(t *testing.T) {
 				_, other := testhelpers.NewNetwork(t, ctx, p)
-				err := other.RevokeSessionByToken(ctx, expected.Token)
+				revoked, err := other.RevokeSessionByToken(ctx, expected.Token)
 				assert.ErrorIs(t, err, sqlcon.ErrNoRows())
+				assert.Equal(t, uuid.Nil, revoked.ID, "session id must be nil when not found")
+				assert.Equal(t, uuid.Nil, revoked.IdentityID, "identity id must be nil when not found")
 
 				actual, err = p.GetSession(ctx, expected.ID, session.ExpandNothing)
 				require.NoError(t, err)
 				assert.True(t, actual.Active)
 			})
 
-			require.NoError(t, p.RevokeSessionByToken(ctx, expected.Token))
+			revoked, err := p.RevokeSessionByToken(ctx, expected.Token)
+			require.NoError(t, err)
+			assert.Equal(t, expected.ID, revoked.ID, "must return the session id")
+			assert.Equal(t, expected.IdentityID, revoked.IdentityID, "must return the identity id")
 
 			actual, err = p.GetSession(ctx, expected.ID, session.ExpandNothing)
 			require.NoError(t, err)
 			assert.False(t, actual.Active)
+
+			// Re-revoking an already-inactive session is silently
+			// idempotent — the CTE-based implementation returns the matched
+			// row, not the flipped one, so the IDs come back regardless.
+			revoked, err = p.RevokeSessionByToken(ctx, expected.Token)
+			require.NoError(t, err,
+				"re-revoking an already-inactive session must succeed silently on %s",
+				p.GetConnection(ctx).Dialect.Name())
+			assert.Equal(t, expected.ID, revoked.ID, "matched id must be returned on re-revoke")
+			assert.Equal(t, expected.IdentityID, revoked.IdentityID, "matched identity id must be returned on re-revoke")
+
+			actual, err = p.GetSession(ctx, expected.ID, session.ExpandNothing)
+			require.NoError(t, err, "session must still exist after re-revoke")
+			assert.False(t, actual.Active, "session must remain inactive after re-revoke")
+
+			t.Run("returns ErrNoRows for an unknown token", func(t *testing.T) {
+				revoked, err := p.RevokeSessionByToken(ctx, "this-token-does-not-exist-"+x.NewUUID().String())
+				assert.ErrorIs(t, err, sqlcon.ErrNoRows())
+				assert.Equal(t, uuid.Nil, revoked.ID)
+				assert.Equal(t, uuid.Nil, revoked.IdentityID)
+			})
 		})
 
 		t.Run("case=revoke session by id", func(t *testing.T) {
@@ -451,6 +477,21 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 			actual, err = p.GetSession(ctx, expected.ID, session.ExpandNothing)
 			require.NoError(t, err)
 			assert.False(t, actual.Active)
+
+			// Re-revoking an already-inactive session is silently
+			// idempotent — the admin disableSession handler relies on it.
+			require.NoError(t, p.RevokeSessionById(ctx, expected.ID),
+				"re-revoking an already-inactive session must succeed silently on %s",
+				p.GetConnection(ctx).Dialect.Name())
+
+			actual, err = p.GetSession(ctx, expected.ID, session.ExpandNothing)
+			require.NoError(t, err, "session must still exist after re-revoke")
+			assert.False(t, actual.Active, "session must remain inactive after re-revoke")
+
+			t.Run("returns ErrNoRows for an unknown id", func(t *testing.T) {
+				err := p.RevokeSessionById(ctx, x.NewUUID())
+				assert.ErrorIs(t, err, sqlcon.ErrNoRows())
+			})
 		})
 
 		t.Run("method=revoke other sessions for identity", func(t *testing.T) {
@@ -507,6 +548,38 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 			for _, s := range otherIdentitiesSessions {
 				assert.True(t, s.Active)
 			}
+
+			t.Run("returns matched count, including already-inactive sessions", func(t *testing.T) {
+				// One identity, three sessions: the keeper, one already-
+				// inactive other, one active other. Returned count must be 2
+				// (both "other" sessions matched the predicate) — not 1
+				// (only the active "other" was actually flipped). The CTE on
+				// CRDB/Postgres must preserve matched-count, not flipped-count.
+				var keeper session.Session
+				require.NoError(t, faker.FakeData(&keeper))
+				keeper.Active = true
+				require.NoError(t, p.CreateIdentity(ctx, keeper.Identity))
+				require.NoError(t, p.UpsertSession(ctx, &keeper))
+
+				makeSibling := func() session.Session {
+					var s session.Session
+					require.NoError(t, faker.FakeData(&s))
+					s.Identity = keeper.Identity
+					s.IdentityID = keeper.IdentityID
+					s.Active = true
+					require.NoError(t, p.UpsertSession(ctx, &s))
+					return s
+				}
+				alreadyInactive := makeSibling()
+				require.NoError(t, p.RevokeSessionById(ctx, alreadyInactive.ID))
+				_ = makeSibling() // stillActive — will be flipped by the call below
+
+				n, err := p.RevokeSessionsIdentityExcept(ctx, keeper.IdentityID, keeper.ID)
+				require.NoError(t, err)
+				assert.Equal(t, 2, n,
+					"matched count must include already-inactive sessions on %s",
+					p.GetConnection(ctx).Dialect.Name())
+			})
 		})
 
 		t.Run("method=revoke specific session for identity", func(t *testing.T) {
@@ -547,6 +620,19 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 				assert.False(t, actual[1].Active)
 				assert.True(t, actual[0].Active)
 			}
+
+			// Re-revoking an already-inactive session must succeed silently —
+			// the `AND active = true` predicate added on the CRDB/Postgres path
+			// must not change the function's nil-on-no-rows contract.
+			require.NoError(t, p.RevokeSession(ctx, sessions[0].IdentityID, sessions[0].ID),
+				"re-revoking an already-inactive session must succeed silently")
+
+			// Wrong identity_id for an existing session id is a silent no-op,
+			// not an error.
+			require.NoError(t, p.RevokeSession(ctx, x.NewUUID(), sessions[1].ID))
+			actual1, err := p.GetSession(ctx, sessions[1].ID, session.ExpandNothing)
+			require.NoError(t, err)
+			assert.True(t, actual1.Active, "session must stay active when identity_id mismatches")
 		})
 
 		t.Run("case=delete session for", func(t *testing.T) {
@@ -666,6 +752,222 @@ func TestPersister(ctx context.Context, conf *config.Config, p interface {
 			require.NoError(t, err)
 			assert.LessOrEqual(t, expectedExpiry.Sub(actual.ExpiresAt).Abs(), 10*time.Second)
 			assert.True(t, foundExpectedCockroachError.Load(), "We expect to find a not found error caused by ... FOR UPDATE SKIP LOCKED")
+		})
+
+		// Helpers for the manage-sessions persister batch tests below. Each
+		// helper creates an active session belonging to a fresh identity and
+		// returns both, so callers can mutate state independently across
+		// subtests without sharing fixtures.
+		newActiveSession := func(t *testing.T) *session.Session {
+			t.Helper()
+			var s session.Session
+			require.NoError(t, faker.FakeData(&s))
+			s.Active = true
+			require.NoError(t, p.CreateIdentity(ctx, s.Identity))
+			require.NoError(t, p.UpsertSession(ctx, &s))
+			return &s
+		}
+		isActive := func(t *testing.T, sID uuid.UUID) bool {
+			t.Helper()
+			s, err := p.GetSession(ctx, sID, session.ExpandNothing)
+			require.NoError(t, err)
+			return s.Active
+		}
+		exists := func(t *testing.T, sID uuid.UUID) bool {
+			t.Helper()
+			_, err := p.GetSession(ctx, sID, session.ExpandNothing)
+			if errors.Is(err, sqlcon.ErrNoRows()) {
+				return false
+			}
+			require.NoError(t, err)
+			return true
+		}
+
+		t.Run("case=RevokeSessionsByIdentities updates only matching active rows", func(t *testing.T) {
+			s1 := newActiveSession(t)
+			s2 := newActiveSession(t)
+			other := newActiveSession(t)
+
+			n, err := p.RevokeSessionsByIdentities(ctx, []uuid.UUID{s1.IdentityID, s2.IdentityID})
+			require.NoError(t, err)
+			assert.Equal(t, 2, n)
+			assert.False(t, isActive(t, s1.ID))
+			assert.False(t, isActive(t, s2.ID))
+			assert.True(t, isActive(t, other.ID), "untargeted session must stay active")
+
+			n, err = p.RevokeSessionsByIdentities(ctx, []uuid.UUID{s1.IdentityID})
+			require.NoError(t, err)
+			assert.Equal(t, 0, n, "already-inactive sessions must not be re-touched")
+		})
+
+		t.Run("case=RevokeSessionsByIdentities is network-isolated", func(t *testing.T) {
+			s := newActiveSession(t)
+			_, other := testhelpers.NewNetwork(t, ctx, p)
+			n, err := other.RevokeSessionsByIdentities(ctx, []uuid.UUID{s.IdentityID})
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+			assert.True(t, isActive(t, s.ID))
+		})
+
+		t.Run("case=RevokeSessionsByIdentities with empty slice is no-op", func(t *testing.T) {
+			n, err := p.RevokeSessionsByIdentities(ctx, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+		})
+
+		t.Run("case=RevokeSessionsByIDs updates only matching active rows", func(t *testing.T) {
+			s1 := newActiveSession(t)
+			s2 := newActiveSession(t)
+			untouched := newActiveSession(t)
+
+			n, err := p.RevokeSessionsByIDs(ctx, []uuid.UUID{s1.ID, s2.ID})
+			require.NoError(t, err)
+			assert.Equal(t, 2, n)
+			assert.False(t, isActive(t, s1.ID))
+			assert.False(t, isActive(t, s2.ID))
+			assert.True(t, isActive(t, untouched.ID))
+
+			n, err = p.RevokeSessionsByIDs(ctx, []uuid.UUID{s1.ID})
+			require.NoError(t, err)
+			assert.Equal(t, 0, n, "already-inactive sessions must not be re-touched")
+		})
+
+		t.Run("case=RevokeSessionsByIDs is network-isolated", func(t *testing.T) {
+			s := newActiveSession(t)
+			_, other := testhelpers.NewNetwork(t, ctx, p)
+			n, err := other.RevokeSessionsByIDs(ctx, []uuid.UUID{s.ID})
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+			assert.True(t, isActive(t, s.ID))
+		})
+
+		t.Run("case=RevokeSessionsByIDs with empty slice is no-op", func(t *testing.T) {
+			n, err := p.RevokeSessionsByIDs(ctx, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+		})
+
+		t.Run("case=RevokeAllSessions deactivates only currently-active rows in this network", func(t *testing.T) {
+			_, scoped := testhelpers.NewNetwork(t, ctx, p)
+			active1 := newActiveSession(t)
+			active2 := newActiveSession(t)
+
+			// Create one session that's already inactive, in the original network.
+			alreadyInactive := newActiveSession(t)
+			require.NoError(t, p.RevokeSessionById(ctx, alreadyInactive.ID))
+
+			// Create a session in the other network — must remain untouched.
+			var foreign session.Session
+			require.NoError(t, faker.FakeData(&foreign))
+			foreign.Active = true
+			require.NoError(t, scoped.CreateIdentity(ctx, foreign.Identity))
+			require.NoError(t, scoped.UpsertSession(ctx, &foreign))
+
+			n, err := p.RevokeAllSessions(ctx, 100)
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, n, 2, "must have flipped active1 and active2 at least")
+
+			assert.False(t, isActive(t, active1.ID))
+			assert.False(t, isActive(t, active2.ID))
+			// The foreign session must still be active when read via its own network.
+			fs, err := scoped.GetSession(ctx, foreign.ID, session.ExpandNothing)
+			require.NoError(t, err)
+			assert.True(t, fs.Active, "foreign-network session must not be touched")
+		})
+
+		t.Run("case=RevokeAllSessions caps the work at limit", func(t *testing.T) {
+			// Isolated network so previous tests can't influence the count.
+			_, scoped := testhelpers.NewNetwork(t, ctx, p)
+			ids := make([]uuid.UUID, 3)
+			for i := range ids {
+				var s session.Session
+				require.NoError(t, faker.FakeData(&s))
+				s.Active = true
+				require.NoError(t, scoped.CreateIdentity(ctx, s.Identity))
+				require.NoError(t, scoped.UpsertSession(ctx, &s))
+				ids[i] = s.ID
+			}
+
+			n, err := scoped.RevokeAllSessions(ctx, 2)
+			require.NoError(t, err)
+			assert.Equal(t, 2, n, "must flip exactly limit rows")
+
+			activeCount := 0
+			for _, id := range ids {
+				s, err := scoped.GetSession(ctx, id, session.ExpandNothing)
+				require.NoError(t, err)
+				if s.Active {
+					activeCount++
+				}
+			}
+			assert.Equal(t, 1, activeCount, "limit must leave one session active")
+		})
+
+		t.Run("case=DeleteSessionsByIdentities removes matching rows", func(t *testing.T) {
+			s1 := newActiveSession(t)
+			s2 := newActiveSession(t)
+			survivor := newActiveSession(t)
+
+			n, err := p.DeleteSessionsByIdentities(ctx, []uuid.UUID{s1.IdentityID, s2.IdentityID})
+			require.NoError(t, err)
+			assert.Equal(t, 2, n)
+			assert.False(t, exists(t, s1.ID))
+			assert.False(t, exists(t, s2.ID))
+			assert.True(t, exists(t, survivor.ID))
+		})
+
+		t.Run("case=DeleteSessionsByIdentities is network-isolated", func(t *testing.T) {
+			s := newActiveSession(t)
+			_, other := testhelpers.NewNetwork(t, ctx, p)
+			n, err := other.DeleteSessionsByIdentities(ctx, []uuid.UUID{s.IdentityID})
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+			assert.True(t, exists(t, s.ID))
+		})
+
+		t.Run("case=DeleteSessionsByIDs removes matching rows", func(t *testing.T) {
+			s1 := newActiveSession(t)
+			s2 := newActiveSession(t)
+			survivor := newActiveSession(t)
+
+			n, err := p.DeleteSessionsByIDs(ctx, []uuid.UUID{s1.ID, s2.ID})
+			require.NoError(t, err)
+			assert.Equal(t, 2, n)
+			assert.False(t, exists(t, s1.ID))
+			assert.False(t, exists(t, s2.ID))
+			assert.True(t, exists(t, survivor.ID))
+		})
+
+		t.Run("case=DeleteSessionsByIDs is network-isolated", func(t *testing.T) {
+			s := newActiveSession(t)
+			_, other := testhelpers.NewNetwork(t, ctx, p)
+			n, err := other.DeleteSessionsByIDs(ctx, []uuid.UUID{s.ID})
+			require.NoError(t, err)
+			assert.Equal(t, 0, n)
+			assert.True(t, exists(t, s.ID))
+		})
+
+		t.Run("case=DeleteAllSessions removes only this network's rows", func(t *testing.T) {
+			_, scoped := testhelpers.NewNetwork(t, ctx, p)
+			s1 := newActiveSession(t)
+			s2 := newActiveSession(t)
+
+			var foreign session.Session
+			require.NoError(t, faker.FakeData(&foreign))
+			foreign.Active = true
+			require.NoError(t, scoped.CreateIdentity(ctx, foreign.Identity))
+			require.NoError(t, scoped.UpsertSession(ctx, &foreign))
+
+			n, err := p.DeleteAllSessions(ctx, 100)
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, n, 2)
+
+			assert.False(t, exists(t, s1.ID))
+			assert.False(t, exists(t, s2.ID))
+
+			fs, err := scoped.GetSession(ctx, foreign.ID, session.ExpandNothing)
+			require.NoError(t, err)
+			assert.NotNil(t, fs, "foreign-network session must survive")
 		})
 	}
 }

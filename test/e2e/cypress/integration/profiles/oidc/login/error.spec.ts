@@ -29,6 +29,7 @@ context("Social Sign In Errors", () => {
         cy.visit(login)
       })
 
+      // playwright:migrated
       it("should fail when the login request is rejected", () => {
         cy.triggerOidc(app)
         cy.get("#reject").click()
@@ -40,6 +41,7 @@ context("Social Sign In Errors", () => {
         cy.noSession()
       })
 
+      // playwright:migrated
       it("should fail when the consent request is rejected", () => {
         const email = gen.email()
         cy.triggerOidc(app)

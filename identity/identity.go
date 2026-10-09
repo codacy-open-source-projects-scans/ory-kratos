@@ -21,6 +21,7 @@ import (
 	"github.com/ory/kratos/cipher"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/x/pagination/keysetpagination"
+	"github.com/ory/x/region"
 	"github.com/ory/x/sqlxx"
 )
 
@@ -139,6 +140,10 @@ type Identity struct {
 	UpdatedAt      time.Time     `json:"updated_at" db:"updated_at"`
 	NID            uuid.UUID     `json:"-"  faker:"-" db:"nid"`
 	OrganizationID uuid.NullUUID `json:"organization_id,omitempty"  faker:"-" db:"organization_id"`
+
+	// Region is the Ory Network region this identity is homed in. Set by
+	// the multi-region persister; empty on OSS and single-region deployments.
+	Region region.Region `json:"region,omitempty" db:"-"`
 }
 
 func (i *Identity) PageToken() keysetpagination.PageToken {
@@ -536,6 +541,23 @@ func (i *Identity) WithDeclassifiedCredentials(ctx context.Context, c cipher.Pro
 				return true
 			})
 
+			if err != nil {
+				return nil, err
+			}
+
+			credsToPublish[ct] = toPublish
+		case CredentialsTypeDeviceAuthn:
+			// The deviceauthn config stores per-key PIN state, including
+			// `pin_secret`, the at-rest HPKE ciphertext of the user's PIN
+			// secret. Strip the whole `pin` object from every key before
+			// publishing so the admin include_credential path never leaks it.
+			toPublish := original
+
+			var err error
+			gjson.GetBytes(original.Config, "credentials").ForEach(func(key, _ gjson.Result) bool {
+				toPublish.Config, err = sjson.DeleteBytes(toPublish.Config, fmt.Sprintf("credentials.%d.pin", key.Int()))
+				return err == nil
+			})
 			if err != nil {
 				return nil, err
 			}

@@ -41,6 +41,7 @@ import (
 	"github.com/ory/x/networkx"
 	"github.com/ory/x/otelx"
 	"github.com/ory/x/otelx/semconv"
+	"github.com/ory/x/popx"
 	"github.com/ory/x/prometheusx"
 	"github.com/ory/x/reqlog"
 	"github.com/ory/x/urlx"
@@ -62,7 +63,6 @@ func servePublic(ctx context.Context, r *driver.RegistryDefault, cmd *cobra.Comm
 	router := httprouterx.NewRouterPublic()
 	n := negroni.New(
 		rec,
-		httprouterx.PopulatePatternNegroni(router),
 		httpMetrics,
 	)
 
@@ -82,7 +82,7 @@ func servePublic(ctx context.Context, r *driver.RegistryDefault, cmd *cobra.Comm
 	n.UseFunc(httprouterx.NoCacheNegroni)
 	n.Use(sqa(ctx, cmd, r))
 
-	csrf := nosurfx.NewCSRFHandler(otelx.SpanNameRecorderMiddleware(router), r)
+	csrf := nosurfx.NewCSRFHandler(router, r)
 
 	// we need to always load the CORS middleware even if it is disabled, to allow hot-enabling CORS
 	n.UseFunc(func(w http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
@@ -163,7 +163,6 @@ func serveAdmin(ctx context.Context, r *driver.RegistryDefault, cmd *cobra.Comma
 	router := httprouterx.NewRouterAdminWithPrefix()
 	n := negroni.New(
 		rec,
-		httprouterx.PopulatePatternNegroni(router),
 		httpMetrics,
 	)
 
@@ -190,8 +189,6 @@ func serveAdmin(ctx context.Context, r *driver.RegistryDefault, cmd *cobra.Comma
 	r.RegisterAdminRoutes(ctx, router)
 
 	n.UseHandler(router)
-
-	n.UseFunc(otelx.SpanNameRecorderNegroniFunc)
 
 	var handler http.Handler = n
 	if tracer := r.Tracer(ctx); tracer.IsLoaded() {
@@ -268,7 +265,7 @@ func sqa(ctx context.Context, cmd *cobra.Command, d driver.Registry) *metricsx.S
 		&metricsx.Options{
 			Service:       "kratos",
 			DeploymentId:  metricsx.Hash(d.Persister().NetworkID(ctx).String()),
-			DBDialect:     d.Persister().GetConnection(ctx).Dialect.Details().Dialect,
+			DBDialect:     d.Persister().GetConnection(ctx).Dialect.Name(),
 			IsDevelopment: d.Config().IsInsecureDevMode(ctx),
 			WriteKey:      "qQlI6q8Q4WvkzTjKQSor4sHYOikHIvvi",
 			WhitelistedPaths: []string{
@@ -347,6 +344,10 @@ func ServeAll(d *driver.RegistryDefault) func(cmd *cobra.Command, args []string)
 		ctx := cmd.Context()
 		g, ctx := errgroup.WithContext(ctx)
 		cmd.SetContext(ctx)
+
+		if err := popx.VerifyDialect(ctx, d.Persister().GetConnection(ctx)); err != nil {
+			return errors.WithStack(err)
+		}
 
 		// construct all tasks upfront to avoid race conditions
 		publicSrv, err := servePublic(ctx, d, cmd)

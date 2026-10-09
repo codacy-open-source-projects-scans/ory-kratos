@@ -7,6 +7,7 @@ import (
 	"context"
 
 	"github.com/ory/kratos/x"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/crdbx"
 	"github.com/ory/x/pagination/keysetpagination"
 	"github.com/ory/x/sqlxx"
@@ -20,6 +21,41 @@ func NewUpdateIdentityOptions(opts []UpdateIdentityModifier) UpdateIdentityOptio
 		opt(&o)
 	}
 	return o
+}
+
+// NewCreateIdentitiesOptions parses CreateIdentities modifiers.
+func NewCreateIdentitiesOptions(opts []CreateIdentitiesModifier) *CreateIdentitiesOptions {
+	o := &CreateIdentitiesOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+// WithExtraColumns appends fixed (key, value) columns to a batch insert.
+func WithExtraColumns(cols []ExtraColumn) CreateIdentitiesModifier {
+	return func(o *CreateIdentitiesOptions) {
+		o.ExtraColumns = append(o.ExtraColumns, cols...)
+	}
+}
+
+// NewUpdateCredentialsConfigOptions parses UpdateCredentialsConfig modifiers.
+func NewUpdateCredentialsConfigOptions(opts []UpdateCredentialsConfigModifier) *UpdateCredentialsConfigOptions {
+	o := &UpdateCredentialsConfigOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+// WithDerivedIdentifiers syncs the credential's identifier rows to the set
+// derived from the post-mutation config, inside the same locked transaction.
+// Like mutate, derive must be pure: it may run more than once on database
+// retries.
+func WithDerivedIdentifiers(derive func(newConfig []byte) ([]string, error)) UpdateCredentialsConfigModifier {
+	return func(o *UpdateCredentialsConfigOptions) {
+		o.DeriveIdentifiers = derive
+	}
 }
 
 // DiffAgainst instructs UpdateIdentity to attempt a minimal update of the
@@ -38,6 +74,33 @@ func (o UpdateIdentityOptions) FromDatabase() *Identity {
 	return o.fromDatabase
 }
 
+// WithoutCredentialTypes excludes the given credential types from the
+// credential-association diff: their rows are neither deleted, recreated,
+// nor updated by UpdateIdentity, and the returned identity carries their
+// database state instead of the in-memory one. Use it for credential types
+// whose rows are persisted through UpdateCredentialsConfig.
+func WithoutCredentialTypes(cts ...CredentialsType) UpdateIdentityModifier {
+	return func(o *UpdateIdentityOptions) {
+		o.excludedCredentialTypes = append(o.excludedCredentialTypes, cts...)
+	}
+}
+
+func (o UpdateIdentityOptions) ExcludedCredentialTypes() []CredentialsType {
+	return o.excludedCredentialTypes
+}
+
+// WithUpdateExtraColumns appends fixed (key, value) columns to the inserts
+// that UpdateIdentity performs for associated rows (addresses, credentials).
+func WithUpdateExtraColumns(cols []ExtraColumn) UpdateIdentityModifier {
+	return func(o *UpdateIdentityOptions) {
+		o.extraColumns = append(o.extraColumns, cols...)
+	}
+}
+
+func (o UpdateIdentityOptions) ExtraColumns() []ExtraColumn {
+	return o.extraColumns
+}
+
 type (
 	ListIdentityParameters struct {
 		Expand                       Expandables
@@ -50,14 +113,46 @@ type (
 		ConsistencyLevel             crdbx.ConsistencyLevel
 		StatementTransformer         func(string) string
 
+		// ColumnsTransformer rewrites the SELECT column list to add extra
+		// columns the persister scans. Must be set together with RowScanner;
+		// the persister rejects the call if only one is provided.
+		ColumnsTransformer func(string) string
+
+		// RowScanner replaces the default scan into []Identity to consume
+		// the extra columns added by ColumnsTransformer. Must be set together
+		// with ColumnsTransformer.
+		RowScanner func(con *pop.Connection, query string, args []any) ([]Identity, error)
+
 		// DEPRECATED
 		PagePagination *x.Page
 	}
 
 	UpdateIdentityModifier func(*UpdateIdentityOptions)
 	UpdateIdentityOptions  struct {
-		fromDatabase *Identity
+		fromDatabase            *Identity
+		excludedCredentialTypes []CredentialsType
+		extraColumns            []ExtraColumn
 	}
+
+	// ExtraColumn carries a (key, value) pair for an extra SQL column on a
+	// batch insert (e.g. crdb_region) without coupling Identity to it.
+	ExtraColumn struct {
+		K string
+		V any
+	}
+
+	CreateIdentitiesOptions struct {
+		ExtraColumns []ExtraColumn
+	}
+
+	CreateIdentitiesModifier func(*CreateIdentitiesOptions)
+
+	UpdateCredentialsConfigOptions struct {
+		ExtraColumns      []ExtraColumn
+		DeriveIdentifiers func(newConfig []byte) ([]string, error)
+	}
+
+	UpdateCredentialsConfigModifier func(*UpdateCredentialsConfigOptions)
 
 	Pool interface {
 		// ListIdentities lists all identities in the store given the page and itemsPerPage.
@@ -76,8 +171,8 @@ type (
 		// FindRecoveryAddressByValue returns a matching address or sql.ErrNoRows if no address could be found.
 		FindRecoveryAddressByValue(ctx context.Context, via, address string) (*RecoveryAddress, error)
 
-		// FindAllRecoveryAddressesForIdentityByRecoveryAddressValue finds all recovery addresses for an identity if at least one of its recovery addresses matches the provided value.
-		FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx context.Context, anyRecoveryAddress string) ([]RecoveryAddress, error)
+		// FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue finds the values of all recovery addresses for an identity if at least one of its recovery addresses matches the provided value.
+		FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx context.Context, anyRecoveryAddress string) ([]string, error)
 	}
 
 	PoolProvider interface {
@@ -111,13 +206,29 @@ type (
 
 		// CreateIdentities creates multiple identities. It is capable of setting credentials without encoding. Will return an error
 		// if identity exists, backend connectivity is broken, or trait validation fails.
-		CreateIdentities(context.Context, ...*Identity) error
+		CreateIdentities(ctx context.Context, identities []*Identity, opts ...CreateIdentitiesModifier) error
 
 		// UpdateIdentity updates an identity including its confidential / privileged / protected data.
 		UpdateIdentity(context.Context, *Identity, ...UpdateIdentityModifier) error
 
 		// UpdateIdentityColumns updates targeted columns of an identity.
 		UpdateIdentityColumns(ctx context.Context, i *Identity, columns ...string) error
+
+		// UpdateCredentialsConfig atomically read-modify-writes a single
+		// identity_credentials row's config under an exclusive row lock:
+		// concurrent updates serialize and mutate always observes the latest
+		// committed config. Use it for credential-content decisions that must
+		// be mutually exclusive (PIN lockout counter, webauthn clone counter);
+		// wrap mutate with UpdateConfig for typed configs.
+		// mutate must be pure (it may run more than once on database retries);
+		// a structurally unchanged result skips the write; the version column
+		// (the config's schema version) is untouched. Calls inside a
+		// surrounding transaction are rejected.
+		// opts may narrow the row set with ExtraColumns (the cloud
+		// multi-region persister pins crdb_region) and sync the credential's
+		// identifier rows to the post-mutation config with
+		// WithDerivedIdentifiers.
+		UpdateCredentialsConfig(ctx context.Context, identityID uuid.UUID, ct CredentialsType, mutate func(config []byte) ([]byte, error), opts ...UpdateCredentialsConfigModifier) error
 
 		// GetIdentityConfidential returns the identity including it's raw credentials.
 		//

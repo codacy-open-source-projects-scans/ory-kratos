@@ -203,7 +203,7 @@ func (s *Strategy) Recover(w http.ResponseWriter, r *http.Request, f *recovery.F
 		}
 	}
 
-	if _, err := s.deps.SessionManager().FetchFromRequest(ctx, r); err == nil {
+	if err := s.deps.SessionManager().SessionActiveForRequest(ctx, r); err == nil {
 		// User is already logged in
 		if x.IsJSONRequest(r) {
 			session.RespondWithJSONErrorOnAuthenticated(s.deps.Writer(), recovery.ErrAlreadyLoggedIn())(w, r)
@@ -226,7 +226,7 @@ func (s *Strategy) Recover(w http.ResponseWriter, r *http.Request, f *recovery.F
 		return s.HandleRecoveryError(w, r, recoveryFlow, body, err)
 	}
 
-	if err := recoveryFlow.Valid(); err != nil {
+	if err := recoveryFlow.Valid(s.deps.Clock()); err != nil {
 		return s.HandleRecoveryError(w, r, recoveryFlow, body, err)
 	}
 
@@ -321,7 +321,7 @@ func (s *Strategy) recoveryIssueSession(w http.ResponseWriter, r *http.Request, 
 
 	config := s.deps.Config()
 
-	sf.UI.Messages.Set(text.NewRecoverySuccessful(time.Now().Add(config.SelfServiceFlowSettingsPrivilegedSessionMaxAge(ctx))))
+	sf.UI.Messages.Set(text.NewRecoverySuccessful(s.deps.Clock(), s.deps.Clock().Now().Add(config.SelfServiceFlowSettingsPrivilegedSessionMaxAge(ctx))))
 	if err := s.deps.SettingsFlowPersister().UpdateSettingsFlow(r.Context(), sf); err != nil {
 		return s.retryRecoveryFlow(w, r, f.Type, RetryWithError(err))
 	}
@@ -422,7 +422,7 @@ func (s *Strategy) retryRecoveryFlow(w http.ResponseWriter, r *http.Request, ft 
 	ctx := r.Context()
 	config := s.deps.Config()
 
-	f, err := recovery.NewFlow(config, config.SelfServiceFlowRecoveryRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, recovery.Strategies{s}, ft)
+	f, err := recovery.NewFlow(s.deps, config.SelfServiceFlowRecoveryRequestLifespan(ctx), s.deps.CSRFHandler().RegenerateToken(w, r), r, recovery.Strategies{s}, ft)
 	if err != nil {
 		return err
 	}
@@ -433,7 +433,7 @@ func (s *Strategy) retryRecoveryFlow(w http.ResponseWriter, r *http.Request, ft 
 
 	if retryOptions.err != nil {
 		if expired := new(flow.ExpiredError); errors.As(retryOptions.err, &expired) {
-			f.UI.Messages.Add(text.NewErrorValidationRecoveryFlowExpired(expired.ExpiredAt))
+			f.UI.Messages.Add(text.NewErrorValidationRecoveryFlowExpired(s.deps.Clock(), expired.ExpiredAt))
 		} else if err := f.UI.ParseError(node.CodeGroup, retryOptions.err); err != nil {
 			return err
 		}
@@ -481,7 +481,7 @@ func (s *Strategy) recoveryV2HandleStateAwaitingAddress(r *http.Request, f *reco
 	}
 
 	// Need to retrieve all possible recovery addresses and present a choice.
-	recoveryAddresses, err := s.deps.IdentityPool().FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
+	recoveryAddresses, err := s.deps.IdentityPool().FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
 	// Real error.
 	if err != nil && !errors.Is(err, sqlcon.ErrNoRows()) {
 		return err
@@ -491,12 +491,12 @@ func (s *Strategy) recoveryV2HandleStateAwaitingAddress(r *http.Request, f *reco
 	if len(recoveryAddresses) == 0 {
 		// To avoid an attacker from using this case to probe for existing addresses, we pretend it exists.
 		// This is the same behavior as in Recovery V1.
-		recoveryAddresses = append(recoveryAddresses, identity.RecoveryAddress{Value: body.RecoveryAddress})
+		recoveryAddresses = append(recoveryAddresses, body.RecoveryAddress)
 	}
 
 	f.State = flow.StateRecoveryAwaitingAddressChoice
 
-	if len(recoveryAddresses) == 1 && recoveryAddresses[0].Value == body.RecoveryAddress {
+	if len(recoveryAddresses) == 1 && recoveryAddresses[0] == body.RecoveryAddress {
 		// Skip two states for convenience:
 		// - No need to present a choice with only one option
 		// - No need to ask for the full address if there is only one and it was just provided in full
@@ -522,20 +522,18 @@ func (s *Strategy) recoveryV2HandleStateAwaitingAddress(r *http.Request, f *reco
 	f.State = flow.StateRecoveryAwaitingAddressChoice
 	f.UI.Messages.Set(text.NewRecoveryAskToChooseAddress())
 
-	slices.SortFunc(recoveryAddresses, func(a, b identity.RecoveryAddress) int {
-		return strings.Compare(a.Value, b.Value)
-	})
+	slices.Sort(recoveryAddresses)
 
 	for _, a := range recoveryAddresses {
 		// NOTE: Only send the masked value and the hash, to avoid information exfiltration.
 		// Why the hash? So that we can recognize later, when the user chooses the masked address in the list,
 		// that the chosen masked address is the `recovery_address` provided in the beginning,
 		// and then we do not ask again the user to provide it in full.
-		hashBase64 := AddressToHashBase64(a.Value)
+		hashBase64 := AddressToHashBase64(a)
 		f.UI.GetNodes().Append(node.NewInputField("recovery_select_address", hashBase64, node.CodeGroup, node.InputAttributeTypeSubmit).
 			WithMetaLabel(&text.Message{
 				ID:   text.InfoNodeLabel,
-				Text: MaskAddress(a.Value),
+				Text: MaskAddress(a),
 				Type: text.Info,
 			}))
 	}
@@ -592,11 +590,11 @@ func (s *Strategy) recoveryV2HandleStateAwaitingAddressChoice(r *http.Request, f
 
 	// Retrieve the selected recovery address in plaintext to determine the input label and type.
 	var plaintextRecoveryAddress string
-	recoveryAddresses, err := s.deps.IdentityPool().FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
+	recoveryAddresses, err := s.deps.IdentityPool().FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
 	if err == nil {
 		for _, a := range recoveryAddresses {
-			if subtle.ConstantTimeCompare([]byte(AddressToHashBase64(a.Value)), []byte(body.RecoverySelectAddress)) == 1 {
-				plaintextRecoveryAddress = a.Value
+			if subtle.ConstantTimeCompare([]byte(AddressToHashBase64(a)), []byte(body.RecoverySelectAddress)) == 1 {
+				plaintextRecoveryAddress = a
 				break
 			}
 		}
@@ -684,6 +682,7 @@ func (s *Strategy) recoveryV2HandleStateConfirmingAddress(r *http.Request, f *re
 		a.Required = true
 		a.Pattern = "[0-9]+"
 		a.MaxLength = CodeLength
+		a.Autocomplete = node.InputAttributeAutocompleteOneTimeCode
 	})).
 		WithMetaLabel(text.NewInfoNodeLabelRecoveryCode()),
 	)
@@ -728,7 +727,7 @@ func (s *Strategy) recoveryV2HandleStateAwaitingCode(w http.ResponseWriter, r *h
 
 func (s *Strategy) recoveryV2HandleGoBack(r *http.Request, f *recovery.Flow, body *recoverySubmitPayload) error {
 	// If no address choice needs to take place, just go to the first screen.
-	recoveryAddresses, _ := s.deps.IdentityPool().FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
+	recoveryAddresses, _ := s.deps.IdentityPool().FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(r.Context(), body.RecoveryAddress)
 	if len(recoveryAddresses) <= 1 {
 		f.State = flow.StateRecoveryAwaitingAddress
 		err := s.PopulateRecoveryMethod(r, f)
@@ -807,6 +806,7 @@ func (s *Strategy) recoveryHandleFormSubmission(w http.ResponseWriter, r *http.R
 		a.Required = true
 		a.Pattern = "[0-9]+"
 		a.MaxLength = CodeLength
+		a.Autocomplete = node.InputAttributeAutocompleteOneTimeCode
 	})).
 		WithMetaLabel(text.NewInfoNodeLabelRecoveryCode()),
 	)

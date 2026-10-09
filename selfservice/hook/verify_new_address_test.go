@@ -24,8 +24,10 @@ import (
 	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/selfservice/hook"
 	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/ui/container"
 	"github.com/ory/kratos/x"
+	"github.com/ory/x/contextx"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
@@ -35,13 +37,13 @@ func TestVerifyNewAddress(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	setup := func(t *testing.T) (*config.Config, *hook.VerifyNewAddress, *driver.RegistryDefault) {
-		conf, reg := pkg.NewFastRegistryWithMocks(t)
-		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/verify_single_email.schema.json")
-		conf.MustSet(ctx, config.ViperKeyPublicBaseURL, "https://www.ory.sh/")
-		conf.MustSet(ctx, config.ViperKeyCourierSMTPURL, "smtp://foo@bar@dev.null/")
+	setup := func(t *testing.T) (context.Context, *hook.VerifyNewAddress, *driver.RegistryDefault) {
+		_, reg := pkg.NewFastRegistryWithMocks(t)
+		ctx := testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/verify_single_email.schema.json")
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeyPublicBaseURL, "https://www.ory.sh/")
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeyCourierSMTPURL, "smtp://foo@bar@dev.null/")
 		h := hook.NewVerifyNewAddress(reg)
-		return conf, h, reg
+		return ctx, h, reg
 	}
 
 	newSettingsFlow := func(t *testing.T, i identity.Identity) *settings.Flow {
@@ -90,7 +92,7 @@ func TestVerifyNewAddress(t *testing.T) {
 
 	t.Run("case=no-op when address does not change", func(t *testing.T) {
 		t.Parallel()
-		_, h, reg := setup(t)
+		ctx, h, reg := setup(t)
 
 		original := createIdentity(t, ctx, reg, "old@example.com", true)
 		f := newSettingsFlow(t, *original)
@@ -109,13 +111,17 @@ func TestVerifyNewAddress(t *testing.T) {
 		r = r.WithContext(ctx)
 		w := httptest.NewRecorder()
 
-		err := h.ExecuteSettingsPrePersistHook(w, r, f, proposed, sess)
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
 		require.NoError(t, err, "hook should be a no-op when address did not change")
 	})
 
 	t.Run("case=aborts flow when address changes", func(t *testing.T) {
 		t.Parallel()
-		_, h, reg := setup(t)
+		ctx, h, reg := setup(t)
 
 		original := createIdentity(t, ctx, reg, "old@example.com", true)
 		f := newSettingsFlow(t, *original)
@@ -141,7 +147,11 @@ func TestVerifyNewAddress(t *testing.T) {
 		r = r.WithContext(ctx)
 		w := httptest.NewRecorder()
 
-		err := h.ExecuteSettingsPrePersistHook(w, r, f, proposed, sess)
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
 		require.Error(t, err)
 		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
 
@@ -177,7 +187,7 @@ func TestVerifyNewAddress(t *testing.T) {
 
 	t.Run("case=previous pending changes are deleted on new submission", func(t *testing.T) {
 		t.Parallel()
-		_, h, reg := setup(t)
+		ctx, h, reg := setup(t)
 
 		original := createIdentity(t, ctx, reg, "old@example.com", true)
 
@@ -205,7 +215,11 @@ func TestVerifyNewAddress(t *testing.T) {
 		r = r.WithContext(ctx)
 		w := httptest.NewRecorder()
 
-		err := h.ExecuteSettingsPrePersistHook(w, r, f1, proposed1, sess)
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f1,
+			Identity: proposed1,
+			Session:  sess,
+		})
 		require.True(t, errors.Is(err, settings.ErrHookAbortFlow))
 
 		vfID1 := f1.ContinueWith()[0].(*flow.ContinueWithVerificationUI).Flow.ID
@@ -229,7 +243,11 @@ func TestVerifyNewAddress(t *testing.T) {
 		}
 
 		w2 := httptest.NewRecorder()
-		err = h.ExecuteSettingsPrePersistHook(w2, r, f2, proposed2, sess)
+		err = h.ExecuteSettingsPrePersistHook(w2, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f2,
+			Identity: proposed2,
+			Session:  sess,
+		})
 		require.True(t, errors.Is(err, settings.ErrHookAbortFlow))
 
 		vfID2 := f2.ContinueWith()[0].(*flow.ContinueWithVerificationUI).Flow.ID
@@ -244,8 +262,8 @@ func TestVerifyNewAddress(t *testing.T) {
 
 	t.Run("case=correctly detects change with two email addresses", func(t *testing.T) {
 		t.Parallel()
-		conf, h, reg := setup(t)
-		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/verify_two_emails.schema.json")
+		ctx, h, reg := setup(t)
+		ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/verify_two_emails.schema.json")
 
 		i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
 		i.Traits = identity.Traits(`{"email":"primary@example.com","recovery_email":"recovery@example.com","name":"Test"}`)
@@ -280,7 +298,11 @@ func TestVerifyNewAddress(t *testing.T) {
 		r = r.WithContext(ctx)
 		w := httptest.NewRecorder()
 
-		err := h.ExecuteSettingsPrePersistHook(w, r, f, proposed, sess)
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
 		// Should abort with exactly one changed address (not two, not zero).
 		require.Error(t, err)
 		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
@@ -298,8 +320,8 @@ func TestVerifyNewAddress(t *testing.T) {
 
 	t.Run("case=no-op with two unchanged email addresses", func(t *testing.T) {
 		t.Parallel()
-		conf, h, reg := setup(t)
-		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/verify_two_emails.schema.json")
+		ctx, h, reg := setup(t)
+		ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/verify_two_emails.schema.json")
 
 		i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
 		i.Traits = identity.Traits(`{"email":"primary@example.com","recovery_email":"recovery@example.com","name":"Test"}`)
@@ -324,15 +346,115 @@ func TestVerifyNewAddress(t *testing.T) {
 		r = r.WithContext(ctx)
 		w := httptest.NewRecorder()
 
-		err := h.ExecuteSettingsPrePersistHook(w, r, f, proposed, sess)
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
 		require.NoError(t, err, "hook should be a no-op when no addresses changed")
 		assert.Empty(t, f.ContinueWith())
 	})
 
+	t.Run("case=rejects change when new address is already owned by another identity", func(t *testing.T) {
+		t.Parallel()
+		ctx, h, reg := setup(t)
+
+		_ = createIdentity(t, ctx, reg, "existing@example.com", true)
+
+		original := createIdentity(t, ctx, reg, "other@example.com", true)
+		f := newSettingsFlow(t, *original)
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, f))
+
+		proposed := &identity.Identity{
+			ID:     original.ID,
+			Traits: identity.Traits(`{"email":"existing@example.com","name":"Test"}`),
+			VerifiableAddresses: []identity.VerifiableAddress{
+				{Value: "existing@example.com", Via: identity.AddressTypeEmail, IdentityID: original.ID},
+			},
+		}
+
+		sess := &session.Session{
+			ID:              x.NewUUID(),
+			Identity:        original,
+			Token:           randx.MustString(12, randx.AlphaLowerNum),
+			LogoutToken:     randx.MustString(12, randx.AlphaLowerNum),
+			AuthenticatedAt: time.Now(),
+		}
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+		r := &http.Request{URL: urlx.ParseOrPanic("https://www.ory.sh/")}
+		r = r.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
+		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
+
+		// Flow should carry the duplicate credentials error — no redirect to verification.
+		assert.Empty(t, f.ContinueWith(), "should not start a verification flow")
+		require.NotEmpty(t, f.UI.Messages)
+		assert.Contains(t, f.UI.Messages[0].Text, "exists already")
+	})
+
+	t.Run("case=rejects change when new phone number is already owned by another identity", func(t *testing.T) {
+		t.Parallel()
+		ctx, h, reg := setup(t)
+		ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/verify_email_and_phone.schema.json")
+
+		existing := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		existing.Traits = identity.Traits(`{"email":"phone-existing@example.com","phone":"+19999999999","name":"Existing"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, existing))
+		verifyAllAddresses(t, ctx, reg, existing)
+
+		original := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		original.Traits = identity.Traits(`{"email":"phone-original@example.com","phone":"+10000000000","name":"Original"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, original))
+		original = verifyAllAddresses(t, ctx, reg, original)
+
+		f := newSettingsFlow(t, *original)
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, f))
+
+		// Proposed: email unchanged, phone changed to the existing's number.
+		proposed := &identity.Identity{
+			ID:     original.ID,
+			Traits: identity.Traits(`{"email":"phone-original@example.com","phone":"+19999999999","name":"Original"}`),
+			VerifiableAddresses: []identity.VerifiableAddress{
+				{Value: "phone-original@example.com", Via: identity.AddressTypeEmail, IdentityID: original.ID},
+				{Value: "+19999999999", Via: identity.AddressTypeSMS, IdentityID: original.ID},
+			},
+		}
+
+		sess := &session.Session{
+			ID:              x.NewUUID(),
+			Identity:        original,
+			Token:           randx.MustString(12, randx.AlphaLowerNum),
+			LogoutToken:     randx.MustString(12, randx.AlphaLowerNum),
+			AuthenticatedAt: time.Now(),
+		}
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+		r := &http.Request{URL: urlx.ParseOrPanic("https://www.ory.sh/")}
+		r = r.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
+		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
+
+		// Flow should carry the duplicate credentials error — no redirect to verification.
+		assert.Empty(t, f.ContinueWith(), "should not start a verification flow")
+		require.NotEmpty(t, f.UI.Messages)
+		assert.Contains(t, f.UI.Messages[0].Text, "exists already")
+	})
+
 	t.Run("case=returns error when multiple addresses change at once", func(t *testing.T) {
 		t.Parallel()
-		conf, h, reg := setup(t)
-		testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/verify_email_and_phone.schema.json")
+		ctx, h, reg := setup(t)
+		ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/verify_email_and_phone.schema.json")
 
 		i := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
 		i.Traits = identity.Traits(`{"email":"old@example.com","phone":"+12345678901","name":"Test"}`)
@@ -357,11 +479,128 @@ func TestVerifyNewAddress(t *testing.T) {
 		r = r.WithContext(ctx)
 		w := httptest.NewRecorder()
 
-		err := h.ExecuteSettingsPrePersistHook(w, r, f, proposed, sess)
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
 		require.Error(t, err)
 		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
 
 		// The flow should contain the too-many-address-changes error message.
 		require.NotEmpty(t, f.UI.Messages)
+	})
+
+	t.Run("case=SMS verification flow shows the phone code-sent message, not the email one", func(t *testing.T) {
+		t.Parallel()
+		ctx, h, reg := setup(t)
+		ctx = testhelpers.WithDefaultIdentitySchema(ctx, "file://./stub/verify_email_and_phone.schema.json")
+		// Configure an SMS courier channel so the verification code can be queued for a phone number.
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeyCourierChannels, []map[string]any{
+			{"id": "sms", "type": "http", "request_config": map[string]any{
+				"url":    "http://localhost:1234/sms",
+				"method": "POST",
+				"body":   "base64://ZnVuY3Rpb24oY3R4KSBjdHg=",
+			}},
+		})
+
+		original := identity.NewIdentity(config.DefaultIdentityTraitsSchemaID)
+		original.Traits = identity.Traits(`{"email":"sms-msg@example.com","phone":"+10000000000","name":"Test"}`)
+		require.NoError(t, reg.IdentityManager().Create(ctx, original))
+		original = verifyAllAddresses(t, ctx, reg, original)
+
+		f := newSettingsFlow(t, *original)
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, f))
+
+		// Proposed: email unchanged, phone changed to a new, unowned number.
+		const newPhone = "+19876543210"
+		proposed := &identity.Identity{
+			ID:     original.ID,
+			Traits: identity.Traits(`{"email":"sms-msg@example.com","phone":"` + newPhone + `","name":"Test"}`),
+			VerifiableAddresses: []identity.VerifiableAddress{
+				{Value: "sms-msg@example.com", Via: identity.AddressTypeEmail, IdentityID: original.ID},
+				{Value: newPhone, Via: identity.AddressTypeSMS, IdentityID: original.ID},
+			},
+		}
+
+		sess := &session.Session{
+			ID:              x.NewUUID(),
+			Identity:        original,
+			Token:           randx.MustString(12, randx.AlphaLowerNum),
+			LogoutToken:     randx.MustString(12, randx.AlphaLowerNum),
+			AuthenticatedAt: time.Now(),
+		}
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+		r := &http.Request{URL: urlx.ParseOrPanic("https://www.ory.sh/")}
+		r = r.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
+		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
+
+		require.NotEmpty(t, f.ContinueWith(), "settings flow should redirect to verification")
+		vfID := f.ContinueWith()[0].(*flow.ContinueWithVerificationUI).Flow.ID
+		vf, err := reg.VerificationFlowPersister().GetVerificationFlow(ctx, vfID)
+		require.NoError(t, err)
+
+		// An SMS verification must show only the phone "code has been sent" message,
+		// never the email wording.
+		require.Len(t, vf.UI.Messages, 1, "expected exactly one code-sent message")
+		assert.Equal(t, text.InfoSelfServiceVerificationPhoneWithCodeSent, vf.UI.Messages[0].ID)
+	})
+
+	t.Run("case=link strategy verification flow does not claim a code was sent", func(t *testing.T) {
+		t.Parallel()
+		ctx, h, reg := setup(t)
+		// Use the legacy link strategy as the primary verification method. It
+		// delivers a link, not a code, and sets no "code sent" message.
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceStrategyConfig+".link.enabled", true)
+		ctx = contextx.WithConfigValue(ctx, config.ViperKeySelfServiceVerificationUse, "link")
+
+		original := createIdentity(t, ctx, reg, "link-msg@example.com", true)
+
+		f := newSettingsFlow(t, *original)
+		require.NoError(t, reg.SettingsFlowPersister().CreateSettingsFlow(ctx, f))
+
+		const newEmail = "link-msg-new@example.com"
+		proposed := &identity.Identity{
+			ID:     original.ID,
+			Traits: identity.Traits(`{"email":"` + newEmail + `","name":"Test"}`),
+			VerifiableAddresses: []identity.VerifiableAddress{
+				{Value: newEmail, Via: identity.AddressTypeEmail, IdentityID: original.ID},
+			},
+		}
+
+		sess := &session.Session{
+			ID:              x.NewUUID(),
+			Identity:        original,
+			Token:           randx.MustString(12, randx.AlphaLowerNum),
+			LogoutToken:     randx.MustString(12, randx.AlphaLowerNum),
+			AuthenticatedAt: time.Now(),
+		}
+		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, sess))
+		r := &http.Request{URL: urlx.ParseOrPanic("https://www.ory.sh/")}
+		r = r.WithContext(ctx)
+		w := httptest.NewRecorder()
+
+		err := h.ExecuteSettingsPrePersistHook(w, r, settings.PostHookPrePersistExecutorParams{
+			Flow:     f,
+			Identity: proposed,
+			Session:  sess,
+		})
+		require.True(t, errors.Is(err, settings.ErrHookAbortFlow), "expected ErrHookAbortFlow, got: %v", err)
+
+		require.NotEmpty(t, f.ContinueWith(), "settings flow should redirect to verification")
+		vfID := f.ContinueWith()[0].(*flow.ContinueWithVerificationUI).Flow.ID
+		vf, err := reg.VerificationFlowPersister().GetVerificationFlow(ctx, vfID)
+		require.NoError(t, err)
+
+		// A link was sent, not a code — the flow must not carry a "code has
+		// been sent" message.
+		require.Empty(t, vf.UI.Messages, "link strategy flows must not claim a code was sent")
 	})
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/selfservice/hook"
 	"github.com/ory/kratos/session"
+	"github.com/ory/kratos/text"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/sqlxx"
 	"github.com/ory/x/urlx"
@@ -113,6 +114,8 @@ func TestVerifier(t *testing.T) {
 						require.NotEmpty(t, expectedVerificationFlow.SessionID.UUID)
 						require.NotEmpty(t, expectedVerificationFlow.IdentityID.UUID)
 						require.NotNil(t, expectedVerificationFlow.UI.Nodes.Find("email"))
+						require.Len(t, expectedVerificationFlow.UI.Messages, 1)
+						require.Equal(t, text.InfoSelfServiceVerificationEmailWithCodeSent, expectedVerificationFlow.UI.Messages[0].ID)
 
 						messages, err := reg.CourierPersister().NextMessages(context.Background(), 12)
 						require.NoError(t, err)
@@ -203,7 +206,12 @@ func TestVerifier(t *testing.T) {
 
 		h := hook.NewVerifier(reg)
 		require.NoError(t, h.ExecuteSettingsPostPersistHook(
-			httptest.NewRecorder(), u, originalFlow, i, &session.Session{ID: x.NewUUID(), Identity: i}))
+			httptest.NewRecorder(), u, settings.PostHookPostPersistExecutorParams{
+				Flow:     originalFlow,
+				Updated:  i,
+				Previous: i,
+				Session:  &session.Session{ID: x.NewUUID(), Identity: i},
+			}))
 		assert.Lenf(t, originalFlow.ContinueWith(), 2, "%#ßv", originalFlow.ContinueWith())
 		assertContinueWithAddresses(t, originalFlow.ContinueWith(), []string{"foo@ory.sh", "bar@ory.sh"})
 		vf := originalFlow.ContinueWith()[0]
@@ -239,7 +247,12 @@ func TestVerifier(t *testing.T) {
 		originalFlow = &settings.Flow{RequestURL: "http://foo.com/settings?after_verification_return_to=verification_callback"}
 
 		require.NoError(t, h.ExecuteSettingsPostPersistHook(
-			httptest.NewRecorder(), u, originalFlow, i, &session.Session{ID: x.NewUUID(), Identity: i}))
+			httptest.NewRecorder(), u, settings.PostHookPostPersistExecutorParams{
+				Flow:     originalFlow,
+				Updated:  i,
+				Previous: i,
+				Session:  &session.Session{ID: x.NewUUID(), Identity: i},
+			}))
 
 		assert.Emptyf(t, originalFlow.ContinueWith(), "%+v", originalFlow.ContinueWith())
 

@@ -4,6 +4,7 @@
 package flow
 
 import (
+	"encoding/base64"
 	"net/url"
 
 	"github.com/ory/herodot"
@@ -264,6 +265,78 @@ func NewContinueWithRedirectBrowserTo(redirectTo string) *ContinueWithRedirectBr
 }
 
 func (c ContinueWithRedirectBrowserTo) GetAction() string {
+	return string(c.Action)
+}
+
+// swagger:enum ContinueWithActionShowPINEntryUI
+type ContinueWithActionShowPINEntryUI string
+
+// #nosec G101 -- only an action constant
+const (
+	ContinueWithActionShowPINEntryUIString ContinueWithActionShowPINEntryUI = "show_pin_entry_ui"
+)
+
+var _ ContinueWith = new(ContinueWithDeviceAuthnPINEntryUI)
+
+// Instructs the client to show its PIN entry UI
+//
+// Returned after a PIN-protected DeviceAuthn enrollment or secret rotation.
+// It carries the one-time HPKE-sealed pin_secret, which the device opens with
+// the transport private key it generated for this enrollment and binds to the
+// user's PIN. The plaintext secret never leaves the device; the server only
+// ever stores its at-rest ciphertext.
+//
+// The enrolled key's client_key_id is not included: it is the SHA-256 fingerprint
+// of the device's own public key, which the device derives locally. Non-PIN keys
+// need no client action at all and therefore produce no continue_with.
+//
+// swagger:model continueWithDeviceAuthnPinEntryUi
+type ContinueWithDeviceAuthnPINEntryUI struct {
+	// Action will always be `show_pin_entry_ui`
+	//
+	// required: true
+	Action ContinueWithActionShowPINEntryUI `json:"action"`
+
+	// Data carries the sealed pin_secret material.
+	//
+	// required: true
+	Data ContinueWithDeviceAuthnPINEntryUIData `json:"data"`
+}
+
+// The one-time HPKE-sealed pin_secret material
+//
+// Contains the encapsulated key and the sealed ciphertext that the device
+// opens with the X25519 transport private key it generated for this
+// enrollment or rotation. Open it with HPKE (RFC 9180) using the suite
+// DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, the ASCII info
+// string "ory/deviceauthn/pin-secret/v1", and the key's client_key_id (its
+// ASCII hex form) as the AAD.
+//
+// swagger:model continueWithDeviceAuthnPinEntryUiData
+type ContinueWithDeviceAuthnPINEntryUIData struct {
+	// The base64-encoded HPKE encapsulated key (the `enc` output of the seal
+	// operation).
+	//
+	// required: true
+	Enc string `json:"enc"`
+
+	// The base64-encoded HPKE ciphertext of the sealed pin_secret.
+	//
+	// required: true
+	Ciphertext string `json:"ciphertext"`
+}
+
+func NewContinueWithDeviceAuthnPINEntryUI(enc, ciphertext []byte) *ContinueWithDeviceAuthnPINEntryUI {
+	return &ContinueWithDeviceAuthnPINEntryUI{
+		Action: ContinueWithActionShowPINEntryUIString,
+		Data: ContinueWithDeviceAuthnPINEntryUIData{
+			Enc:        base64.StdEncoding.EncodeToString(enc),
+			Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
+		},
+	}
+}
+
+func (c ContinueWithDeviceAuthnPINEntryUI) GetAction() string {
 	return string(c.Action)
 }
 

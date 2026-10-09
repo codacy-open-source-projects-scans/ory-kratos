@@ -70,10 +70,10 @@ test-resetdb:
 .PHONY: test
 test:
 	docker pull oryd/hydra:v2.2.0
-	go test -p 1 -count=1 -failfast ./...
+	go test -p 1 -count=1 -failfast $(if $(TAGS),-tags $(TAGS)) ./...
 
 test-short:
-	go test -count=1 -failfast -short ./...
+	go test -count=1 -failfast -short $(if $(TAGS),-tags $(TAGS)) ./...
 
 .PHONY: test-coverage
 test-coverage:
@@ -92,7 +92,8 @@ sdk: .bin/ory node_modules
 		-c github.com/ory/kratos \
 		-c github.com/ory/x/healthx \
 		-c github.com/ory/x/crdbx \
-		-c github.com/ory/x/openapix
+		-c github.com/ory/x/openapix \
+		-c github.com/ory/x/region
 	ory dev swagger sanitize ./spec/swagger.json
 	../../.bin/swagger validate ./spec/swagger.json
 	CIRCLE_PROJECT_USERNAME=ory CIRCLE_PROJECT_REPONAME=kratos \

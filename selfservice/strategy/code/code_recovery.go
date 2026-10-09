@@ -15,6 +15,7 @@ import (
 	"github.com/ory/herodot"
 
 	"github.com/ory/kratos/identity"
+	"github.com/ory/x/clock"
 )
 
 type RecoveryCodeType int
@@ -34,6 +35,20 @@ func ErrCodeAlreadyUsed() *herodot.DefaultError {
 
 func ErrCodeSubmittedTooOften() *herodot.DefaultError {
 	return herodot.ErrBadRequest().WithReasonf("The request was submitted too often. Please request another code.")
+}
+
+// validateOneTimeCode reports whether a one-time code is still usable. Every
+// one-time code type (login, registration, recovery, verification) shares this
+// logic: an expired code is reported as not found, and an already-consumed code
+// is reported as already used.
+func validateOneTimeCode(expiresAt time.Time, usedAt sql.NullTime, clk clock.Clock) error {
+	if expiresAt.Before(clk.Now().UTC()) {
+		return errors.WithStack(ErrCodeNotFound())
+	}
+	if usedAt.Valid {
+		return errors.WithStack(ErrCodeAlreadyUsed())
+	}
+	return nil
 }
 
 type RecoveryCode struct {
@@ -81,17 +96,11 @@ func (RecoveryCode) TableName(ctx context.Context) string {
 	return "identity_recovery_codes"
 }
 
-func (f *RecoveryCode) Validate() error {
+func (f *RecoveryCode) Validate(clk clock.Clock) error {
 	if f == nil {
 		return errors.WithStack(ErrCodeNotFound())
 	}
-	if f.ExpiresAt.Before(time.Now().UTC()) {
-		return errors.WithStack(ErrCodeNotFound())
-	}
-	if f.UsedAt.Valid {
-		return errors.WithStack(ErrCodeAlreadyUsed())
-	}
-	return nil
+	return validateOneTimeCode(f.ExpiresAt, f.UsedAt, clk)
 }
 
 func (c *RecoveryCode) GetHMACCode() string {

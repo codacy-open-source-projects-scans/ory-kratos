@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
@@ -25,6 +24,7 @@ import (
 	"github.com/ory/x/configx"
 	"github.com/ory/x/sqlxx"
 
+	"github.com/ory/kratos/courier"
 	"github.com/ory/kratos/driver"
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/hydra"
@@ -142,7 +142,7 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 			client = testhelpers.NewClientWithCookies(t)
 		}
 
-		client.Transport = testhelpers.NewTransportWithLogger(http.DefaultTransport, t).RoundTripper
+		client.Transport = testhelpers.NewTransportWithLogger(testhelpers.NewTestTransport(t), t).RoundTripper
 
 		var clientInit *oryClient.RegistrationFlow
 		if apiType == ApiTypeNative {
@@ -586,10 +586,10 @@ func TestRegistrationCodeStrategy(t *testing.T) {
 
 				t.Run("case=should have verifiable address even if after session hook is disabled", func(t *testing.T) {
 					// disable the after session hook
-					conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".code.hooks", []map[string]interface{}{})
+					conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".code.hooks", []map[string]any{})
 
 					t.Cleanup(func() {
-						conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".code.hooks", []map[string]interface{}{
+						conf.MustSet(ctx, config.ViperKeySelfServiceRegistrationAfter+".code.hooks", []map[string]any{
 							{"hook": "session"},
 						})
 					})
@@ -760,7 +760,7 @@ func TestPopulateRegistrationMethod(t *testing.T) {
 		r := httptest.NewRequest("GET", "/self-service/registration/browser", nil)
 		r = r.WithContext(ctx)
 		t.Helper()
-		f, err := registration.NewFlow(reg.Config(), time.Minute, "csrf_token", r, flow.TypeBrowser)
+		f, err := registration.NewFlow(reg, r, flow.TypeBrowser)
 		f.UI.Nodes = make(node.Nodes, 0)
 		require.NoError(t, err)
 		return r, f
@@ -824,7 +824,7 @@ func TestCodeRegistrationWithLoginChallenge(t *testing.T) {
 	t.Parallel()
 
 	_, reg := pkg.NewFastRegistryWithMocks(t,
-		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]interface{}{
+		configx.WithValue(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeCodeAuth), map[string]any{
 			"enabled":              true,
 			"passwordless_enabled": true,
 		}),
@@ -840,7 +840,7 @@ func TestCodeRegistrationWithLoginChallenge(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/self-service/registration/browser", nil)
 		r = r.WithContext(ctx)
-		f, err := registration.NewFlow(reg.Config(), time.Minute, nosurfx.FakeCSRFToken, r, flow.TypeBrowser)
+		f, err := registration.NewFlow(reg, r, flow.TypeBrowser)
 		require.NoError(t, err)
 		require.NoError(t, reg.RegistrationFlowPersister().CreateRegistrationFlow(ctx, f))
 		return r, f
@@ -863,6 +863,14 @@ func TestCodeRegistrationWithLoginChallenge(t *testing.T) {
 		err := s.Register(httptest.NewRecorder(), r, f, i)
 		require.ErrorIs(t, err, flow.ErrCompletedByStrategy)
 		require.NotNil(t, f.HydraLoginRequest)
+
+		messages, err := reg.CourierPersister().NextMessages(t.Context(), 10)
+		require.NoError(t, err)
+		require.Len(t, messages, 1)
+		assert.Equal(t, loginChallenge, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.challenge").String())
+		assert.Equal(t, hydra.FakeClientID, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.client.client_id").String())
+		assert.Equal(t, hydra.FakeClientName, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.client.client_name").String())
+		assert.Equal(t, hydra.FakeClientLogoURI, gjson.GetBytes(messages[0].TemplateData, "oauth2_login_request.client.logo_uri").String())
 	})
 
 	t.Run("case=returns error if login challenge is invalid", func(t *testing.T) {
@@ -883,5 +891,9 @@ func TestCodeRegistrationWithLoginChallenge(t *testing.T) {
 		err := s.Register(httptest.NewRecorder(), r, f, i)
 		require.ErrorIs(t, err, herodot.ErrBadRequest())
 		require.Nil(t, f.HydraLoginRequest)
+
+		// Pin that the invalid login challenge aborts before any one-time code is queued.
+		_, err = reg.CourierPersister().NextMessages(t.Context(), 1)
+		require.ErrorIs(t, err, courier.ErrQueueEmpty)
 	})
 }

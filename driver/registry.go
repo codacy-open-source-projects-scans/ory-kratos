@@ -35,6 +35,7 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/nosurf"
 	"github.com/ory/pop/v6"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/configx"
 	"github.com/ory/x/contextx"
 	"github.com/ory/x/healthx"
@@ -51,6 +52,10 @@ type Registry interface {
 
 	SetLogger(l *logrusx.Logger)
 	SetJSONNetVMProvider(jsonnetsecure.VMProvider)
+
+	// Clock returns the time source used for time-dependent behavior such as
+	// flow expiry. Tests can override it via RegistryDefault.SetClock.
+	Clock() clock.Clock
 
 	WithCSRFHandler(c nosurf.Handler)
 	WithCSRFTokenGenerator(cg nosurfx.CSRFToken)
@@ -178,7 +183,8 @@ type options struct {
 	extraMigrations               []fs.FS
 	extraGoMigrations             popx.Migrations
 	replacementStrategies         []NewStrategy
-	extraHooks                    map[string]func(config.SelfServiceHook) any
+	extraHooks                    map[string]NewHookFn
+	extraHashers                  map[string]NewHasherFn
 	extraHandlers                 []NewHandler
 	disableMigrationLogging       bool
 	jsonnetPool                   jsonnetsecure.Pool
@@ -241,9 +247,22 @@ func WithReplaceStrategies(s ...NewStrategy) RegistryOption {
 	}
 }
 
-func WithExtraHooks(hooks map[string]func(config.SelfServiceHook) any) RegistryOption {
+type NewHookFn func(config.SelfServiceHook, Registry) any
+
+func WithExtraHooks(hooks map[string]NewHookFn) RegistryOption {
 	return func(o *options) {
 		o.extraHooks = hooks
+	}
+}
+
+type NewHasherFn func(reg Registry) hash.Hasher
+
+// WithExtraHashers registers additional password hashers, keyed by the
+// hashers.algorithm value that selects them. An extra hasher takes precedence
+// over a built-in hasher with the same name.
+func WithExtraHashers(hashers map[string]NewHasherFn) RegistryOption {
+	return func(o *options) {
+		o.extraHashers = hashers
 	}
 }
 

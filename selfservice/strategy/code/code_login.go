@@ -13,6 +13,8 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/ory/kratos/identity"
+	"github.com/ory/x/clock"
+	"github.com/ory/x/region"
 )
 
 // swagger:ignore
@@ -63,17 +65,11 @@ func (LoginCode) TableName(ctx context.Context) string {
 	return "identity_login_codes"
 }
 
-func (c *LoginCode) Validate() error {
+func (c *LoginCode) Validate(clk clock.Clock) error {
 	if c == nil {
 		return errors.WithStack(ErrCodeNotFound())
 	}
-	if c.ExpiresAt.Before(time.Now().UTC()) {
-		return errors.WithStack(ErrCodeNotFound())
-	}
-	if c.UsedAt.Valid {
-		return errors.WithStack(ErrCodeAlreadyUsed())
-	}
-	return nil
+	return validateOneTimeCode(c.ExpiresAt, c.UsedAt, clk)
 }
 
 func (c *LoginCode) GetHMACCode() string {
@@ -109,4 +105,13 @@ type CreateLoginCodeParams struct {
 	// IdentityID is the identity that this code is for
 	// required: true
 	IdentityID uuid.UUID
+
+	// IdentityRegion optionally carries the already-known region of the
+	// identity the code is for, so persisters can use it without re-reading
+	// the identity row.
+	IdentityRegion region.Region `json:"-" db:"-" faker:"-"`
+
+	// InsertExtraColumns appends fixed (key, value) columns to the INSERT
+	// statement (e.g. crdb_region).
+	InsertExtraColumns []identity.ExtraColumn `json:"-" db:"-" faker:"-"`
 }

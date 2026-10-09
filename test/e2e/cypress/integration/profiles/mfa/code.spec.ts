@@ -40,6 +40,7 @@ context("2FA code", () => {
           )
         })
 
+        // playwright:migrated
         it("should show second factor screen on whoami call", () => {
           email = gen.email()
           password = gen.password()

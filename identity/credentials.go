@@ -4,6 +4,7 @@
 package identity
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,8 +15,10 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
 	"github.com/wI2L/jsondiff"
 
+	"github.com/ory/herodot"
 	"github.com/ory/kratos/ui/node"
 	"github.com/ory/x/sqlxx"
 )
@@ -85,16 +88,17 @@ type CredentialsType string
 
 // Please make sure to add all of these values to the test that ensures they are created during migration
 const (
-	CredentialsTypePassword    CredentialsType = "password"
-	CredentialsTypeOIDC        CredentialsType = "oidc"
-	CredentialsTypeTOTP        CredentialsType = "totp"
-	CredentialsTypeLookup      CredentialsType = "lookup_secret"
-	CredentialsTypeWebAuthn    CredentialsType = "webauthn"
-	CredentialsTypeCodeAuth    CredentialsType = "code"
-	CredentialsTypePasskey     CredentialsType = "passkey"
-	CredentialsTypeProfile     CredentialsType = "profile"
-	CredentialsTypeSAML        CredentialsType = "saml"
-	CredentialsTypeDeviceAuthn CredentialsType = "deviceauthn"
+	CredentialsTypePassword        CredentialsType = "password"
+	CredentialsTypeOIDC            CredentialsType = "oidc"
+	CredentialsTypeTOTP            CredentialsType = "totp"
+	CredentialsTypeLookup          CredentialsType = "lookup_secret"
+	CredentialsTypeWebAuthn        CredentialsType = "webauthn"
+	CredentialsTypeCodeAuth        CredentialsType = "code"
+	CredentialsTypePasskey         CredentialsType = "passkey"
+	CredentialsTypeProfile         CredentialsType = "profile"
+	CredentialsTypeSAML            CredentialsType = "saml"
+	CredentialsTypeDeviceAuthn     CredentialsType = "deviceauthn"
+	CredentialsTypeIdentifierFirst CredentialsType = "identifier_first" // TODO(jonas): Used only for SDK compatibility. We should refactor all the places that use "CredentialType" as a method identifier (flow.Active fields, etc.)
 )
 
 func (c CredentialsType) String() string {
@@ -119,6 +123,8 @@ func (c CredentialsType) ToUiNodeGroup() node.UiNodeGroup {
 		return node.PasskeyGroup
 	case CredentialsTypeDeviceAuthn:
 		return node.DeviceAuthnGroup
+	case CredentialsTypeIdentifierFirst:
+		return node.IdentifierFirstGroup
 	default:
 		return node.DefaultGroup
 	}
@@ -257,6 +263,29 @@ func (c CredentialIdentifier) TableName(context.Context) string {
 	return "identity_credential_identifiers"
 }
 
+// ValidateCredentialsIntegrity returns a BadRequest error if any entry in
+// the credentials map has a Type field that does not equal its map key.
+//
+// The internal helpers (SetCredentials, SetCredentialsWithConfig,
+// UpsertCredentialsConfig) always force these two to match, so this only
+// trips for callers that write to the map directly — notably the PATCH
+// /admin/identities/{id} handler, which decodes the patched JSON straight
+// into Identity. Caught early, this is a malformed request. Caught late,
+// it has two destructive failure modes: a misleading 500 from the
+// persister when the type is unknown, or a silent overwrite of the
+// existing credential's config (e.g. hashed_password) when schema
+// validation later repairs Type but not Config.
+func ValidateCredentialsIntegrity(creds map[CredentialsType]Credentials) error {
+	for k, c := range creds {
+		if c.Type != k {
+			return errors.WithStack(herodot.ErrBadRequest().WithReasonf(
+				"credentials.%s.type must equal %q, got %q", k, string(k), string(c.Type),
+			))
+		}
+	}
+	return nil
+}
+
 func CredentialsEqual(a, b map[CredentialsType]Credentials) bool {
 	if len(a) != len(b) {
 		return false
@@ -295,4 +324,33 @@ func CredentialsEqual(a, b map[CredentialsType]Credentials) bool {
 	}
 
 	return true
+}
+
+// UpdateConfig adapts a typed, in-place credential-config mutation into the
+// raw mutate form PrivilegedPool.UpdateCredentialsConfig takes:
+//
+//	pool.UpdateCredentialsConfig(ctx, id, ct, identity.UpdateConfig(mutate))
+//
+// T must model the complete stored config shape: unknown fields do not
+// survive the roundtrip. An empty or JSON-null config is rejected before
+// mutate runs. mutate must be pure (it may run more than once on database
+// retries); returning an error aborts without persisting.
+func UpdateConfig[T any](mutate func(*T) error) func(config []byte) ([]byte, error) {
+	return func(config []byte) ([]byte, error) {
+		if len(config) == 0 || bytes.Equal(config, []byte("null")) {
+			return nil, errors.WithStack(herodot.ErrInternalServerError().WithReason("The stored credential configuration is empty and cannot be updated."))
+		}
+		var decoded T
+		if err := json.Unmarshal(config, &decoded); err != nil {
+			return nil, errors.WithStack(herodot.ErrInternalServerError().WithReason("The stored credential configuration could not be decoded.").WithDebug(err.Error()).WithWrap(err))
+		}
+		if err := mutate(&decoded); err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(&decoded)
+		if err != nil {
+			return nil, errors.WithStack(herodot.ErrInternalServerError().WithReason("The updated credential configuration could not be encoded.").WithDebug(err.Error()).WithWrap(err))
+		}
+		return encoded, nil
+	}
 }

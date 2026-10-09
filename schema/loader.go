@@ -96,17 +96,13 @@ func NewCompilerWithURL(ctx context.Context, schemaURL string, disallowRefs bool
 	return c, nil
 }
 
+var defaultHTTPClient = httpx.NewResilientClient(httpx.ResilientClientDisallowInternalIPs())
+
 // ensureGuardedHTTPClient guarantees that the jsonschema httploader will
-// pick up a client whose dialer rejects internal IP ranges. Callers who
-// have already attached a client (typically via the request middleware
-// x.HTTPLoaderContextMiddleware) are unaffected — the existing client is
-// preserved. Callers without a client get a fresh resilient client with
-// `ResilientClientDisallowInternalIPs` applied so that fetches from
-// background paths cannot be steered at IMDS or in-cluster services.
+// pick up a client whose dialer rejects internal IP ranges.
 func ensureGuardedHTTPClient(ctx context.Context) context.Context {
 	if ctx.Value(httploader.ContextKey) != nil {
 		return ctx
 	}
-	return context.WithValue(ctx, httploader.ContextKey,
-		httpx.NewResilientClient(httpx.ResilientClientDisallowInternalIPs()))
+	return context.WithValue(ctx, httploader.ContextKey, defaultHTTPClient)
 }

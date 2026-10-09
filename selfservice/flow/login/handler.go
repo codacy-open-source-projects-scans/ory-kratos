@@ -6,7 +6,6 @@ package login
 import (
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
@@ -30,6 +29,7 @@ import (
 	"github.com/ory/kratos/x/nosurfx"
 	"github.com/ory/kratos/x/redir"
 	"github.com/ory/nosurf"
+	"github.com/ory/x/clock"
 	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/httpx"
 	"github.com/ory/x/logrusx"
@@ -51,6 +51,7 @@ const (
 
 type (
 	dependencies interface {
+		clock.Provider
 		HookExecutorProvider
 		FlowPersistenceProvider
 		errorx.ManagementProvider
@@ -66,6 +67,7 @@ type (
 		ErrorHandlerProvider
 		sessiontokenexchange.PersistenceProvider
 		logrusx.Provider
+		TestStrategyProvider
 	}
 	HandlerProvider interface {
 		LoginHandler() *Handler
@@ -78,6 +80,9 @@ func NewHandler(d dependencies) *Handler { return &Handler{d: d} }
 func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 	h.d.CSRFHandler().IgnorePath(RouteInitAPIFlow)
 	h.d.CSRFHandler().IgnorePath(RouteSubmitFlow)
+	// The test-login-flow delete endpoint is authorized by the HMAC cookie
+	// set on the OIDC callback, not the global nosurf middleware.
+	h.d.CSRFHandler().IgnorePath(RouteDeleteTestFlow)
 
 	public.GET(RouteInitBrowserFlow, h.createBrowserLoginFlow)
 	public.GET(RouteInitAPIFlow, h.createNativeLoginFlow)
@@ -85,6 +90,8 @@ func (h *Handler) RegisterPublicRoutes(public *httprouterx.RouterPublic) {
 
 	public.POST(RouteSubmitFlow, h.updateLoginFlow)
 	public.GET(RouteSubmitFlow, h.updateLoginFlow)
+
+	public.DELETE(RouteDeleteTestFlow, h.deleteTestLoginFlow)
 }
 
 func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
@@ -94,6 +101,8 @@ func (h *Handler) RegisterAdminRoutes(admin *httprouterx.RouterAdmin) {
 
 	admin.POST(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
 	admin.GET(RouteSubmitFlow, redir.RedirectToPublicRoute(h.d))
+
+	admin.POST(RouteAdminCreateTestFlow, h.adminCreateTestLoginFlow)
 }
 
 type FlowOption func(f *Flow)
@@ -138,7 +147,7 @@ func WithLoginChallenge(loginChallenge string) FlowOption {
 
 func (h *Handler) NewLoginFlow(w http.ResponseWriter, r *http.Request, ft flow.Type, opts ...FlowOption) (*Flow, *session.Session, error) {
 	conf := h.d.Config()
-	f, err := NewFlow(conf, conf.SelfServiceFlowLoginRequestLifespan(r.Context()), h.d.GenerateCSRFToken(r), r, ft)
+	f, err := NewFlow(h.d, r, ft)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -167,8 +176,10 @@ func (h *Handler) NewLoginFlow(w http.ResponseWriter, r *http.Request, ft flow.T
 		return nil, nil, errors.WithStack(herodot.ErrBadRequest().WithReasonf("Unable to parse AuthenticationMethod Assurance Level (AAL): %s", cs.ToUnknownCaseErr()))
 	}
 
-	// We assume an error means the user has no session
-	sess, err := h.d.SessionManager().FetchFromRequest(r.Context(), r)
+	// We assume an error means the user has no session.
+	// The full expansion is required: the strategies' form hydrators and the organization
+	// filter read the session's identity.
+	sess, err := h.d.SessionManager().FetchFromRequest(r.Context(), r, session.ExpandEverything, identity.ExpandEverything)
 	if e := new(session.ErrNoActiveSessionFound); errors.As(err, &e) {
 		// No session exists yet
 		returnSessionTokenExchangeCode, _ := strconv.ParseBool(r.URL.Query().Get("return_session_token_exchange_code"))
@@ -240,7 +251,7 @@ preLoginHook:
 				continue
 			default:
 				populateErr = errors.WithStack(
-					x.PseudoPanic.WithReasonf("A login strategy was expected to implement interface AAL1FormHydrator but did not: %s", s.ID()),
+					x.PseudoPanic.WithReason("A login strategy was expected to implement interface AAL1FormHydrator but did not."),
 				)
 			}
 		case identity.AuthenticatorAssuranceLevel2:
@@ -257,7 +268,7 @@ preLoginHook:
 				continue
 			default:
 				populateErr = errors.WithStack(
-					x.PseudoPanic.WithReasonf("A login strategy was expected to implement interface AAL2FormHydrator but did not: %s", s.ID()),
+					x.PseudoPanic.WithReason("A login strategy was expected to implement interface AAL2FormHydrator but did not."),
 				)
 			}
 		}
@@ -729,12 +740,33 @@ func (h *Handler) getLoginFlow(w http.ResponseWriter, r *http.Request) {
 	// Browser flows must include the CSRF token
 	//
 	// Resolves: https://github.com/ory/kratos/issues/1282
-	if ar.Type == flow.TypeBrowser && !nosurf.VerifyToken(h.d.GenerateCSRFToken(r), ar.CSRFToken) {
+	//
+	// Test flows have their own scheme:
+	//   - choose_method (uncaptured): public read. The flow carries no PII
+	//     and was admin-created with a server-minted token that the browser
+	//     never received, so a CSRF check would always fail.
+	//   - captured: require the CSRF cookie to match f.CSRFToken. The OIDC
+	//     callback regenerated the cookie+token pair, so only the browser
+	//     that completed the round trip can read the captured DebugPayload.
+	switch {
+	case ar.IsTest():
+		// TestContext is a derived field (loaded from internal_context); the
+		// SQL fetch above doesn't populate it.
+		if err := ar.LoadTestContext(); err != nil {
+			h.d.Writer().WriteError(w, r, err)
+			return
+		}
+		if ar.TestContext != nil && ar.TestContext.DebugPayload != nil &&
+			!nosurf.VerifyToken(h.d.GenerateCSRFToken(r), ar.CSRFToken) {
+			h.d.Writer().WriteError(w, r, errors.WithStack(herodot.ErrForbidden().WithReason("missing or invalid CSRF token")))
+			return
+		}
+	case ar.Type == flow.TypeBrowser && !nosurf.VerifyToken(h.d.GenerateCSRFToken(r), ar.CSRFToken):
 		h.d.Writer().WriteError(w, r, nosurfx.CSRFErrorReason(r, h.d))
 		return
 	}
 
-	if ar.ExpiresAt.Before(time.Now()) {
+	if ar.ExpiresAt.Before(h.d.Clock().Now()) {
 		if ar.Type == flow.TypeBrowser {
 			redirectURL := flow.GetFlowExpiredRedirectURL(ctx, h.d.Config(), RouteInitBrowserFlow, ar.ReturnTo)
 
@@ -881,7 +913,8 @@ func (h *Handler) updateLoginFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := h.d.SessionManager().FetchFromRequest(ctx, r)
+	// The full expansion is required: the session is handed to every login strategy below.
+	sess, err := h.d.SessionManager().FetchFromRequest(ctx, r, session.ExpandEverything, identity.ExpandEverything)
 	if err == nil {
 		if f.Refresh {
 			// If we want to refresh, continue the login
@@ -916,7 +949,7 @@ func (h *Handler) updateLoginFlow(w http.ResponseWriter, r *http.Request) {
 	}
 
 continueLogin:
-	if err := f.Valid(); err != nil {
+	if err := f.Valid(h.d.Clock()); err != nil {
 		h.d.LoginFlowErrorHandler().WriteFlowError(w, r, f, "", node.DefaultGroup, err)
 		return
 	}

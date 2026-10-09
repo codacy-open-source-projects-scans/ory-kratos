@@ -5,12 +5,16 @@ package test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"slices"
+	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,10 +32,11 @@ import (
 	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/schema"
 	"github.com/ory/kratos/x"
+	"github.com/ory/pop/v6"
 	"github.com/ory/x/assertx"
-	"github.com/ory/x/contextx"
 	"github.com/ory/x/crdbx"
 	"github.com/ory/x/pagination/keysetpagination"
+	"github.com/ory/x/popx"
 	"github.com/ory/x/randx"
 	"github.com/ory/x/sqlcon"
 	"github.com/ory/x/sqlxx"
@@ -49,61 +54,83 @@ func assertContainsValues(t *testing.T, actual []string, shouldContain, shouldNo
 	}
 }
 
+// poolSchemaSet is the identity-schema set the TestPool contract exercises.
+//
+// Only ID and RawURL are set on each schema.Schema: the config carries RawURL
+// (see PoolConfigValues), and SchemaURL() derives the public URL from ID, so
+// schema.Schema.URL is never read here.
+type poolSchemaSet struct {
+	expand, def, alt, phoneEmail schema.Schema
+	publicBaseURL                *url.URL
+}
+
+func newPoolSchemaSet() poolSchemaSet {
+	return poolSchemaSet{
+		publicBaseURL: urlx.ParseOrPanic("http://example.com"),
+		expand: schema.Schema{
+			ID:     "expandSchema",
+			RawURL: "file://./stub/expand.schema.json",
+		},
+		def: schema.Schema{
+			ID:     config.DefaultIdentityTraitsSchemaID,
+			RawURL: "file://./stub/identity.schema.json",
+		},
+		alt: schema.Schema{
+			ID:     "altSchema",
+			RawURL: "file://./stub/identity-2.schema.json",
+		},
+		phoneEmail: schema.Schema{
+			ID:     "phoneIdentifier",
+			RawURL: "file://./stub/phone.schema.json",
+		},
+	}
+}
+
+// PoolConfigValues returns the configuration the TestPool contract requires.
+//
+// Prefer passing these to the registry as base config (configx.WithValues) over
+// attaching them to the context with contextx.WithConfigValues. A context
+// overlay makes TestConfigProvider.Config rebuild the whole koanf tree — schema
+// validation and a full re-flatten — on every config read underneath it, and
+// TestPool reads config from 187 subtests.
+func PoolConfigValues() map[string]any {
+	s := newPoolSchemaSet()
+	return map[string]any{
+		config.ViperKeyPublicBaseURL: s.publicBaseURL.String(),
+		// Set explicitly so callers do not also need the suite-wide
+		// testhelpers.WithDefaultIdentitySchema overlay — that overlay replaces
+		// the schema list below with a single "default" entry.
+		config.ViperKeyDefaultIdentitySchemaID: s.def.ID,
+		config.ViperKeyIdentitySchemas: []config.Schema{
+			{ID: s.alt.ID, URL: s.alt.RawURL},
+			{ID: s.def.ID, URL: s.def.RawURL},
+			{ID: s.expand.ID, URL: s.expand.RawURL},
+			// The multiple_emails schema is only registered so config accepts the
+			// ID; the contract never reads its traits, so it reuses altSchema's file.
+			{ID: "multiple_emails", URL: s.alt.RawURL},
+			{ID: s.phoneEmail.ID, URL: s.phoneEmail.RawURL},
+		},
+	}
+}
+
+// TestPool runs the identity persister contract. The caller must have the values
+// from PoolConfigValues in scope, ideally baked into the registry's base config.
 func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager, dbname string) func(t *testing.T) {
 	return func(t *testing.T) {
 		nid, p := testhelpers.NewNetworkUnlessExisting(t, ctx, p)
 
-		exampleServerURL := urlx.ParseOrPanic("http://example.com")
-		expandSchema := schema.Schema{
-			ID:     "expandSchema",
-			URL:    urlx.ParseOrPanic("file://./stub/expand.schema.json"),
-			RawURL: "file://./stub/expand.schema.json",
-		}
-		defaultSchema := schema.Schema{
-			ID:     config.DefaultIdentityTraitsSchemaID,
-			URL:    urlx.ParseOrPanic("file://./stub/identity.schema.json"),
-			RawURL: "file://./stub/identity.schema.json",
-		}
-		altSchema := schema.Schema{
-			ID:     "altSchema",
-			URL:    urlx.ParseOrPanic("file://./stub/identity-2.schema.json"),
-			RawURL: "file://./stub/identity-2.schema.json",
-		}
-		multipleEmailsSchema := schema.Schema{
-			ID:     "multiple_emails",
-			URL:    urlx.ParseOrPanic("file://./stub/handler/multiple_emails.schema.json"),
-			RawURL: "file://./stub/identity-2.schema.json",
-		}
-		phoneEmailSchema := schema.Schema{
-			ID:     "phoneIdentifier",
-			URL:    urlx.ParseOrPanic("file://./stub/phone.schema.json"),
-			RawURL: "file://./stub/phone.schema.json",
-		}
-		ctx := contextx.WithConfigValues(ctx, map[string]any{
-			config.ViperKeyPublicBaseURL: exampleServerURL.String(),
-			config.ViperKeyIdentitySchemas: []config.Schema{
-				{
-					ID:  altSchema.ID,
-					URL: altSchema.RawURL,
-				},
-				{
-					ID:  defaultSchema.ID,
-					URL: defaultSchema.RawURL,
-				},
-				{
-					ID:  expandSchema.ID,
-					URL: expandSchema.RawURL,
-				},
-				{
-					ID:  multipleEmailsSchema.ID,
-					URL: multipleEmailsSchema.RawURL,
-				},
-				{
-					ID:  phoneEmailSchema.ID,
-					URL: phoneEmailSchema.RawURL,
-				},
-			},
-		})
+		s := newPoolSchemaSet()
+		exampleServerURL := s.publicBaseURL
+		expandSchema, defaultSchema, altSchema := s.expand, s.def, s.alt
+		phoneEmailSchema := s.phoneEmail
+
+		// Fail fast (rather than deep inside case=expand) when the caller did not
+		// put PoolConfigValues into scope: without the schemas registered,
+		// ValidateIdentity returns an opaque schema-lookup error.
+		probe := identity.NewIdentity(expandSchema.ID)
+		probe.Traits = identity.Traits(`{"email":"probe@ory.sh","name":"probe"}`)
+		require.NoError(t, m.ValidateIdentity(ctx, probe, new(identity.ManagerOptions)),
+			"TestPool requires the schemas from identity.PoolConfigValues in scope")
 
 		t.Run("case=expand", func(t *testing.T) {
 			require.NoError(t, p.GetConnection(ctx).RawQuery("DELETE FROM identities WHERE nid = ?", nid).Exec())
@@ -127,6 +154,11 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				assertion := func(t *testing.T, actual *identity.Identity) {
 					assertx.EqualAsJSONExcept(t, expected, actual, []string{
 						"verifiable_addresses", "recovery_addresses", "updated_at", "created_at", "credentials", "state_changed_at",
+						// region is hydrated by the multi-region persister from
+						// the row's crdb_region, but the OSS-side `expected`
+						// snapshot is built from the in-memory Identity which
+						// has Region empty when the test does not set it.
+						"region",
 					})
 					cb(t, actual)
 				}
@@ -243,6 +275,9 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				require.NoError(t, err)
 				assertx.EqualAsJSONExcept(t, expected, actual, []string{
 					"verifiable_addresses", "recovery_addresses", "updated_at", "created_at", "credentials", "state_changed_at",
+					// region is hydrated by the multi-region persister; the
+					// in-memory expected snapshot has Region empty.
+					"region",
 				})
 				require.Len(t, actual.Credentials, 2)
 
@@ -564,7 +599,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				for i := range identities {
 					identities[i] = NewTestIdentity(4, "persister-create-multiple", i)
 				}
-				require.NoError(t, p.CreateIdentities(ctx, identities...))
+				require.NoError(t, p.CreateIdentities(ctx, identities))
 				createdAt := time.Now().UTC()
 
 				for _, id := range identities {
@@ -597,7 +632,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				for i := range identities {
 					identities[i] = NewTestIdentity(4, "persister-create-multiple-2", i%60)
 				}
-				err := p.CreateIdentities(ctx, identities...)
+				err := p.CreateIdentities(ctx, identities)
 				if dbname == "mysql" {
 					// partial inserts are not supported on mysql
 					assert.ErrorIs(t, err, sqlcon.ErrUniqueViolation())
@@ -639,6 +674,163 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 					assert.NotNil(t, failed)
 				}
 			})
+
+			t.Run("case=conflict only on credential identifier marks the identity as failed", func(t *testing.T) {
+				// Regression test: OIDC identities carry no verifiable or recovery
+				// addresses, so a duplicate conflicts solely on the credential
+				// identifier. CreateIdentities must map that conflict back to the
+				// owning identity, mark it failed, and not leave a partially
+				// persisted identity behind.
+				if dbname == "mysql" {
+					// Partial inserts are not supported on mysql.
+					t.Skip()
+				}
+
+				oidcID := randx.MustString(16, randx.AlphaLowerNum)
+				initial := oidcIdentity("", oidcID)
+				require.NoError(t, p.CreateIdentity(ctx, initial))
+				createdIDs = append(createdIDs, initial.ID)
+
+				unique := oidcIdentity("", randx.MustString(16, randx.AlphaLowerNum))
+				conflicting := oidcIdentity("", oidcID)
+				batch := []*identity.Identity{unique, conflicting}
+
+				err := p.CreateIdentities(ctx, batch)
+				errWithCtx := new(identity.CreateIdentitiesError)
+				require.ErrorAsf(t, err, &errWithCtx, "%#v", err)
+
+				// The conflicting identity must be reported as failed and must not
+				// exist in the database.
+				require.NotNil(t, errWithCtx.Find(conflicting))
+				_, err = p.GetIdentity(ctx, conflicting.ID, identity.ExpandNothing)
+				require.Error(t, err)
+
+				// The non-conflicting identity must succeed and be persisted.
+				require.Nil(t, errWithCtx.Find(unique))
+				_, err = p.GetIdentity(ctx, unique.ID, identity.ExpandNothing)
+				require.NoError(t, err)
+				createdIDs = append(createdIDs, unique.ID)
+			})
+
+			t.Run("case=transaction retry re-runs the batch create with the ids from the first attempt", func(t *testing.T) {
+				// A transaction retry discards the first attempt's writes and runs
+				// the closure passed to the Transaction helper again. The ids
+				// assigned during the first attempt (generated by the database on
+				// CockroachDB, by Go elsewhere) stay on the in-memory structs, so
+				// the second attempt inserts the same identities with pre-assigned
+				// ids. The result must be indistinguishable from a first-try
+				// success, in particular the child-table rows must be linked to
+				// the right identities.
+				//
+				// CreateIdentities joins a surrounding transaction, so the retry
+				// re-runs it as a whole — exactly what happens when the driver
+				// retries the transaction of a plain CreateIdentities call.
+				identities := make([]*identity.Identity, 4)
+				for i := range identities {
+					identities[i] = NewTestIdentity(2, "retry-batch", i)
+				}
+
+				attempt := 0
+				idsSeen := make(map[int][]uuid.UUID)
+				require.NoError(t, p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
+					attempt++
+					if err := p.CreateIdentities(ctx, identities); err != nil {
+						return err
+					}
+					for _, ident := range identities {
+						if !assert.NotEqual(t, uuid.Nil, ident.ID) {
+							return errors.New("identity id was not assigned")
+						}
+						idsSeen[attempt] = append(idsSeen[attempt], ident.ID)
+					}
+					if attempt == 1 {
+						// Force a genuine retryable error so the Transaction
+						// helper rolls this attempt back and re-runs the closure.
+						if dbname == "cockroach" {
+							return tx.RawQuery("SELECT crdb_internal.force_retry('1h'::INTERVAL)").Exec()
+						}
+						return sqlcon.ErrConcurrentUpdate()
+					}
+					return nil
+				}))
+				require.Equal(t, 2, attempt, "the transaction closure must have run twice")
+				assert.Equal(t, idsSeen[1], idsSeen[2], "the retry must reuse the ids assigned on the first attempt")
+
+				for _, ident := range identities {
+					fromDB, err := p.GetIdentity(ctx, ident.ID, identity.ExpandEverything)
+					require.NoError(t, err)
+					assert.Equal(t, ident.ID, fromDB.ID)
+					assert.Equal(t,
+						ident.Credentials[identity.CredentialsTypePassword].Identifiers,
+						fromDB.Credentials[identity.CredentialsTypePassword].Identifiers,
+						"the credentials must belong to the identity that carried them in the input batch")
+					assert.Len(t, fromDB.VerifiableAddresses, len(ident.VerifiableAddresses))
+					assert.Len(t, fromDB.RecoveryAddresses, len(ident.RecoveryAddresses))
+
+					// Clean up so the later list assertions, which expect every
+					// remaining identity to be tracked in createdIDs and to fit
+					// in a single page, are unaffected.
+					require.NoError(t, p.DeleteIdentity(ctx, ident.ID))
+				}
+			})
+
+			t.Run("case=transaction retry keeps partial-conflict semantics", func(t *testing.T) {
+				if dbname == "mysql" {
+					// Partial inserts are not supported on mysql.
+					t.Skip()
+				}
+
+				// Same retry scenario, but on the partial-inserts path: one
+				// identity in the batch conflicts on external_id with a
+				// pre-existing identity. The retry re-runs the batch with the ids
+				// assigned on the first attempt; the conflict must still be
+				// attributed to the same input identity and the non-conflicting
+				// one must be persisted.
+				existing := NewTestIdentity(1, "retry-partial-existing", 0)
+				existing.ExternalID = sqlxx.NullString("retry-partial-ext-0")
+				require.NoError(t, p.CreateIdentity(ctx, existing))
+
+				unique := NewTestIdentity(1, "retry-partial-unique", 1)
+				conflicting := NewTestIdentity(1, "retry-partial-conflict", 2)
+				conflicting.ExternalID = existing.ExternalID
+				batch := []*identity.Identity{unique, conflicting}
+
+				attempt := 0
+				var createErr error
+				require.NoError(t, p.Transaction(ctx, func(ctx context.Context, tx *pop.Connection) error {
+					attempt++
+					createErr = p.CreateIdentities(ctx, batch)
+					if _, ok := errors.AsType[*identity.CreateIdentitiesError](createErr); createErr != nil && !ok {
+						return createErr
+					}
+					if attempt == 1 {
+						if dbname == "cockroach" {
+							return tx.RawQuery("SELECT crdb_internal.force_retry('1h'::INTERVAL)").Exec()
+						}
+						return sqlcon.ErrConcurrentUpdate()
+					}
+					return nil
+				}))
+				require.Equal(t, 2, attempt, "the transaction closure must have run twice")
+
+				errWithCtx := new(identity.CreateIdentitiesError)
+				require.ErrorAsf(t, createErr, &errWithCtx, "%#v", createErr)
+				assert.NotNil(t, errWithCtx.Find(conflicting), "the conflict must be attributed to the conflicting input identity")
+				assert.Nil(t, errWithCtx.Find(unique))
+
+				fromDB, err := p.GetIdentity(ctx, unique.ID, identity.ExpandNothing)
+				require.NoError(t, err)
+				assert.Equal(t, unique.ID, fromDB.ID)
+
+				_, err = p.GetIdentity(ctx, conflicting.ID, identity.ExpandNothing)
+				require.Error(t, err, "the conflicting identity must not be persisted")
+
+				// Clean up so the later list assertions, which expect every
+				// remaining identity to be tracked in createdIDs and to fit in
+				// a single page, are unaffected.
+				require.NoError(t, p.DeleteIdentity(ctx, unique.ID))
+				require.NoError(t, p.DeleteIdentity(ctx, existing.ID))
+			})
 		})
 
 		t.Run("case=external_id conflict in batch create returns partial error", func(t *testing.T) {
@@ -654,7 +846,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				first[i] = NewTestIdentity(1, "ext-id-conflict-first", i)
 				first[i].ExternalID = sqlxx.NullString(fmt.Sprintf("ext-conflict-pool-%d", i))
 			}
-			require.NoError(t, p.CreateIdentities(ctx, first...))
+			require.NoError(t, p.CreateIdentities(ctx, first))
 			for _, id := range first {
 				createdIDs = append(createdIDs, id.ID)
 			}
@@ -665,7 +857,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				second[i] = NewTestIdentity(1, "ext-id-conflict-second", i)
 				second[i].ExternalID = sqlxx.NullString(fmt.Sprintf("ext-conflict-pool-%d", i))
 			}
-			err := p.CreateIdentities(ctx, second...)
+			err := p.CreateIdentities(ctx, second)
 			if dbname == "mysql" {
 				assert.ErrorIs(t, err, sqlcon.ErrUniqueViolation())
 				return
@@ -754,6 +946,33 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				func(s string) string { return s[:1] + strings.ToUpper(s[1:2]) + s[2:] },
 				strings.ToUpper,
 				func(s string) string { left, right, _ := strings.Cut(s, "@"); return left + "@" + strings.Title(right) },
+				// Invisible Unicode characters (category Cf) must not let an
+				// attacker register a second visually-identical identifier.
+				func(s string) string { return "\u200B" + s }, // zero-width space prefix
+				func(s string) string { return s[:1] + "\u200C" + s[1:] },
+				func(s string) string { return s[:1] + "\u200D" + s[1:] },
+				func(s string) string { return s[:1] + "\u00AD" + s[1:] },
+				func(s string) string { return s[:1] + "\uFEFF" + s[1:] },
+				func(s string) string { return s[:1] + "\u2060" + s[1:] },
+				func(s string) string { return s[:1] + "\u180E" + s[1:] },
+				// NFKC compatibility decomposition must collapse fullwidth
+				// lookalikes into ASCII.
+				func(s string) string {
+					left, right, _ := strings.Cut(s, "@")
+					out := make([]rune, 0, len(left))
+					for _, r := range left {
+						if r >= 'a' && r <= 'z' {
+							out = append(out, 0xFF41+(r-'a'))
+							continue
+						}
+						if r >= '0' && r <= '9' {
+							out = append(out, 0xFF10+(r-'0'))
+							continue
+						}
+						out = append(out, r)
+					}
+					return string(out) + "@" + right
+				},
 			} {
 				ids := transform(email)
 				expected := passwordIdentity("", ids)
@@ -889,6 +1108,65 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 			require.NoError(t, err)
 			assert.Equal(t, string(identity.AuthenticatorAssuranceLevel1), actual.InternalAvailableAAL.String)
 			assert.Equal(t, identity.StateActive, actual.State, "the state remains unchanged")
+		})
+
+		t.Run("case=update external_id via UpdateIdentity", func(t *testing.T) {
+			externalID := sqlxx.NullString("ext-update-" + randx.MustString(10, randx.AlphaNum))
+
+			initial := oidcIdentity("", x.NewUUID().String())
+			initial.ExternalID = externalID
+			require.NoError(t, p.CreateIdentity(ctx, initial))
+			createdIDs = append(createdIDs, initial.ID)
+
+			t.Run("case=updating other fields keeps external_id unchanged", func(t *testing.T) {
+				// Loaded twice so the from-database snapshot and the update
+				// target are independent objects, matching how the update is
+				// driven in production.
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				updated, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+
+				updated.State = identity.StateInactive
+				require.NoError(t, p.UpdateIdentity(ctx, updated, identity.DiffAgainst(fromDB)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				assert.Equal(t, identity.StateInactive, actual.State)
+				assert.Equal(t, externalID, actual.ExternalID, "external_id is preserved when it does not change")
+			})
+
+			t.Run("case=changing external_id persists the new value", func(t *testing.T) {
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				updated, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+
+				newExternalID := sqlxx.NullString("ext-update-" + randx.MustString(10, randx.AlphaNum))
+				updated.ExternalID = newExternalID
+				require.NoError(t, p.UpdateIdentity(ctx, updated, identity.DiffAgainst(fromDB)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				assert.Equal(t, newExternalID, actual.ExternalID)
+			})
+
+			t.Run("case=changing external_id to an existing one is rejected", func(t *testing.T) {
+				other := oidcIdentity("", x.NewUUID().String())
+				otherExternalID := sqlxx.NullString("ext-update-" + randx.MustString(10, randx.AlphaNum))
+				other.ExternalID = otherExternalID
+				require.NoError(t, p.CreateIdentity(ctx, other))
+				createdIDs = append(createdIDs, other.ID)
+
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				updated, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+
+				updated.ExternalID = otherExternalID
+				require.Error(t, p.UpdateIdentity(ctx, updated, identity.DiffAgainst(fromDB)),
+					"the external_id unique constraint is still enforced when the value changes")
+			})
 		})
 
 		t.Run("case=should fail to insert identity because credentials from traits exist", func(t *testing.T) {
@@ -1029,34 +1307,40 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				require.NoError(t, err)
 				require.Len(t, is, len(createdIDs))
 
-				var results []identity.Identity
-				// It takes about 4.8 seconds to replicate the data.
-				for i := 0; i < 8; i++ {
-					time.Sleep(time.Second)
-
-					// The error here is explicitly ignored because the table / schema might not yet be replicated.
-					// This can lead to "ERROR: cached plan must not change result type (SQLSTATE 0A000)" whih is caused
-					// because the prepared query exist but the schema is not yet replicated.
+				// The data is replicated with eventual consistency (usually a few
+				// seconds). Poll until every identity is visible instead of sleeping
+				// a fixed 8 seconds, so the test returns as soon as replication
+				// completes.
+				listEventually := func() []identity.Identity {
+					// The error is intentionally ignored because the table / schema
+					// might not yet be replicated. This can surface as "cached plan
+					// must not change result type (SQLSTATE 0A000)" because the
+					// prepared query exists but the schema is not yet replicated.
 					is, _, _ := p.ListIdentities(ctx, identity.ListIdentityParameters{
 						Expand:           identity.ExpandEverything,
 						KeySetPagination: []keysetpagination.Option{keysetpagination.WithSize(25)},
 						ConsistencyLevel: crdbx.ConsistencyLevelEventual,
 					})
-
-					if len(is) == len(createdIDs) {
-						results = is
-					}
+					return is
 				}
-				require.NotZero(t, len(results))
-				require.Len(t, results, len(createdIDs), "Could not find all identities after 8 seconds")
-
-				var found bool
-				for _, i := range results {
-					if i.ID == another.ID {
-						found = true
+				// Assert the full count and the specific identity on the same
+				// snapshot inside the poll. A follower read can return a stale
+				// snapshot whose count matches len(createdIDs) but that does not
+				// yet contain the just-created identity, so checking the count and
+				// the identity against separate reads is racy.
+				require.EventuallyWithT(t, func(t *assert.CollectT) {
+					results := listEventually()
+					if !assert.Len(t, results, len(createdIDs), "Could not find all identities") {
+						return
 					}
-				}
-				require.True(t, found, id, "Unable to find created identity in eventually consistent results.")
+					var found bool
+					for _, i := range results {
+						if i.ID == another.ID {
+							found = true
+						}
+					}
+					assert.True(t, found, "Unable to find created identity %s in eventually consistent results.", another.ID)
+				}, 15*time.Second, 200*time.Millisecond)
 			})
 		})
 
@@ -1103,7 +1387,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 
 					expected := expectedIdentities[c]
 					require.Len(t, actual, 1)
-					assertx.EqualAsJSONExcept(t, expected, actual[0], []string{"credentials.config", "created_at", "updated_at", "state_changed_at"})
+					assertx.EqualAsJSONExcept(t, expected, actual[0], []string{"credentials.config", "created_at", "updated_at", "state_changed_at", "region"})
 				})
 			}
 
@@ -1119,7 +1403,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				for _, e := range append(expectedIdentities[:2], create) {
 					for _, a := range actual {
 						if e.ID == a.ID {
-							assertx.EqualAsJSONExcept(t, e, a, []string{"credentials.config", "created_at", "updated_at", "state_changed_at"})
+							assertx.EqualAsJSONExcept(t, e, a, []string{"credentials.config", "created_at", "updated_at", "state_changed_at", "region"})
 							continue outer
 						}
 					}
@@ -1608,7 +1892,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 						actual, creds, err := p.FindByCredentialsIdentifier(ctx, ct, caseSensitive)
 						require.NoError(t, err)
 						assertx.EqualAsJSONExcept(t, expected.Credentials[ct], creds, []string{"created_at", "updated_at", "id"})
-						assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id"})
+						assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id", "region"})
 					})
 				}
 			})
@@ -1625,7 +1909,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 							ec := expected.Credentials[ct]
 							ec.Identifiers = []string{strings.ToLower(caseSensitive)}
 							assertx.EqualAsJSONExcept(t, ec, creds, []string{"created_at", "updated_at", "id", "config.user_handle", "config.credentials", "version"})
-							assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id"})
+							assertx.EqualAsJSONExcept(t, expected, actual, []string{"created_at", "state_changed_at", "updated_at", "id", "region"})
 						}
 					})
 				}
@@ -1986,12 +2270,6 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 		})
 
 		t.Run("suite=recovery-address", func(t *testing.T) {
-			sortAddresses := func(addresses []identity.RecoveryAddress) {
-				slices.SortFunc(addresses, func(a, b identity.RecoveryAddress) int {
-					return strings.Compare(a.Value, b.Value)
-				})
-			}
-
 			createIdentityWithAddresses := func(t *testing.T, email string) *identity.Identity {
 				var i identity.Identity
 				require.NoError(t, faker.FakeData(&i))
@@ -2010,7 +2288,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				_, err := p.FindRecoveryAddressByValue(ctx, identity.AddressTypeEmail, "does-not-exist")
 				require.ErrorIs(t, err, sqlcon.ErrNoRows())
 
-				allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, "does-not-exist")
+				allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, "does-not-exist")
 				require.NoError(t, err)
 				require.Len(t, allAddresses, 0)
 			})
@@ -2045,19 +2323,18 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 						})
 					})
 
-					t.Run("method=FindAllRecoveryAddressesForIdentityByRecoveryAddressValue", func(t *testing.T) {
+					t.Run("method=FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue", func(t *testing.T) {
 						t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
-							allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, expected.Value)
+							allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, expected.Value)
 							require.NoError(t, err)
 							require.Len(t, allAddresses, 2)
-							sortAddresses(allAddresses)
-							require.Equal(t, expected.Value, allAddresses[0].Value)
-							require.Equal(t, expected.Value+"_other", allAddresses[1].Value)
+							require.Equal(t, expected.Value, allAddresses[0])
+							require.Equal(t, expected.Value+"_other", allAddresses[1])
 						})
 
 						t.Run("not if on another network", func(t *testing.T) {
 							_, p := testhelpers.NewNetwork(t, ctx, p)
-							allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, expected.Value)
+							allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, expected.Value)
 							require.NoError(t, err)
 							require.Len(t, allAddresses, 0)
 						})
@@ -2073,19 +2350,18 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				_, err := p.FindRecoveryAddressByValue(ctx, identity.AddressTypeEmail, email)
 				require.NoError(t, err)
 
-				allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, emailLower)
+				allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, emailLower)
 				require.NoError(t, err)
 				require.Len(t, allAddresses, 2)
-				sortAddresses(allAddresses)
-				require.Equal(t, allAddresses[0].Value, emailLower)
-				require.Equal(t, allAddresses[1].Value, emailLower+"_other")
+				require.Equal(t, allAddresses[0], emailLower)
+				require.Equal(t, allAddresses[1], emailLower+"_other")
 
 				t.Run("can not find if on another network", func(t *testing.T) {
 					_, p := testhelpers.NewNetwork(t, ctx, p)
 					_, err := p.FindRecoveryAddressByValue(ctx, identity.AddressTypeEmail, email)
 					require.ErrorIs(t, err, sqlcon.ErrNoRows())
 
-					allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, emailLower)
+					allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, emailLower)
 					require.NoError(t, err)
 					require.Len(t, allAddresses, 0)
 				})
@@ -2097,7 +2373,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				_, err = p.FindRecoveryAddressByValue(ctx, identity.AddressTypeEmail, email)
 				require.EqualError(t, err, sqlcon.ErrNoRows().Error())
 
-				allAddresses, err = p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, emailLower)
+				allAddresses, err = p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, emailLower)
 				require.NoError(t, err)
 				require.Len(t, allAddresses, 0)
 
@@ -2106,7 +2382,7 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 					_, err := p.FindRecoveryAddressByValue(ctx, identity.AddressTypeEmail, email)
 					require.ErrorIs(t, err, sqlcon.ErrNoRows())
 
-					allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, emailLower)
+					allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, emailLower)
 					require.NoError(t, err)
 					require.Len(t, allAddresses, 0)
 				})
@@ -2117,21 +2393,18 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				assert.Equal(t, identity.AddressTypeEmail, actual.Via)
 				assert.Equal(t, emailNextLower, actual.Value)
 
-				allAddresses, err = p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, emailNextLower)
+				allAddresses, err = p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, emailNextLower)
 				require.NoError(t, err)
 				require.Len(t, allAddresses, 2)
-				sortAddresses(allAddresses)
-				assert.Equal(t, identity.AddressTypeEmail, allAddresses[0].Via)
-				assert.Equal(t, emailNextLower, allAddresses[0].Value)
-				assert.Equal(t, identity.AddressTypeEmail, allAddresses[1].Via)
-				assert.Equal(t, emailNextLower+"_other", allAddresses[1].Value)
+				assert.Equal(t, emailNextLower, allAddresses[0])
+				assert.Equal(t, emailNextLower+"_other", allAddresses[1])
 
 				t.Run("can not find if on another network", func(t *testing.T) {
 					_, p := testhelpers.NewNetwork(t, ctx, p)
 					_, err := p.FindRecoveryAddressByValue(ctx, identity.AddressTypeEmail, emailNext)
 					require.ErrorIs(t, err, sqlcon.ErrNoRows())
 
-					allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, emailNextLower)
+					allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, emailNextLower)
 					require.NoError(t, err)
 					require.Len(t, allAddresses, 0)
 				})
@@ -2332,30 +2605,25 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 					createdIDs = append(createdIDs, i.ID)
 
 					// Test 1: Find all addresses using normalized phone1
-					allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, normalizedPhone1)
+					allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, normalizedPhone1)
 					require.NoError(t, err, "should find all recovery addresses with normalized phone")
 					require.Len(t, allAddresses, 2, "should return all recovery addresses for the identity")
-					sortAddresses(allAddresses)
-					assert.Equal(t, normalizedPhone1, allAddresses[0].Value)
-					assert.Equal(t, normalizedPhone2, allAddresses[1].Value)
-					assert.Equal(t, identity.AddressTypeSMS, allAddresses[0].Via)
-					assert.Equal(t, identity.AddressTypeSMS, allAddresses[1].Via)
+					assert.Equal(t, normalizedPhone1, allAddresses[0])
+					assert.Equal(t, normalizedPhone2, allAddresses[1])
 
 					// Test 2: Find all addresses using non-normalized phone1 (gets normalized, then matches)
-					allAddresses2, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, nonNormalizedPhone1)
+					allAddresses2, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, nonNormalizedPhone1)
 					require.NoError(t, err, "should find all recovery addresses with non-normalized phone")
 					require.Len(t, allAddresses2, 2, "should return all recovery addresses when querying with non-normalized phone")
-					sortAddresses(allAddresses2)
-					assert.Equal(t, normalizedPhone1, allAddresses2[0].Value)
-					assert.Equal(t, normalizedPhone2, allAddresses2[1].Value)
+					assert.Equal(t, normalizedPhone1, allAddresses2[0])
+					assert.Equal(t, normalizedPhone2, allAddresses2[1])
 
 					// Test 3: Find all addresses using normalized phone2
-					allAddresses3, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, normalizedPhone2)
+					allAddresses3, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, normalizedPhone2)
 					require.NoError(t, err)
 					require.Len(t, allAddresses3, 2, "should return all recovery addresses when querying with second phone")
-					sortAddresses(allAddresses3)
-					assert.Equal(t, normalizedPhone1, allAddresses3[0].Value)
-					assert.Equal(t, normalizedPhone2, allAddresses3[1].Value)
+					assert.Equal(t, normalizedPhone1, allAddresses3[0])
+					assert.Equal(t, normalizedPhone2, allAddresses3[1])
 				})
 
 				t.Run("create with multiple SMS addresses and find all with non-normalized phone", func(t *testing.T) {
@@ -2378,22 +2646,18 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 					createdIDs = append(createdIDs, i.ID)
 
 					// Test 1: Find all addresses using non-normalized phone1 (gets normalized for search)
-					allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, nonNormPhone1)
+					allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, nonNormPhone1)
 					require.NoError(t, err, "should find all recovery addresses with non-normalized phone")
 					require.Len(t, allAddresses, 2, "should return all recovery addresses for the identity")
-					sortAddresses(allAddresses)
-					assert.Equal(t, normPhone1, allAddresses[0].Value, "stored values should be normalized")
-					assert.Equal(t, normPhone2, allAddresses[1].Value)
-					assert.Equal(t, identity.AddressTypeSMS, allAddresses[0].Via)
-					assert.Equal(t, identity.AddressTypeSMS, allAddresses[1].Via)
+					assert.Equal(t, normPhone1, allAddresses[0], "stored values should be normalized")
+					assert.Equal(t, normPhone2, allAddresses[1])
 
 					// Test 2: Find all addresses using normalized phone1 (direct match)
-					allAddresses2, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, normPhone1)
+					allAddresses2, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, normPhone1)
 					require.NoError(t, err)
 					require.Len(t, allAddresses2, 2, "should return all recovery addresses when querying with normalized phone")
-					sortAddresses(allAddresses2)
-					assert.Equal(t, normPhone1, allAddresses2[0].Value)
-					assert.Equal(t, normPhone2, allAddresses2[1].Value)
+					assert.Equal(t, normPhone1, allAddresses2[0])
+					assert.Equal(t, normPhone2, allAddresses2[1])
 				})
 
 				t.Run("backward compatibility with legacy non-normalized phone data", func(t *testing.T) {
@@ -2435,14 +2699,11 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 
 					// Test: Find all addresses with exact non-normalized phone (what user would enter)
 					// Should find all recovery addresses for the identity
-					allAddresses, err := p.FindAllRecoveryAddressesForIdentityByRecoveryAddressValue(ctx, legacyPhone1)
+					allAddresses, err := p.FindAllRecoveryAddressValuesForIdentityByRecoveryAddressValue(ctx, legacyPhone1)
 					require.NoError(t, err, "should find all recovery addresses with non-normalized search")
 					require.Len(t, allAddresses, 2, "should return all recovery addresses for the identity")
-					sortAddresses(allAddresses)
-					assert.Equal(t, legacyPhone1, allAddresses[0].Value)
-					assert.Equal(t, legacyPhone2, allAddresses[1].Value)
-					assert.Equal(t, identity.AddressTypeSMS, allAddresses[0].Via)
-					assert.Equal(t, identity.AddressTypeSMS, allAddresses[1].Via)
+					assert.Equal(t, legacyPhone1, allAddresses[0])
+					assert.Equal(t, legacyPhone2, allAddresses[1])
 				})
 			})
 		})
@@ -3100,6 +3361,150 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				assert.Equal(t, oldPasswordCredID, actual.Credentials[identity.CredentialsTypePassword].ID, "password credential should not be recreated when adding TOTP without fromDatabase")
 				assert.Equal(t, oldOIDCCredID, actual.Credentials[identity.CredentialsTypeOIDC].ID, "OIDC credential should not be recreated when adding TOTP without fromDatabase")
 			})
+
+			t.Run("case=WithoutCredentialTypes leaves the excluded credential untouched", func(t *testing.T) {
+				initial := passwordIdentity("", x.NewUUID().String())
+				initial.SetCredentials(identity.CredentialsTypeTOTP, identity.Credentials{
+					Type:        identity.CredentialsTypeTOTP,
+					Identifiers: []string{"totp-excluded-" + x.NewUUID().String()},
+					Config:      sqlxx.JSONRawMessage(`{"totp_url":"otpauth://totp/old"}`),
+				})
+				require.NoError(t, p.CreateIdentity(ctx, initial))
+				createdIDs = append(createdIDs, initial.ID)
+
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				require.Len(t, fromDB.Credentials, 2)
+				dbPasswordCred := fromDB.Credentials[identity.CredentialsTypePassword]
+				dbTOTPCred := fromDB.Credentials[identity.CredentialsTypeTOTP]
+
+				// The in-memory password config diverges from the database, as if a
+				// concurrent UpdateCredentialsConfig had won. Password is excluded,
+				// so its row must survive while TOTP still updates.
+				updated := *fromDB
+				updated.Credentials = nil
+				updated.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+					Type:        identity.CredentialsTypePassword,
+					Identifiers: dbPasswordCred.Identifiers,
+					Config:      sqlxx.JSONRawMessage(`{"foo":"stale-in-memory"}`),
+					Version:     dbPasswordCred.Version,
+				})
+				updated.SetCredentials(identity.CredentialsTypeTOTP, identity.Credentials{
+					Type:        identity.CredentialsTypeTOTP,
+					Identifiers: dbTOTPCred.Identifiers,
+					Config:      sqlxx.JSONRawMessage(`{"totp_url":"otpauth://totp/new"}`),
+				})
+				updated.Traits = identity.Traits(`{"email":"excluded-update@ory.sh"}`)
+
+				require.NoError(t, p.UpdateIdentity(ctx, &updated,
+					identity.DiffAgainst(fromDB),
+					identity.WithoutCredentialTypes(identity.CredentialsTypePassword)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				require.Len(t, actual.Credentials, 2)
+				// The excluded row is untouched: same row ID, same config.
+				assert.Equal(t, dbPasswordCred.ID, actual.Credentials[identity.CredentialsTypePassword].ID, "excluded credential must not be recreated")
+				assert.JSONEq(t, string(dbPasswordCred.Config), string(actual.Credentials[identity.CredentialsTypePassword].Config), "excluded credential config must not change")
+				// The non-excluded credential still updates.
+				assert.JSONEq(t, `{"totp_url":"otpauth://totp/new"}`, string(actual.Credentials[identity.CredentialsTypeTOTP].Config))
+				// Identity-level changes still persist.
+				assert.JSONEq(t, `{"email":"excluded-update@ory.sh"}`, string(actual.Traits))
+				// The returned identity carries the database state of the excluded
+				// type, not the stale in-memory copy.
+				assert.Equal(t, dbPasswordCred.ID, updated.Credentials[identity.CredentialsTypePassword].ID)
+				assert.JSONEq(t, string(dbPasswordCred.Config), string(updated.Credentials[identity.CredentialsTypePassword].Config))
+			})
+
+			t.Run("case=WithoutCredentialTypes without DiffAgainst leaves the excluded credential untouched", func(t *testing.T) {
+				initial := passwordIdentity("", x.NewUUID().String())
+				require.NoError(t, p.CreateIdentity(ctx, initial))
+				createdIDs = append(createdIDs, initial.ID)
+
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				dbPasswordCred := fromDB.Credentials[identity.CredentialsTypePassword]
+
+				updated := *fromDB
+				updated.Credentials = nil
+				updated.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+					Type:        identity.CredentialsTypePassword,
+					Identifiers: dbPasswordCred.Identifiers,
+					Config:      sqlxx.JSONRawMessage(`{"foo":"stale-in-memory"}`),
+					Version:     dbPasswordCred.Version,
+				})
+
+				require.NoError(t, p.UpdateIdentity(ctx, &updated,
+					identity.WithoutCredentialTypes(identity.CredentialsTypePassword)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				require.Len(t, actual.Credentials, 1)
+				assert.Equal(t, dbPasswordCred.ID, actual.Credentials[identity.CredentialsTypePassword].ID, "excluded credential must not be recreated")
+				assert.JSONEq(t, string(dbPasswordCred.Config), string(actual.Credentials[identity.CredentialsTypePassword].Config), "excluded credential config must not change")
+				// The returned identity carries the database state of the excluded type.
+				assert.JSONEq(t, string(dbPasswordCred.Config), string(updated.Credentials[identity.CredentialsTypePassword].Config))
+			})
+
+			t.Run("case=WithoutCredentialTypes excludes two credential types at once", func(t *testing.T) {
+				initial := passwordIdentity("", x.NewUUID().String())
+				initial.SetCredentials(identity.CredentialsTypeOIDC, identity.Credentials{
+					Type:        identity.CredentialsTypeOIDC,
+					Identifiers: []string{"oidc-two-excluded-" + x.NewUUID().String()},
+					Config:      sqlxx.JSONRawMessage(`{}`),
+				})
+				initial.SetCredentials(identity.CredentialsTypeTOTP, identity.Credentials{
+					Type:        identity.CredentialsTypeTOTP,
+					Identifiers: []string{"totp-two-excluded-" + x.NewUUID().String()},
+					Config:      sqlxx.JSONRawMessage(`{"totp_url":"otpauth://totp/old"}`),
+				})
+				require.NoError(t, p.CreateIdentity(ctx, initial))
+				createdIDs = append(createdIDs, initial.ID)
+
+				fromDB, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				require.Len(t, fromDB.Credentials, 3)
+				dbPasswordCred := fromDB.Credentials[identity.CredentialsTypePassword]
+				dbOIDCCred := fromDB.Credentials[identity.CredentialsTypeOIDC]
+				dbTOTPCred := fromDB.Credentials[identity.CredentialsTypeTOTP]
+
+				// Both excluded types diverge in memory; both rows must survive
+				// while the non-excluded TOTP credential still updates.
+				updated := *fromDB
+				updated.Credentials = nil
+				updated.SetCredentials(identity.CredentialsTypePassword, identity.Credentials{
+					Type:        identity.CredentialsTypePassword,
+					Identifiers: dbPasswordCred.Identifiers,
+					Config:      sqlxx.JSONRawMessage(`{"foo":"stale-password"}`),
+					Version:     dbPasswordCred.Version,
+				})
+				updated.SetCredentials(identity.CredentialsTypeOIDC, identity.Credentials{
+					Type:        identity.CredentialsTypeOIDC,
+					Identifiers: dbOIDCCred.Identifiers,
+					Config:      sqlxx.JSONRawMessage(`{"foo":"stale-oidc"}`),
+					Version:     dbOIDCCred.Version,
+				})
+				updated.SetCredentials(identity.CredentialsTypeTOTP, identity.Credentials{
+					Type:        identity.CredentialsTypeTOTP,
+					Identifiers: dbTOTPCred.Identifiers,
+					Config:      sqlxx.JSONRawMessage(`{"totp_url":"otpauth://totp/new"}`),
+				})
+
+				require.NoError(t, p.UpdateIdentity(ctx, &updated,
+					identity.DiffAgainst(fromDB),
+					identity.WithoutCredentialTypes(identity.CredentialsTypePassword, identity.CredentialsTypeOIDC)))
+
+				actual, err := p.GetIdentityConfidential(ctx, initial.ID)
+				require.NoError(t, err)
+				require.Len(t, actual.Credentials, 3)
+				// Both excluded rows are untouched: same row IDs, same configs.
+				assert.Equal(t, dbPasswordCred.ID, actual.Credentials[identity.CredentialsTypePassword].ID, "excluded password credential must not be recreated")
+				assert.JSONEq(t, string(dbPasswordCred.Config), string(actual.Credentials[identity.CredentialsTypePassword].Config), "excluded password config must not change")
+				assert.Equal(t, dbOIDCCred.ID, actual.Credentials[identity.CredentialsTypeOIDC].ID, "excluded OIDC credential must not be recreated")
+				assert.JSONEq(t, string(dbOIDCCred.Config), string(actual.Credentials[identity.CredentialsTypeOIDC].Config), "excluded OIDC config must not change")
+				// The non-excluded credential still updates.
+				assert.JSONEq(t, `{"totp_url":"otpauth://totp/new"}`, string(actual.Credentials[identity.CredentialsTypeTOTP].Config))
+			})
 		})
 
 		t.Run("suite=update-combined-changes", func(t *testing.T) {
@@ -3145,7 +3550,710 @@ func TestPool(ctx context.Context, p persistence.Persister, m *identity.Manager,
 				assert.True(t, hasTOTP)
 			})
 		})
+
+		t.Run("case=UpdateCredentialsConfig does not lose concurrent increments", func(t *testing.T) {
+			t.Parallel()
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"cas-key-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			created, err := p.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			createdCreds, ok := created.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			versionBefore := createdCreds.Version
+
+			// Fire N concurrent read-modify-write increments; the final counter
+			// must equal exactly N. SQLite serializes writes, so real contention
+			// is exercised on the concurrent engines.
+			const N = 12
+			var wg sync.WaitGroup
+			for range N {
+				wg.Go(func() {
+					err := p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+						func(cfg []byte) ([]byte, error) {
+							var parsed map[string]int
+							if err := json.Unmarshal(cfg, &parsed); err != nil {
+								return nil, err
+							}
+							parsed["failed_attempts"]++
+							return json.Marshal(parsed)
+						})
+					// Assert in a goroutine without FailNow to stay concurrency-safe.
+					assert.NoError(t, err)
+				})
+			}
+			wg.Wait()
+
+			reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			var counts map[string]int
+			require.NoError(t, json.Unmarshal(c.Config, &counts))
+			assert.Equal(t, N, counts["failed_attempts"], "no increment may be lost")
+			// The version column versions the *shape* of the config (its schema),
+			// not its content. Content updates must not consume it, or future
+			// schema migrations keyed on version become impossible.
+			assert.Equal(t, versionBefore, c.Version, "content updates must not bump the config-schema version column")
+		})
+
+		t.Run("case=UpdateCredentialsConfig survives concurrent plain writes", func(t *testing.T) {
+			t.Parallel()
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"plain-writes-key-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			// Plain single-statement writes commit freely while the locked
+			// mutation's transaction is open: pop's SQLite transaction mutex
+			// does not cover them, and on the cluster databases they contend
+			// only on row locks. They model the flow and session writes that
+			// surround a login burst.
+			stop := make(chan struct{})
+			var noise sync.WaitGroup
+			var noiseWrites atomic.Int64
+			for w := range 3 {
+				noise.Go(func() {
+					// Bind a value that changes on every write: SQLite skips the
+					// page write (and thus the WAL commit) when an UPDATE leaves
+					// the row byte-identical, and a commit that appends nothing
+					// stales nobody's snapshot.
+					ts := time.Now().Add(time.Duration(w) * time.Hour)
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						ts = ts.Add(time.Second)
+						if err := p.GetConnection(ctx).RawQuery(
+							"UPDATE identities SET updated_at = ? WHERE id = ?", ts, id.ID).Exec(); err != nil {
+							return
+						}
+						noiseWrites.Add(1)
+					}
+				})
+			}
+			t.Cleanup(func() {
+				close(stop)
+				noise.Wait()
+				require.NotZero(t, noiseWrites.Load(), "the concurrent writer must actually have written")
+			})
+
+			const n = 10
+			for i := range n {
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) {
+						var parsed map[string]int
+						if err := json.Unmarshal(cfg, &parsed); err != nil {
+							return nil, err
+						}
+						parsed["failed_attempts"]++
+						// Give the concurrent writers room to commit between this
+						// transaction's read and its write, so the race is a
+						// certainty instead of a scheduling accident.
+						time.Sleep(10 * time.Millisecond)
+						return json.Marshal(parsed)
+					}), "mutation %d must not leak a concurrent-update error", i)
+			}
+
+			reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			var counts map[string]int
+			require.NoError(t, json.Unmarshal(c.Config, &counts))
+			assert.Equal(t, n, counts["failed_attempts"], "every increment must be applied exactly once")
+		})
+
+		t.Run("case=UpdateCredentialsConfig no-op mutation succeeds", func(t *testing.T) {
+			t.Parallel()
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"cas-noop-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			// A mutation that leaves the config unchanged must succeed without
+			// writing.
+			require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+				func(cfg []byte) ([]byte, error) { return cfg, nil }))
+
+			reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			var counts map[string]int
+			require.NoError(t, json.Unmarshal(c.Config, &counts))
+			assert.Equal(t, 0, counts["failed_attempts"], "config must be unchanged")
+		})
+
+		t.Run("case=UpdateCredentialsConfig serializes the whole read-mutate-write", func(t *testing.T) {
+			t.Parallel()
+
+			if dbname == "sqlite" {
+				// SQLite serializes writers at the engine level; the interleaving
+				// this test forces cannot occur there.
+				t.Skip("SQLite cannot interleave two writers")
+			}
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"lock-serialization-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			// Writer A parks inside its mutate callback; writer B starts only once
+			// A is inside. Under an exclusive row lock B cannot run until A
+			// commits, so B must observe A's increment. Asserting on the value B
+			// reads (not on wall-clock ordering) is causally determined by the
+			// locking and immune to goroutine scheduling.
+			var aInsideOnce, bInsideOnce sync.Once
+			aInside := make(chan struct{})
+			bInside := make(chan struct{})
+			releaseA := make(chan struct{})
+
+			increment := func(cfg []byte) (map[string]int, error) {
+				var parsed map[string]int
+				if err := json.Unmarshal(cfg, &parsed); err != nil {
+					return nil, err
+				}
+				parsed["failed_attempts"]++
+				return parsed, nil
+			}
+
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				err := p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) {
+						// The callback may re-run on database retries, so the
+						// signal fires once and the park is re-entrant.
+						aInsideOnce.Do(func() { close(aInside) })
+						<-releaseA
+						parsed, err := increment(cfg)
+						if err != nil {
+							return nil, err
+						}
+						return json.Marshal(parsed)
+					})
+				assert.NoError(t, err)
+			})
+
+			<-aInside
+
+			// bSaw is written only from B's callback and read after wg.Wait.
+			bSaw := -1
+			wg.Go(func() {
+				err := p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) {
+						bInsideOnce.Do(func() { close(bInside) })
+						parsed, err := increment(cfg)
+						if err != nil {
+							return nil, err
+						}
+						bSaw = parsed["failed_attempts"] - 1
+						return json.Marshal(parsed)
+					})
+				assert.NoError(t, err)
+			})
+
+			// Give B time to reach the row before releasing A; if B's callback
+			// runs during this window, the value assertion below fails.
+			select {
+			case <-bInside:
+			case <-time.After(500 * time.Millisecond):
+			}
+			close(releaseA)
+			wg.Wait()
+
+			assert.Equal(t, 1, bSaw,
+				"B's mutate must observe A's committed increment; observing the pre-A value means the read-mutate-write cycle is not exclusively locked")
+
+			reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			var counts map[string]int
+			require.NoError(t, json.Unmarshal(c.Config, &counts))
+			assert.Equal(t, 2, counts["failed_attempts"], "both increments must be committed")
+		})
+
+		t.Run("case=UpdateCredentialsConfig runs at READ COMMITTED", func(t *testing.T) {
+			t.Parallel()
+
+			// UpdateCredentialsConfig depends on READ COMMITTED so that its
+			// SELECT ... FOR UPDATE is a durable row lock on CockroachDB rather
+			// than the best-effort lock SERIALIZABLE gives. This guards that the
+			// isolation request is actually honored — not silently upgraded by
+			// the cluster or dropped by a pop/driver change — because under
+			// SERIALIZABLE the lock, and therefore the lost-update protection,
+			// would quietly weaken.
+			//
+			// Only PostgreSQL and CockroachDB are asserted here. SQLite has no
+			// configurable isolation and serializes writers at the engine level.
+			// MySQL's default REPEATABLE READ already takes durable FOR UPDATE
+			// locks (so RC is not needed for correctness there), and its
+			// per-transaction isolation override does not update
+			// @@transaction_isolation, so it cannot be observed with a query.
+			if dbname != "postgres" && dbname != "cockroach" {
+				t.Skipf("transaction isolation is not observable / not required on %s", dbname)
+			}
+
+			var got string
+			require.NoError(t, popx.TransactionWithOptions(ctx, p.GetConnection(ctx),
+				&sql.TxOptions{Isolation: sql.LevelReadCommitted},
+				func(ctx context.Context, tx *pop.Connection) error {
+					var row struct {
+						Level string `db:"transaction_isolation"`
+					}
+					if err := tx.RawQuery("SHOW transaction_isolation").First(&row); err != nil {
+						return err
+					}
+					got = row.Level
+					return nil
+				}))
+			assert.Equal(t, "read committed", got)
+		})
+
+		t.Run("case=UpdateCredentialsConfig bounds the wait for the row lock", func(t *testing.T) {
+			t.Parallel()
+
+			if dbname == "sqlite" {
+				t.Skip("SQLite has no row-lock wait to bound")
+			}
+			if testing.Short() {
+				t.Skip("holds a row lock for longer than the lock timeout")
+			}
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"lock-timeout-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			// Writer A parks inside its mutate callback holding the row lock. The
+			// whole transaction runs under a bounded context, so neither the
+			// holder nor a waiter can occupy a pooled connection beyond the
+			// budget: A's transaction is rolled back when its budget expires, and
+			// B — whether it errors on its own deadline or acquires the lock
+			// freed by A's rollback — must return within the generous ceiling
+			// (5x the 5s budget) instead of parking for an engine default (e.g.
+			// MySQL's 50s innodb_lock_wait_timeout). Neither writer's outcome is
+			// asserted: A deliberately overstays its budget, and B's result
+			// depends on whose deadline fires first.
+			var aInsideOnce sync.Once
+			aInside := make(chan struct{})
+			releaseA := make(chan struct{})
+
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				_ = p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) {
+						aInsideOnce.Do(func() { close(aInside) })
+						<-releaseA
+						return cfg, nil
+					})
+			})
+			<-aInside
+
+			start := time.Now()
+			_ = p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+				func(cfg []byte) ([]byte, error) { return cfg, nil })
+			elapsed := time.Since(start)
+			close(releaseA)
+			wg.Wait()
+
+			assert.Less(t, elapsed, 25*time.Second, "the wait must be bounded near the configured lock timeout, not the engine default")
+		})
+
+		t.Run("case=UpdateCredentialsConfig refuses to run inside a surrounding transaction", func(t *testing.T) {
+			t.Parallel()
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"lock-ambient-tx-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, p.CreateIdentity(ctx, id))
+
+			// An ambient transaction would extend the lock and its timeout to the
+			// outer transaction's lifetime; the persister must fail loudly instead.
+			mutated := false
+			err := p.Transaction(ctx, func(ctx context.Context, _ *pop.Connection) error {
+				return p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) {
+						mutated = true
+						return cfg, nil
+					})
+			})
+			require.Error(t, err, "calling UpdateCredentialsConfig inside a transaction must be rejected")
+			assert.False(t, mutated, "mutate must not run when the call is rejected")
+		})
+
+		t.Run("case=UpdateConfig typed adapter", func(t *testing.T) {
+			t.Parallel()
+
+			_, p := testhelpers.NewNetwork(t, ctx, p)
+
+			// The adapter is credential-type agnostic; this stand-in models a
+			// complete stored config shape (like a lockout or clone counter).
+			type counterConfig struct {
+				FailedAttempts int `json:"failed_attempts"`
+			}
+
+			newCounterIdentity := func(t *testing.T, rawConfig string) *identity.Identity {
+				t.Helper()
+				id := identity.NewIdentity("default")
+				id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+					Type:        identity.CredentialsTypeDeviceAuthn,
+					Identifiers: []string{x.NewUUID().String()},
+					Config:      sqlxx.JSONRawMessage(rawConfig),
+				})
+				require.NoError(t, p.CreateIdentity(ctx, id))
+				return id
+			}
+
+			t.Run("decodes, mutates, and persists", func(t *testing.T) {
+				t.Parallel()
+
+				id := newCounterIdentity(t, `{"failed_attempts":41}`)
+
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					identity.UpdateConfig(func(c *counterConfig) error {
+						c.FailedAttempts++
+						return nil
+					})))
+
+				reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+				require.NoError(t, err)
+				c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+				require.True(t, ok)
+				assert.Equal(t, int64(42), gjson.GetBytes(c.Config, "failed_attempts").Int())
+			})
+
+			t.Run("pins that fields T does not model are dropped", func(t *testing.T) {
+				t.Parallel()
+
+				// Pins the documented contract: T must model the COMPLETE stored
+				// shape, because a partial T silently drops sibling fields.
+				id := newCounterIdentity(t, `{"failed_attempts":5,"sibling":"not-modeled-by-T"}`)
+
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					identity.UpdateConfig(func(c *counterConfig) error {
+						c.FailedAttempts++
+						return nil
+					})))
+
+				reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+				require.NoError(t, err)
+				c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+				require.True(t, ok)
+				assert.Equal(t, int64(6), gjson.GetBytes(c.Config, "failed_attempts").Int())
+				assert.False(t, gjson.GetBytes(c.Config, "sibling").Exists(),
+					"a field T does not model is dropped by the roundtrip — T must model the complete stored shape")
+			})
+
+			t.Run("null config is rejected without calling mutate", func(t *testing.T) {
+				t.Parallel()
+
+				// Mutating a zero value would silently replace whatever the row
+				// held. JSON null is the one undecodable state every dialect can
+				// store (JSON-typed columns refuse empty/whitespace outright).
+				id := newCounterIdentity(t, "null")
+
+				mutated := false
+				err := p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					identity.UpdateConfig(func(c *counterConfig) error {
+						mutated = true
+						return nil
+					}))
+				require.Error(t, err)
+				assert.False(t, mutated, "mutate must not run on an undecodable config")
+			})
+
+			t.Run("mutate error aborts without persisting", func(t *testing.T) {
+				t.Parallel()
+
+				id := newCounterIdentity(t, `{"failed_attempts":7}`)
+
+				bang := errors.New("mutation rejected")
+				err := p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					identity.UpdateConfig(func(c *counterConfig) error {
+						c.FailedAttempts = 999
+						return bang
+					}))
+				require.ErrorIs(t, err, bang)
+
+				reloaded, err := p.GetIdentityConfidential(ctx, id.ID)
+				require.NoError(t, err)
+				c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+				require.True(t, ok)
+				assert.Equal(t, int64(7), gjson.GetBytes(c.Config, "failed_attempts").Int(), "a failed mutation must not be persisted")
+			})
+		})
+
+		t.Run("case=UpdateCredentialsConfig not if on another network", func(t *testing.T) {
+			t.Parallel()
+
+			// Create the identity (and its credential row) on network A.
+			_, pA := testhelpers.NewNetwork(t, ctx, p)
+			id := identity.NewIdentity("default")
+			id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+				Type:        identity.CredentialsTypeDeviceAuthn,
+				Identifiers: []string{"cas-nid-isolation-1"},
+				Config:      sqlxx.JSONRawMessage(`{"failed_attempts":0}`),
+			})
+			require.NoError(t, pA.CreateIdentity(ctx, id))
+
+			// A persister scoped to a different network must not see the row.
+			// The locked SELECT is keyed by nid, so it returns not-found and never
+			// invokes mutate, guarding against a cross-tenant mutation.
+			_, pB := testhelpers.NewNetwork(t, ctx, p)
+			mutated := false
+			err := pB.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+				func(cfg []byte) ([]byte, error) {
+					mutated = true
+					return []byte(`{"failed_attempts":999}`), nil
+				})
+			require.ErrorIs(t, err, sqlcon.ErrNoRows())
+			assert.False(t, mutated, "mutate must not run for an identity on another network")
+
+			// The original row on network A must be untouched.
+			reloaded, err := pA.GetIdentityConfidential(ctx, id.ID)
+			require.NoError(t, err)
+			c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+			require.True(t, ok)
+			var counts map[string]int
+			require.NoError(t, json.Unmarshal(c.Config, &counts))
+			assert.Equal(t, 0, counts["failed_attempts"], "row must not be mutated across networks")
+		})
+
+		t.Run("case=UpdateCredentialsConfig syncs derived identifiers", func(t *testing.T) {
+			t.Parallel()
+
+			// The stand-in config stores a set of keys; the identifier rows are
+			// pure derived state of that set.
+			deriveKeys := func(cfg []byte) ([]string, error) {
+				var parsed struct {
+					Keys []string `json:"keys"`
+				}
+				if err := json.Unmarshal(cfg, &parsed); err != nil {
+					return nil, err
+				}
+				return parsed.Keys, nil
+			}
+
+			setKeys := func(keys ...string) func(cfg []byte) ([]byte, error) {
+				return func([]byte) ([]byte, error) {
+					return json.Marshal(map[string][]string{"keys": keys})
+				}
+			}
+
+			newKeyedIdentity := func(t *testing.T, p persistence.Persister, identifiers ...string) *identity.Identity {
+				t.Helper()
+				cfg, err := json.Marshal(map[string][]string{"keys": identifiers})
+				require.NoError(t, err)
+				id := identity.NewIdentity("default")
+				id.SetCredentials(identity.CredentialsTypeDeviceAuthn, identity.Credentials{
+					Type:        identity.CredentialsTypeDeviceAuthn,
+					Identifiers: identifiers,
+					Config:      sqlxx.JSONRawMessage(cfg),
+				})
+				require.NoError(t, p.CreateIdentity(ctx, id))
+				return id
+			}
+
+			credentials := func(t *testing.T, p persistence.Persister, identityID uuid.UUID) identity.Credentials {
+				t.Helper()
+				reloaded, err := p.GetIdentityConfidential(ctx, identityID)
+				require.NoError(t, err)
+				c, ok := reloaded.GetCredentials(identity.CredentialsTypeDeviceAuthn)
+				require.True(t, ok)
+				return *c
+			}
+
+			// identifierRows reads the credential's raw identifier rows so tests
+			// can observe row identity (a re-created row gets a new id).
+			identifierRows := func(t *testing.T, p persistence.Persister, credID uuid.UUID) map[string]uuid.UUID {
+				t.Helper()
+				var rows []struct {
+					ID         uuid.UUID `db:"id"`
+					Identifier string    `db:"identifier"`
+				}
+				require.NoError(t, p.GetConnection(ctx).RawQuery(
+					`SELECT id, identifier FROM identity_credential_identifiers WHERE identity_credential_id = ?`, credID).All(&rows))
+				out := make(map[string]uuid.UUID, len(rows))
+				for _, r := range rows {
+					out[r.Identifier] = r.ID
+				}
+				return out
+			}
+
+			t.Run("inserts the derived set on first sync", func(t *testing.T) {
+				t.Parallel()
+
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				id := newKeyedIdentity(t, p, "sync-seed-1")
+
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					setKeys("sync-key-a", "sync-key-b"),
+					identity.WithDerivedIdentifiers(deriveKeys)))
+
+				c := credentials(t, p, id.ID)
+				assert.ElementsMatch(t, []string{"sync-key-a", "sync-key-b"}, c.Identifiers,
+					"identifier rows must reflect the post-mutation config")
+				assert.ElementsMatch(t, []string{"sync-key-a", "sync-key-b"}, gjsonStrings(c.Config, "keys"))
+			})
+
+			t.Run("removing a key removes its identifier row", func(t *testing.T) {
+				t.Parallel()
+
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				id := newKeyedIdentity(t, p, "rm-key-a", "rm-key-b")
+
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					setKeys("rm-key-a"),
+					identity.WithDerivedIdentifiers(deriveKeys)))
+
+				c := credentials(t, p, id.ID)
+				assert.ElementsMatch(t, []string{"rm-key-a"}, c.Identifiers,
+					"the deleted key's identifier row must be gone")
+			})
+
+			t.Run("no-op config with unchanged identifiers writes nothing", func(t *testing.T) {
+				t.Parallel()
+
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				id := newKeyedIdentity(t, p, "noop-key-1")
+				before := identifierRows(t, p, credentials(t, p, id.ID).ID)
+
+				require.NoError(t, p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					func(cfg []byte) ([]byte, error) { return cfg, nil },
+					identity.WithDerivedIdentifiers(deriveKeys)))
+
+				c := credentials(t, p, id.ID)
+				assert.ElementsMatch(t, []string{"noop-key-1"}, c.Identifiers)
+				assert.Equal(t, before, identifierRows(t, p, c.ID),
+					"an unchanged identifier set must not re-create the rows")
+			})
+
+			t.Run("identifier rows are nid-scoped", func(t *testing.T) {
+				t.Parallel()
+
+				_, pA := testhelpers.NewNetwork(t, ctx, p)
+				idA := newKeyedIdentity(t, pA, "nid-scope-key")
+				rowsA := identifierRows(t, pA, credentials(t, pA, idA.ID).ID)
+
+				// A persister on another network must not see A's credential row;
+				// neither mutate nor derive may run.
+				_, pB := testhelpers.NewNetwork(t, ctx, p)
+				derived := false
+				err := pB.UpdateCredentialsConfig(ctx, idA.ID, identity.CredentialsTypeDeviceAuthn,
+					setKeys("nid-scope-clobber"),
+					identity.WithDerivedIdentifiers(func(cfg []byte) ([]string, error) {
+						derived = true
+						return deriveKeys(cfg)
+					}))
+				require.ErrorIs(t, err, sqlcon.ErrNoRows())
+				assert.False(t, derived, "derive must not run for an identity on another network")
+
+				// The identifier uniqueness is per network: B may claim the same
+				// value A holds.
+				idB := newKeyedIdentity(t, pB, "nid-scope-seed")
+				require.NoError(t, pB.UpdateCredentialsConfig(ctx, idB.ID, identity.CredentialsTypeDeviceAuthn,
+					setKeys("nid-scope-key"),
+					identity.WithDerivedIdentifiers(deriveKeys)))
+				assert.ElementsMatch(t, []string{"nid-scope-key"}, credentials(t, pB, idB.ID).Identifiers)
+
+				// A's rows must be untouched, down to the row ids.
+				assert.Equal(t, rowsA, identifierRows(t, pA, credentials(t, pA, idA.ID).ID),
+					"another network's sync must not clobber the rows")
+			})
+
+			t.Run("duplicate identifier on another identity fails with unique violation", func(t *testing.T) {
+				t.Parallel()
+
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				newKeyedIdentity(t, p, "dup-owned")
+				victim := newKeyedIdentity(t, p, "dup-seed")
+
+				err := p.UpdateCredentialsConfig(ctx, victim.ID, identity.CredentialsTypeDeviceAuthn,
+					setKeys("dup-owned"),
+					identity.WithDerivedIdentifiers(deriveKeys))
+				require.ErrorIs(t, err, sqlcon.ErrUniqueViolation())
+
+				// The transaction must roll back as a whole: neither the config
+				// nor the identifier rows may change.
+				c := credentials(t, p, victim.ID)
+				assert.ElementsMatch(t, []string{"dup-seed"}, gjsonStrings(c.Config, "keys"))
+				assert.ElementsMatch(t, []string{"dup-seed"}, c.Identifiers)
+			})
+
+			t.Run("derive error aborts and rolls back the config write", func(t *testing.T) {
+				t.Parallel()
+
+				_, p := testhelpers.NewNetwork(t, ctx, p)
+				id := newKeyedIdentity(t, p, "derive-err-seed")
+				before := identifierRows(t, p, credentials(t, p, id.ID).ID)
+
+				bang := errors.New("derive failed")
+				err := p.UpdateCredentialsConfig(ctx, id.ID, identity.CredentialsTypeDeviceAuthn,
+					setKeys("derive-err-new"),
+					identity.WithDerivedIdentifiers(func([]byte) ([]string, error) {
+						return nil, bang
+					}))
+				require.ErrorIs(t, err, bang, "the derive error must surface to the caller")
+
+				// The transaction must roll back as a whole: the config write
+				// that already executed is undone and the identifier rows are
+				// untouched, down to the row ids.
+				c := credentials(t, p, id.ID)
+				assert.ElementsMatch(t, []string{"derive-err-seed"}, gjsonStrings(c.Config, "keys"),
+					"the config write must roll back with the derive error")
+				assert.ElementsMatch(t, []string{"derive-err-seed"}, c.Identifiers)
+				assert.Equal(t, before, identifierRows(t, p, c.ID))
+			})
+		})
 	}
+}
+
+// gjsonStrings returns the string array at path in the JSON document.
+func gjsonStrings(doc []byte, path string) []string {
+	var out []string
+	for _, v := range gjson.GetBytes(doc, path).Array() {
+		out = append(out, v.String())
+	}
+	return out
 }
 
 func NewTestIdentity(numAddresses int, prefix string, i int) *identity.Identity {

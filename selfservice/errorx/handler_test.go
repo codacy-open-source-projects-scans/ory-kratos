@@ -19,6 +19,7 @@ import (
 
 	"github.com/ory/herodot"
 	"github.com/ory/kratos/pkg"
+	"github.com/ory/kratos/pkg/testhelpers"
 	"github.com/ory/kratos/selfservice/errorx"
 	"github.com/ory/kratos/x"
 	"github.com/ory/kratos/x/nosurfx"
@@ -33,19 +34,19 @@ func TestHandler(t *testing.T) {
 	h := errorx.NewHandler(reg)
 
 	t.Run("case=public authorization", func(t *testing.T) {
-		router := httprouterx.NewTestRouterPublic(t)
+		router := httprouterx.NewRouterPublic()
 		ns := nosurfx.NewTestCSRFHandler(router, reg)
 
 		h.RegisterPublicRoutes(router)
-		router.Handler("GET", "/regen", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		router.GET("/regen", func(w http.ResponseWriter, r *http.Request) {
 			ns.RegenerateToken(w, r)
 			w.WriteHeader(http.StatusNoContent)
-		}))
-		router.Handler("GET", "/set-error", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		})
+		router.GET("/set-error", func(w http.ResponseWriter, r *http.Request) {
 			id, err := reg.SelfServiceErrorPersister().CreateErrorContainer(context.Background(), nosurf.Token(r), herodot.ErrNotFound().WithReason("foobar"))
 			require.NoError(t, err)
 			_, _ = w.Write([]byte(id.String()))
-		}))
+		})
 
 		ts := httptest.NewServer(ns)
 		defer ts.Close()
@@ -62,7 +63,7 @@ func TestHandler(t *testing.T) {
 		expectedError := x.MustEncodeJSON(t, herodot.ErrNotFound().WithReason("foobar"))
 
 		t.Run("call with valid csrf cookie", func(t *testing.T) {
-			hc := &http.Client{}
+			hc := testhelpers.NewTestClient(t)
 			id := getBody(t, hc, "/set-error", http.StatusOK)
 			actual := getBody(t, hc, errorx.RouteGet+"?id="+string(id), http.StatusOK)
 			assert.JSONEq(t, expectedError, gjson.GetBytes(actual, "error").Raw, "%s", actual)
@@ -73,7 +74,7 @@ func TestHandler(t *testing.T) {
 	})
 
 	t.Run("case=stubs", func(t *testing.T) {
-		router := httprouterx.NewTestRouterPublic(t)
+		router := httprouterx.NewRouterPublic()
 		h.RegisterPublicRoutes(router)
 		ts := httptest.NewServer(router)
 		defer ts.Close()
@@ -89,7 +90,7 @@ func TestHandler(t *testing.T) {
 	})
 
 	t.Run("case=errors types", func(t *testing.T) {
-		router := httprouterx.NewTestRouterPublic(t)
+		router := httprouterx.NewRouterPublic()
 		h.RegisterPublicRoutes(router)
 		ts := httptest.NewServer(router)
 		defer ts.Close()
